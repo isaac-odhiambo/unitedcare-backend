@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import timedelta
+import os
 
 # =========================
 # BASE DIRECTORY
@@ -12,7 +13,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # SECURITY
 # =========================
 
-SECRET_KEY = 'django-insecure-change-this-in-production'
+SECRET_KEY = "django-insecure-change-this-in-production"
 
 DEBUG = True
 
@@ -25,22 +26,22 @@ ALLOWED_HOSTS = []
 
 INSTALLED_APPS = [
     # CORS
-    'corsheaders',
+    "corsheaders",
 
     # Django core
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
 
     # Third-party
-    'rest_framework',
-    'rest_framework.authtoken',
+    "rest_framework",
+    "rest_framework.authtoken",
 
     # Local apps
-    'accounts',
+    "accounts",
 ]
 
 
@@ -49,14 +50,14 @@ INSTALLED_APPS = [
 # =========================
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
-    'django.middleware.security.SecurityMiddleware',
-    'django.contrib.sessions.middleware.SessionMiddleware',
-    'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
-    'django.contrib.auth.middleware.AuthenticationMiddleware',
-    'django.contrib.messages.middleware.MessageMiddleware',
-    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
 
@@ -64,7 +65,7 @@ MIDDLEWARE = [
 # URL CONFIGURATION
 # =========================
 
-ROOT_URLCONF = 'unitedcare_backend.urls'
+ROOT_URLCONF = "unitedcare_backend.urls"
 
 
 # =========================
@@ -73,14 +74,14 @@ ROOT_URLCONF = 'unitedcare_backend.urls'
 
 TEMPLATES = [
     {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
+        "BACKEND": "django.template.backends.django.DjangoTemplates",
+        "DIRS": [],
+        "APP_DIRS": True,
+        "OPTIONS": {
+            "context_processors": [
+                "django.template.context_processors.request",
+                "django.contrib.auth.context_processors.auth",
+                "django.contrib.messages.context_processors.messages",
             ],
         },
     },
@@ -91,7 +92,7 @@ TEMPLATES = [
 # WSGI
 # =========================
 
-WSGI_APPLICATION = 'unitedcare_backend.wsgi.application'
+WSGI_APPLICATION = "unitedcare_backend.wsgi.application"
 
 
 # =========================
@@ -99,9 +100,9 @@ WSGI_APPLICATION = 'unitedcare_backend.wsgi.application'
 # =========================
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "db.sqlite3",
     }
 }
 
@@ -109,20 +110,20 @@ DATABASES = {
 # =========================
 # PASSWORD VALIDATION
 # =========================
+# ✔ Minimum 4 characters
+# ✔ Blocks numeric-only passwords
+# ✔ Blocks common passwords
 
 AUTH_PASSWORD_VALIDATORS = [
     {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 4},
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-        'OPTIONS': {'min_length': 8},
+        "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
     },
     {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
+        "NAME": "django.contrib.auth.password_validation.NumericPasswordValidator",
     },
 ]
 
@@ -131,7 +132,7 @@ AUTH_PASSWORD_VALIDATORS = [
 # CUSTOM USER MODEL
 # =========================
 
-AUTH_USER_MODEL = 'accounts.User'
+AUTH_USER_MODEL = "accounts.User"
 
 
 # =========================
@@ -139,12 +140,26 @@ AUTH_USER_MODEL = 'accounts.User'
 # =========================
 
 REST_FRAMEWORK = {
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    "DEFAULT_AUTHENTICATION_CLASSES": (
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
-    'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.IsAuthenticated',
+
+    "DEFAULT_PERMISSION_CLASSES": (
+        "rest_framework.permissions.IsAuthenticated",
     ),
+
+    # 🔒 GLOBAL THROTTLING
+    "DEFAULT_THROTTLE_CLASSES": [
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ],
+
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "20/minute",
+        "user": "100/minute",
+        "login": "5/minute",
+        "otp": "3/minute",
+    },
 }
 
 
@@ -153,11 +168,11 @@ REST_FRAMEWORK = {
 # =========================
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=30),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
-    'ROTATE_REFRESH_TOKENS': True,
-    'BLACKLIST_AFTER_ROTATION': True,
-    'AUTH_HEADER_TYPES': ('Bearer',),
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "AUTH_HEADER_TYPES": ("Bearer",),
 }
 
 
@@ -165,8 +180,8 @@ SIMPLE_JWT = {
 # INTERNATIONALIZATION
 # =========================
 
-LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+LANGUAGE_CODE = "en-us"
+TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
@@ -175,22 +190,22 @@ USE_TZ = True
 # STATIC FILES
 # =========================
 
-STATIC_URL = '/static/'
+STATIC_URL = "/static/"
 
 
 # =========================
-# MEDIA FILES (KYC IMAGES)
+# MEDIA FILES (KYC)
 # =========================
 
-MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
 
 
 # =========================
 # DEFAULT PRIMARY KEY
 # =========================
 
-DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 
 # =========================
@@ -199,3 +214,12 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+
+
+# =========================
+# AFRICA'S TALKING (SMS OTP)
+# =========================
+
+AFRICASTALKING_USERNAME = os.getenv("AFRICASTALKING_USERNAME", "sandbox")
+AFRICASTALKING_API_KEY = os.getenv("AFRICASTALKING_API_KEY", "your_api_key_here")
+AFRICASTALKING_SENDER_ID = os.getenv("AFRICASTALKING_SENDER_ID", "UNITEDCARE")
