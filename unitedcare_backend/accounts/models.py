@@ -11,17 +11,17 @@ import random
 # =========================
 
 phone_validator = RegexValidator(
-    regex=r'^(07|01)\d{8}$',
+    regex=r"^(07|01)\d{8}$",
     message="Phone number must be a valid Kenyan number (07XXXXXXXX or 01XXXXXXXX)"
 )
 
 username_validator = RegexValidator(
-    regex=r'^[A-Za-z]+$',
+    regex=r"^[A-Za-z]+$",
     message="Username must contain letters only"
 )
 
 id_number_validator = RegexValidator(
-    regex=r'^\d{1,9}$',
+    regex=r"^\d{1,9}$",
     message="ID number must be numeric and not exceed 9 digits"
 )
 
@@ -42,6 +42,9 @@ class User(AbstractUser):
         ("blocked", "Blocked"),
     )
 
+    # ✅ Email is OPTIONAL (not needed for chama members)
+    email = models.EmailField(null=True, blank=True)
+
     # 🔤 Username: letters only
     username = models.CharField(
         max_length=150,
@@ -49,14 +52,15 @@ class User(AbstractUser):
         validators=[username_validator]
     )
 
-    # 📱 Phone number (LOGIN FIELD)
+    # 📱 Phone number (LOGIN FIELD) - indexed for faster lookup
     phone = models.CharField(
         max_length=10,
         unique=True,
+        db_index=True,
         validators=[phone_validator]
     )
 
-    # 🪪 National ID (OPTIONAL – used during KYC later)
+    # 🪪 National ID (OPTIONAL – trusted only when KYC approved)
     id_number = models.CharField(
         max_length=9,
         unique=True,
@@ -71,6 +75,7 @@ class User(AbstractUser):
         default="member"
     )
 
+    # Business approval workflow
     status = models.CharField(
         max_length=10,
         choices=STATUS_CHOICES,
@@ -92,18 +97,44 @@ class User(AbstractUser):
     # 🔒 SECURITY METHODS
     # =========================
 
-    def is_locked(self):
-        return self.locked_until and timezone.now() < self.locked_until
+    def is_locked(self) -> bool:
+        return bool(self.locked_until and timezone.now() < self.locked_until)
 
-    def lock_account(self):
+    def lock_account(self) -> None:
         self.locked_until = timezone.now() + timedelta(minutes=15)
         self.failed_login_attempts = 0
         self.save(update_fields=["locked_until", "failed_login_attempts"])
 
-    def reset_failed_attempts(self):
+    def reset_failed_attempts(self) -> None:
         self.failed_login_attempts = 0
         self.locked_until = None
         self.save(update_fields=["failed_login_attempts", "locked_until"])
+
+    # =========================
+    # ✅ BEST PRACTICE HELPERS
+    # =========================
+
+    @property
+    def is_admin(self) -> bool:
+        """
+        Best practice: allow Django built-in admin flags too.
+        """
+        return self.is_superuser or self.is_staff or self.role == "admin"
+
+    @property
+    def is_approved(self) -> bool:
+        return self.status == "approved"
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.status == "blocked"
+
+    @property
+    def is_kyc_approved(self) -> bool:
+        """
+        ID number is only trusted when KYC is approved.
+        """
+        return hasattr(self, "kycprofile") and self.kycprofile.status == "approved"
 
     def __str__(self):
         return self.phone
@@ -114,7 +145,7 @@ class User(AbstractUser):
 # =========================
 
 class OTP(models.Model):
-    phone = models.CharField(max_length=10)
+    phone = models.CharField(max_length=10, validators=[phone_validator])
     code = models.CharField(max_length=6)
     created_at = models.DateTimeField(auto_now_add=True)
     is_used = models.BooleanField(default=False)

@@ -1,12 +1,15 @@
 from pathlib import Path
 from datetime import timedelta
 import os
+from dotenv import load_dotenv
+
 
 # =========================
 # BASE DIRECTORY
 # =========================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv()   # load variables from .env
 
 
 # =========================
@@ -42,6 +45,14 @@ INSTALLED_APPS = [
 
     # Local apps
     "accounts",
+    "merry",
+    "loans",
+    "savings",
+    "groups"
+    
+
+    
+    
 ]
 
 
@@ -223,3 +234,15 @@ CORS_ALLOW_CREDENTIALS = True
 AFRICASTALKING_USERNAME = os.getenv("AFRICASTALKING_USERNAME", "sandbox")
 AFRICASTALKING_API_KEY = os.getenv("AFRICASTALKING_API_KEY", "your_api_key_here")
 AFRICASTALKING_SENDER_ID = os.getenv("AFRICASTALKING_SENDER_ID", "UNITEDCARE")
+
+CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+
+# in settings.py (or celery.py config)
+CELERY_BEAT_SCHEDULE = {
+    "apply-late-fees-nightly": {
+        "task": "loans.tasks.apply_late_fees_and_tag_defaulters",
+        "schedule": 60 * 60 * 24,  # daily
+    }
+}

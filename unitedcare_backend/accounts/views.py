@@ -1,23 +1,24 @@
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework.permissions import AllowAny
-from rest_framework_simplejwt.tokens import RefreshToken
-from django.utils import timezone
 from datetime import timedelta
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 
+from rest_framework import status
+from rest_framework.permissions import AllowAny
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from .models import OTP
 from .serializers import (
     RegisterSerializer,
     LoginSerializer,
     ForgotPasswordSerializer,
     ResetPasswordSerializer,
 )
-from .models import OTP
 from .throttles import LoginThrottle, OTPThrottle
-from .utils.sms import send_sms
 from .utils.phone import normalize_kenyan_phone
+from .utils.sms import send_sms
 
 User = get_user_model()
 
@@ -47,9 +48,7 @@ class RegisterView(APIView):
         send_sms(phone_intl, message)
 
         return Response(
-            {
-                "message": "Registration successful. OTP sent to phone.",
-            },
+            {"message": "Registration successful. OTP sent to phone."},
             status=status.HTTP_201_CREATED,
         )
 
@@ -72,11 +71,7 @@ class VerifyOTPView(APIView):
             )
 
         try:
-            otp = OTP.objects.filter(
-                phone=phone,
-                code=code,
-                is_used=False
-            ).latest("created_at")
+            otp = OTP.objects.filter(phone=phone, code=code, is_used=False).latest("created_at")
         except OTP.DoesNotExist:
             return Response(
                 {"detail": "Invalid or expired OTP"},
@@ -89,21 +84,27 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        user = User.objects.get(phone=phone)
+        try:
+            user = User.objects.get(phone=phone)
+        except User.DoesNotExist:
+            return Response(
+                {"detail": "User not found for this phone."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ✅ Activate account
         user.is_active = True
         user.save(update_fields=["is_active"])
 
+        # ✅ Mark OTP used
         otp.is_used = True
         otp.save(update_fields=["is_used"])
 
-        return Response(
-            {"message": "Account verified successfully"},
-            status=status.HTTP_200_OK,
-        )
+        return Response({"message": "Account verified successfully"}, status=status.HTTP_200_OK)
 
 
 # =========================
-# 🔑 LOGIN (JWT)
+# 🔑 LOGIN (JWT) + BEST-PRACTICE CHECKS
 # =========================
 class LoginView(APIView):
     permission_classes = [AllowAny]
@@ -114,6 +115,31 @@ class LoginView(APIView):
         serializer.is_valid(raise_exception=True)
 
         user = serializer.validated_data["user"]
+
+        # ✅ 1) Block locked accounts
+        if user.is_locked():
+            return Response(
+                {"detail": "Account temporarily locked. Try again later."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # ✅ 2) Must be OTP-activated
+        if not user.is_active:
+            return Response(
+                {"detail": "Account not activated. Verify OTP first."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # ✅ 3) Blocked users cannot login (recommended)
+        if getattr(user, "status", "") == "blocked":
+            return Response(
+                {"detail": "Account blocked. Contact admin."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # ✅ reset failed attempts after successful login
+        user.reset_failed_attempts()
+
         refresh = RefreshToken.for_user(user)
 
         return Response(
@@ -122,6 +148,7 @@ class LoginView(APIView):
                 "refresh": str(refresh),
                 "role": user.role,
                 "status": user.status,
+                "is_admin": getattr(user, "is_admin", False),
             },
             status=status.HTTP_200_OK,
         )
@@ -151,11 +178,7 @@ class ForgotPasswordView(APIView):
 
         # 🔢 Limit: 5 OTPs per hour
         hour_ago = now - timedelta(hours=1)
-        otp_count = OTP.objects.filter(
-            phone=phone,
-            created_at__gte=hour_ago
-        ).count()
-
+        otp_count = OTP.objects.filter(phone=phone, created_at__gte=hour_ago).count()
         if otp_count >= OTP_MAX_PER_HOUR:
             return Response(
                 {"detail": "OTP request limit reached. Try again later."},
@@ -170,10 +193,7 @@ class ForgotPasswordView(APIView):
         message = f"Your password reset OTP is {otp_code}. Valid for 5 minutes."
         send_sms(phone_intl, message)
 
-        return Response(
-            {"message": "OTP sent successfully"},
-            status=status.HTTP_200_OK,
-        )
+        return Response({"message": "OTP sent successfully"}, status=status.HTTP_200_OK)
 
 
 # =========================
@@ -190,12 +210,21 @@ class ResetPasswordView(APIView):
         new_password = serializer.validated_data["new_password"]
         otp = serializer.validated_data["otp_obj"]
 
-        user = User.objects.get(phone=phone)
+        try:
+            user = User.objects.get(phone=phone)
+        except User.DoesNotExist:
+            return Response({"detail": "User not found."}, status=status.HTTP_400_BAD_REQUEST)
 
         # 🔐 Reset password
         user.set_password(new_password)
+
+        # ✅ Ensure account is active after password reset
         user.is_active = True
-        user.save()
+
+        # ✅ Reset lock state too
+        user.failed_login_attempts = 0
+        user.locked_until = None
+        user.save(update_fields=["password", "is_active", "failed_login_attempts", "locked_until"])
 
         # ✅ Mark OTP as used
         otp.is_used = True
