@@ -2,6 +2,7 @@ from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from rest_framework import serializers
+from .models import KYCProfile
 import re
 
 from .models import OTP
@@ -154,3 +155,52 @@ class ResetPasswordSerializer(serializers.Serializer):
 
         data["otp_obj"] = otp
         return data
+
+class ResendOTPSerializer(serializers.Serializer):
+    phone = serializers.CharField()
+
+    def validate_phone(self, value):
+        if not re.match(r"^(07|01)\d{8}$", value):
+            raise serializers.ValidationError("Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)")
+
+        try:
+            user = User.objects.get(phone=value)
+        except User.DoesNotExist:
+            raise serializers.ValidationError("User with this phone does not exist")
+
+        if user.is_active:
+            raise serializers.ValidationError("Account is already verified.")
+
+        if user.status == "blocked":
+            raise serializers.ValidationError("Your account has been blocked. Contact support.")
+
+        self.context["user"] = user
+        return value
+class MeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["username", "phone", "email", "role", "status", "is_active"]
+
+
+class UpdateMeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ["username", "email"]
+
+    def validate_username(self, value):
+        if value and not value.isalpha():
+            raise serializers.ValidationError("Username must contain letters only")
+        return value
+
+
+class KYCSubmitSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = KYCProfile
+        fields = ["passport_photo", "id_front", "id_back"]
+
+    def validate(self, attrs):
+        # Ensure all files are provided
+        for f in ["passport_photo", "id_front", "id_back"]:
+            if not attrs.get(f):
+                raise serializers.ValidationError({f: "This file is required."})
+        return attrs

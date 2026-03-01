@@ -5,6 +5,9 @@ from .views import (
     LoginView,
     ForgotPasswordView,
     ResetPasswordView,
+    ResendOTPView,
+    MeView,
+    KYCSubmitView,
 )
 
 urlpatterns = [
@@ -13,4 +16,8 @@ urlpatterns = [
     path("login/", LoginView.as_view(), name="login"),
     path("forgot-password/", ForgotPasswordView.as_view(), name="forgot-password"),
     path("reset-password/", ResetPasswordView.as_view(), name="reset-password"),
+    path("resend-otp/", ResendOTPView.as_view(), name="resend-otp"),  # ✅ add
+
+    path("me/", MeView.as_view(), name="me"),
+    path("kyc/", KYCSubmitView.as_view(), name="kyc-submit"),
 ]

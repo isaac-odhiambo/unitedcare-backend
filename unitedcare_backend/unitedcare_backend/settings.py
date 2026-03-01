@@ -20,7 +20,8 @@ SECRET_KEY = "django-insecure-change-this-in-production"
 
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# ALLOWED_HOSTS = ["192.168.100.34", "127.0.0.1", "localhost"]
+ALLOWED_HOSTS = ["*"]
 
 
 # =========================
@@ -48,7 +49,8 @@ INSTALLED_APPS = [
     "merry",
     "loans",
     "savings",
-    "groups"
+    "groups",
+    "payments"
     
 
     
