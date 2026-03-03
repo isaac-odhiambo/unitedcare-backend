@@ -1,570 +1,617 @@
 # payments/services.py
-
 from __future__ import annotations
 
-import base64
-import json
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-import requests
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.auth.base_user import AbstractBaseUser
+from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
-from rest_framework.sexceptions import ValidationError
 
+from .balances import get_user_balance
 from .models import MpesaTransaction, PaymentLedger, WithdrawalRequest
+from .utils import calculate_b2c_fee
 
+# Runtime model class (do NOT use for type expressions in Pylance)
+UserModel = get_user_model()
+
+# ============================================================
+# Constants / Fees
+# ============================================================
+MERRY_STK_FEE = Decimal("50")  # flat fee added on top of merry contribution
 
 
 # ============================================================
-# Money helpers
+# Helpers
 # ============================================================
-
-MONEY_QUANT = Decimal("0.01")
-
-
-def q2(x: Decimal) -> Decimal:
-    return Decimal(x).quantize(MONEY_QUANT)
-
-
-def normalize_ke_phone(phone: str) -> str:
-    """
-    Accept: 07.. / 01.. / 254.. / +254..
-    Store: 2547.. / 2541..
-    """
-    if not phone:
-        raise ValidationError({"phone": "Phone is required."})
-
-    p = str(phone).strip().replace(" ", "")
-    if p.startswith("+"):
-        p = p[1:]
-
-    if p.startswith("0"):
-        p = "254" + p[1:]
-
-    # 2547XXXXXXXX or 2541XXXXXXXX => length 12
-    if not p.startswith("254") or len(p) != 12:
-        raise ValidationError({"phone": "Phone must be Kenyan format (07.. / 01.. / 254..)."})
-
+def normalize_phone(phone: str) -> str:
+    p = (phone or "").strip().replace(" ", "").replace("-", "")
+    if p.startswith("+254"):
+        p = "0" + p[4:]
+    elif p.startswith("254"):
+        p = "0" + p[3:]
     return p
 
 
-def _now_timestamp() -> str:
-    return timezone.now().strftime("%Y%m%d%H%M%S")
-
-
-def _stk_password(shortcode: str, passkey: str, timestamp: str) -> str:
-    raw = f"{shortcode}{passkey}{timestamp}".encode("utf-8")
-    return base64.b64encode(raw).decode("utf-8")
-
-
-def _stk_callback_meta(payload: dict) -> dict:
+def _safe_decimal(v: Any) -> Decimal:
     try:
-        items = payload["Body"]["stkCallback"]["CallbackMetadata"]["Item"]
+        d = Decimal(str(v))
+        return d if d.is_finite() else Decimal("0")
     except Exception:
-        return {}
-
-    out = {}
-    for it in items or []:
-        if not isinstance(it, dict):
-            continue
-        name = it.get("Name")
-        if name:
-            out[name] = it.get("Value")
-    return out
+        return Decimal("0")
 
 
-def _parse_mpesa_datetime(v: Any):
-    if not v:
-        return None
-    s = str(v)
-    try:
-        dt = datetime.strptime(s, "%Y%m%d%H%M%S")
-        return timezone.make_aware(dt, timezone.get_current_timezone())
-    except Exception:
-        return None
+def _set_generic_target(obj: Optional[object]) -> Tuple[Optional[ContentType], Optional[int]]:
+    if not obj:
+        return None, None
+    return ContentType.objects.get_for_model(obj.__class__), int(obj.pk)
 
 
-def purpose_to_ledger_category(purpose: str) -> str:
-    p = (purpose or "").upper()
-    if p == "SAVINGS_DEPOSIT":
-        return "SAVINGS"
-    if p == "MERRY_CONTRIBUTION":
-        return "MERRY"
-    if p == "LOAN_REPAYMENT":
-        return "LOANS"
-    if p == "WITHDRAWAL":
-        return "WITHDRAWAL"
-    return "OTHER"
+def _purpose_to_ledger_category(purpose: str) -> str:
+    mapping = {
+        "SAVINGS_DEPOSIT": "SAVINGS",
+        "LOAN_REPAYMENT": "LOANS",
+        "MERRY_CONTRIBUTION": "MERRY",
+        "GROUP_CONTRIBUTION": "GROUP",
+        "WITHDRAWAL": "WITHDRAWAL",
+        "LOAN_DISBURSEMENT": "LOANS",
+    }
+    return mapping.get(purpose, "OTHER")
 
 
-# ============================================================
-# Mpesa config + token
-# ============================================================
-
-@dataclass(frozen=True)
-class MpesaConfig:
-    env: str
-    consumer_key: str
-    consumer_secret: str
-
-    stk_shortcode: str
-    stk_passkey: str
-    stk_callback_url: str
-
-    b2c_shortcode: str
-    b2c_initiator_name: str
-    b2c_security_credential: str
-    b2c_result_url: str
-    b2c_timeout_url: str
-
-    base_url: str
+def _withdrawal_source_to_category(source: str) -> str:
+    """
+    Withdrawal must reduce the SOURCE bucket balance.
+    """
+    s = (source or "").upper()
+    mapping = {"SAVINGS": "SAVINGS", "MERRY": "MERRY", "GROUP": "GROUP"}
+    return mapping.get(s, "SAVINGS")
 
 
-def get_mpesa_config() -> MpesaConfig:
-    env = getattr(settings, "MPESA_ENV", "sandbox")
-    base_url = "https://sandbox.safaricom.co.ke" if env == "sandbox" else "https://api.safaricom.co.ke"
-
-    required = [
-        "MPESA_CONSUMER_KEY",
-        "MPESA_CONSUMER_SECRET",
-        "MPESA_STK_SHORTCODE",
-        "MPESA_STK_PASSKEY",
-        "MPESA_STK_CALLBACK_URL",
-        "MPESA_B2C_SHORTCODE",
-        "MPESA_B2C_INITIATOR_NAME",
-        "MPESA_B2C_SECURITY_CREDENTIAL",
-        "MPESA_B2C_RESULT_URL",
-        "MPESA_B2C_TIMEOUT_URL",
-    ]
-    missing = [k for k in required if not getattr(settings, k, None)]
-    if missing:
-        raise ValidationError(f"Missing Mpesa settings: {', '.join(missing)}")
-
-    return MpesaConfig(
-        env=env,
-        consumer_key=settings.MPESA_CONSUMER_KEY,
-        consumer_secret=settings.MPESA_CONSUMER_SECRET,
-        stk_shortcode=str(settings.MPESA_STK_SHORTCODE),
-        stk_passkey=str(settings.MPESA_STK_PASSKEY),
-        stk_callback_url=str(settings.MPESA_STK_CALLBACK_URL),
-        b2c_shortcode=str(settings.MPESA_B2C_SHORTCODE),
-        b2c_initiator_name=str(settings.MPESA_B2C_INITIATOR_NAME),
-        b2c_security_credential=str(settings.MPESA_B2C_SECURITY_CREDENTIAL),
-        b2c_result_url=str(settings.MPESA_B2C_RESULT_URL),
-        b2c_timeout_url=str(settings.MPESA_B2C_TIMEOUT_URL),
-        base_url=base_url,
+def create_ledger_entry(
+    *,
+    user: AbstractBaseUser,
+    entry_type: str,
+    category: str,
+    amount: Decimal,
+    narration: str = "",
+    reference: str = "",
+    mpesa_tx: Optional[MpesaTransaction] = None,
+    target_object: Optional[object] = None,
+) -> PaymentLedger:
+    ct, oid = _set_generic_target(target_object)
+    return PaymentLedger.objects.create(
+        user=user,
+        entry_type=entry_type,
+        category=category,
+        amount=amount,
+        narration=narration,
+        reference=reference,
+        mpesa_tx=mpesa_tx,
+        target_content_type=ct,
+        target_object_id=oid,
+        created_at=timezone.now(),
     )
 
 
-_TOKEN_CACHE: Dict[str, Any] = {"token": None, "expires_at": None}
+# ============================================================
+# Daraja Client (plug your implementation here)
+# ============================================================
+@dataclass
+class STKPushResult:
+    merchant_request_id: str
+    checkout_request_id: str
+    customer_message: str = ""
 
 
-def mpesa_access_token(force_refresh: bool = False) -> str:
-    now = timezone.now().timestamp()
-    token = _TOKEN_CACHE.get("token")
-    exp = _TOKEN_CACHE.get("expires_at")
-
-    if (not force_refresh) and token and exp and now < exp - 30:
-        return str(token)
-
-    cfg = get_mpesa_config()
-    url = f"{cfg.base_url}/oauth/v1/generate?grant_type=client_credentials"
-    r = requests.get(url, auth=(cfg.consumer_key, cfg.consumer_secret), timeout=25)
-
-    if r.status_code != 200:
-        raise ValidationError(f"Mpesa auth failed: {r.text}")
-
-    data = r.json()
-    token = data.get("access_token")
-    expires_in = int(data.get("expires_in") or 3599)
-
-    if not token:
-        raise ValidationError("Mpesa auth failed: missing access_token.")
-
-    _TOKEN_CACHE["token"] = token
-    _TOKEN_CACHE["expires_at"] = now + expires_in
-    return str(token)
+@dataclass
+class B2CResult:
+    conversation_id: str
+    originator_conversation_id: str = ""
+    response_description: str = ""
 
 
-def _auth_headers() -> Dict[str, str]:
-    return {"Authorization": f"Bearer {mpesa_access_token()}", "Content-Type": "application/json"}
+class DarajaClient:
+    """
+    Replace these with your real implementation.
+    IMPORTANT: stk_query() is required for security verification.
+    """
+
+    def stk_push(
+        self,
+        *,
+        phone: str,
+        amount: Decimal,
+        account_reference: str,
+        transaction_desc: str,
+        callback_url: str,
+    ) -> STKPushResult:
+        raise NotImplementedError("Connect your Daraja STK push here")
+
+    def stk_query(self, *, checkout_request_id: str) -> Dict[str, Any]:
+        """
+        Must call Daraja STK Query API.
+        """
+        raise NotImplementedError("Connect your Daraja STK query here")
+
+    def b2c_payout(
+        self,
+        *,
+        phone: str,
+        amount: Decimal,
+        remarks: str,
+        occasion: str,
+        result_url: str,
+        timeout_url: str,
+    ) -> B2CResult:
+        raise NotImplementedError("Connect your Daraja B2C payout here")
+
+
+def get_daraja_client():
+    """
+    Uses your real Daraja client from payments/daraja.py
+    """
+    from .daraja import DarajaClient as RealClient  # avoids circular import at module load
+    return RealClient()
+
+
+def _build_callback_url(path: str) -> str:
+    base = getattr(settings, "MPESA_CALLBACK_BASE_URL", "").rstrip("/")
+    if not base:
+        raise RuntimeError("MPESA_CALLBACK_BASE_URL missing in settings")
+
+    token = getattr(settings, "MPESA_CALLBACK_TOKEN", "")
+    url = f"{base}{path}"
+    if token:
+        url += f"?token={token}"
+    return url
 
 
 # ============================================================
-# STK PUSH (Customer -> Paybill)
+# STK VERIFICATION (SECURITY)
 # ============================================================
+def _stk_query_is_success(data: Dict[str, Any]) -> bool:
+    rc = data.get("ResultCode")
+    if rc is None:
+        return False
+    return str(rc) == "0"
 
-@transaction.atomic
+
+def _verify_stk_with_query(client, tx: MpesaTransaction) -> Dict[str, Any]:
+    if not tx.checkout_request_id:
+        raise ValueError("Cannot verify STK without checkout_request_id")
+    return client.stk_query(checkout_request_id=tx.checkout_request_id)
+
+
+# ============================================================
+# STK SERVICES
+# ============================================================
 def initiate_stk_push(
     *,
-    user,
+    user: AbstractBaseUser,
     phone: str,
     amount: Decimal,
     purpose: str,
+    target_object: Optional[object] = None,
     reference: str = "",
-    raw_request: Optional[dict] = None,
+    narration: str = "",
 ) -> MpesaTransaction:
-    """
-    ✅ EXACT signature your view uses.
-    Creates MpesaTransaction first, then calls Safaricom STK Push.
-    Updates tx with checkout_request_id / merchant_request_id for callback matching.
-    """
-    cfg = get_mpesa_config()
+    phone_n = normalize_phone(phone)
+    base_amount = _safe_decimal(amount)
+    if base_amount <= Decimal("0"):
+        raise ValueError("Amount must be greater than 0")
 
-    amt = q2(Decimal(str(amount or "0")))
-    if amt <= 0:
-        raise ValidationError({"amount": "Amount must be greater than 0."})
+    # Apply Merry fee rule: pay (amount + 50)
+    fee = Decimal("0")
+    total_amount = base_amount
+    if purpose == "MERRY_CONTRIBUTION":
+        fee = MERRY_STK_FEE
+        total_amount = base_amount + fee
 
-    phone_norm = normalize_ke_phone(phone)
+    ct, oid = _set_generic_target(target_object)
 
-    timestamp = _now_timestamp()
-    password = _stk_password(cfg.stk_shortcode, cfg.stk_passkey, timestamp)
+    # Rush guard: reuse a recent INITIATED/PENDING tx within 60s
+    recent = (
+        MpesaTransaction.objects.filter(
+            user=user,
+            phone=phone_n,
+            amount=total_amount,
+            purpose=purpose,
+            channel="STK",
+            direction="IN",
+            status__in=("INITIATED", "PENDING"),
+            created_at__gte=timezone.now() - timezone.timedelta(seconds=60),
+        )
+        .order_by("-id")
+        .first()
+    )
+    if recent:
+        return recent
 
-    # Create tx first (audit trail)
     tx = MpesaTransaction.objects.create(
         user=user,
-        phone=phone_norm,
-        amount=amt,
+        phone=phone_n,
+        amount=total_amount,
         direction="IN",
         channel="STK",
-        purpose=(purpose or "OTHER").upper(),
+        purpose=purpose,
         status="INITIATED",
-        reference=(reference or "").strip(),
-        request_payload={"client_request": raw_request or {}, "reference": (reference or "").strip()},
+        reference=reference or "",
+        request_payload={
+            "base_amount": str(base_amount),
+            "fee": str(fee),
+            "total_amount": str(total_amount),
+        },
+        callback_payload=None,
+        target_content_type=ct,
+        target_object_id=oid,
     )
 
-    url = f"{cfg.base_url}/mpesa/stkpush/v1/processrequest"
-    payload = {
-        "BusinessShortCode": cfg.stk_shortcode,
-        "Password": password,
-        "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": int(amt),
-        "PartyA": phone_norm,
-        "PartyB": cfg.stk_shortcode,
-        "PhoneNumber": phone_norm,
-        "CallBackURL": cfg.stk_callback_url,
-        "AccountReference": reference or "UNITEDCARE",
-        "TransactionDesc": "UNITED CARE",
-    }
+    callback_url = _build_callback_url("/payments/mpesa/stk/callback/")
+    client = get_daraja_client()
 
-    r = requests.post(url, headers=_auth_headers(), data=json.dumps(payload), timeout=25)
-    try:
-        resp = r.json()
-    except Exception:
-        resp = {"raw": r.text}
+    res = client.stk_push(
+        phone=phone_n,
+        amount=total_amount,
+        account_reference=reference or f"TX{tx.id}",
+        transaction_desc=narration or purpose,
+        callback_url=callback_url,
+    )
 
-    # store payloads no matter what
-    tx.request_payload = {**(tx.request_payload or {}), "mpesa_request": payload, "mpesa_response": resp}
+    MpesaTransaction.objects.filter(id=tx.id).update(
+        merchant_request_id=res.merchant_request_id,
+        checkout_request_id=res.checkout_request_id,
+        status="PENDING",
+        updated_at=timezone.now(),
+    )
+    tx.refresh_from_db()
+    return tx
 
-    if r.status_code != 200:
-        tx.status = "FAILED"
-        tx.result_desc = "STK initiation failed"
-        tx.save(update_fields=["status", "result_desc", "request_payload", "updated_at"])
-        raise ValidationError(f"STK push failed: {resp}")
 
-    checkout_id = resp.get("CheckoutRequestID")
-    merchant_id = resp.get("MerchantRequestID")
+@transaction.atomic
+def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction:
+    stk = (((callback_payload or {}).get("Body") or {}).get("stkCallback")) or {}
+    checkout_id = stk.get("CheckoutRequestID") or ""
+    merchant_id = stk.get("MerchantRequestID") or ""
+    callback_result_code = str(stk.get("ResultCode")) if stk.get("ResultCode") is not None else ""
+    callback_result_desc = stk.get("ResultDesc") or ""
 
     if not checkout_id:
-        tx.status = "FAILED"
-        tx.result_desc = "Missing CheckoutRequestID"
-        tx.save(update_fields=["status", "result_desc", "request_payload", "updated_at"])
-        raise ValidationError("STK push failed: missing CheckoutRequestID.")
+        raise ValueError("Invalid STK callback: missing CheckoutRequestID")
 
-    tx.checkout_request_id = checkout_id
-    tx.merchant_request_id = merchant_id
-    tx.status = "PENDING"
-    tx.save(update_fields=["checkout_request_id", "merchant_request_id", "status", "request_payload", "updated_at"])
+    tx = MpesaTransaction.objects.select_for_update().filter(checkout_request_id=checkout_id).first()
+    if not tx:
+        raise ValueError("Unknown CheckoutRequestID (no matching transaction)")
 
+    # audit store
+    tx.merchant_request_id = tx.merchant_request_id or merchant_id
+    tx.callback_payload = callback_payload
+    tx.result_code = callback_result_code
+    tx.result_desc = callback_result_desc
+    tx.updated_at = timezone.now()
+    tx.save(update_fields=["merchant_request_id", "callback_payload", "result_code", "result_desc", "updated_at"])
+
+    # cancelled/failed
+    if callback_result_code != "0":
+        tx.status = "CANCELLED" if callback_result_code in ("1032",) else "FAILED"
+        tx.save(update_fields=["status"])
+        return tx
+
+    # idempotency
+    if tx.ledger_posted:
+        tx.status = "SUCCESS"
+        tx.save(update_fields=["status"])
+        return tx
+
+    enable_verify = getattr(settings, "MPESA_ENABLE_STK_QUERY_VERIFICATION", True)
+
+    if enable_verify:
+        client = get_daraja_client()
+        try:
+            q = _verify_stk_with_query(client, tx)
+        except Exception as e:
+            # do not credit if verification fails
+            tx.status = "PENDING"
+            tx.result_desc = f"{tx.result_desc or ''} | Verification error: {str(e)}"[:255]
+            tx.save(update_fields=["status", "result_desc"])
+            return tx
+
+        if not _stk_query_is_success(q):
+            tx.status = "PENDING"
+            tx.result_desc = f"{tx.result_desc or ''} | STK Query not confirmed"[:255]
+            tx.save(update_fields=["status", "result_desc"])
+            return tx
+
+        receipt = q.get("MpesaReceiptNumber") or q.get("mpesaReceiptNumber")
+        amount_q = _safe_decimal(q.get("Amount"))
+        tx_date = q.get("TransactionDate")
+
+        if receipt and not tx.mpesa_receipt_number:
+            tx.mpesa_receipt_number = str(receipt)
+
+        # ✅ STRICT AMOUNT CHECK (MAX SECURITY)
+        if amount_q > Decimal("0") and amount_q != tx.amount:
+            if getattr(settings, "MPESA_STRICT_AMOUNT_MATCH", True):
+                tx.status = "FAILED"
+                tx.result_desc = "Amount mismatch detected during STK verification."[:255]
+                tx.save(update_fields=["status", "result_desc", "mpesa_receipt_number"])
+                return tx
+            # non-strict mode: continue (not recommended)
+
+        if tx_date and not tx.transaction_date:
+            tx.transaction_date = timezone.now()
+
+    # credit
+    tx.status = "SUCCESS"
+    tx.updated_at = timezone.now()
+    tx.save(update_fields=["status", "updated_at", "mpesa_receipt_number", "transaction_date"])
+
+    if tx.user_id:
+        category = _purpose_to_ledger_category(tx.purpose)
+        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+
+        base_amount = _safe_decimal(payload.get("base_amount", tx.amount))
+        fee = _safe_decimal(payload.get("fee", "0"))
+        total = _safe_decimal(payload.get("total_amount", tx.amount))
+
+        ref = tx.mpesa_receipt_number or tx.reference or f"STK#{tx.id}"
+
+        if tx.purpose == "MERRY_CONTRIBUTION":
+            create_ledger_entry(
+                user=tx.user,
+                entry_type="CREDIT",
+                category="MERRY",
+                amount=base_amount,
+                narration="Merry contribution via STK",
+                reference=ref,
+                mpesa_tx=tx,
+                target_object=tx.target_object,
+            )
+            if fee > Decimal("0"):
+                create_ledger_entry(
+                    user=tx.user,
+                    entry_type="DEBIT",
+                    category="TRANSACTION_FEE",
+                    amount=fee,
+                    narration="Merry contribution transaction fee",
+                    reference=f"FEE-{ref}",
+                    mpesa_tx=tx,
+                    target_object=tx.target_object,
+                )
+        else:
+            create_ledger_entry(
+                user=tx.user,
+                entry_type="CREDIT",
+                category=category,
+                amount=total,
+                narration=f"{tx.purpose.replace('_', ' ').title()} via STK",
+                reference=ref,
+                mpesa_tx=tx,
+                target_object=tx.target_object,
+            )
+
+    tx.ledger_posted = True
+    tx.save(update_fields=["ledger_posted"])
     return tx
 
 
+# ============================================================
+# WITHDRAWAL / B2C SERVICES
+# ============================================================
 @transaction.atomic
-def handle_stk_callback(payload: dict) -> Optional[MpesaTransaction]:
-    """
-    ✅ EXACT signature your view uses.
-    Idempotent:
-      - safely updates tx
-      - creates ONLY ONE ledger entry for that mpesa tx
-    """
-    try:
-        cb = payload["Body"]["stkCallback"]
-    except Exception:
-        return None
+def create_withdrawal_request(
+    *,
+    user: AbstractBaseUser,
+    phone: str,
+    amount: Decimal,
+    source: str = "SAVINGS",
+    target_object: Optional[object] = None,
+) -> WithdrawalRequest:
+    phone_n = normalize_phone(phone)
+    amt = _safe_decimal(amount)
+    if amt <= Decimal("0"):
+        raise ValueError("Amount must be greater than 0")
 
-    checkout_id = cb.get("CheckoutRequestID")
-    merchant_id = cb.get("MerchantRequestID")
+    ct, oid = _set_generic_target(target_object)
+    wd = WithdrawalRequest.objects.create(
+        user=user,
+        phone=phone_n,
+        amount=amt,
+        source=source,
+        target_content_type=ct,
+        target_object_id=oid,
+        status="PENDING",
+    )
+    return wd
 
-    tx = None
-    if checkout_id:
-        tx = MpesaTransaction.objects.select_for_update().filter(checkout_request_id=checkout_id).first()
-    if not tx and merchant_id:
-        tx = MpesaTransaction.objects.select_for_update().filter(merchant_request_id=merchant_id).first()
-    if not tx:
-        return None
 
-    # Always store callback
-    tx.callback_payload = payload
+@transaction.atomic
+def approve_withdrawal_request(*, withdrawal_id: int, approved_by: AbstractBaseUser) -> WithdrawalRequest:
+    wd = WithdrawalRequest.objects.select_for_update().get(id=withdrawal_id)
+    if wd.status != "PENDING":
+        return wd
 
-    result_code = str(cb.get("ResultCode")) if cb.get("ResultCode") is not None else ""
-    result_desc = cb.get("ResultDesc", "") or ""
-    tx.result_code = result_code
-    tx.result_desc = result_desc
+    wd.status = "APPROVED"
+    wd.approved_by = approved_by
+    wd.approved_at = timezone.now()
+    wd.save(update_fields=["status", "approved_by", "approved_at"])
+    return wd
 
-    # If already final, don't double post
-    if tx.status in ("SUCCESS", "FAILED", "CANCELLED"):
-        tx.save(update_fields=["callback_payload", "result_code", "result_desc", "updated_at"])
-        return tx
 
-    # Failed / cancelled
-    if result_code != "0":
-        tx.status = "CANCELLED" if result_code == "1032" else "FAILED"
-        tx.save(update_fields=["status", "callback_payload", "result_code", "result_desc", "updated_at"])
-        return tx
+def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransaction:
+    client = get_daraja_client()
 
-    # Success
-    meta = _stk_callback_meta(payload)
-    receipt = meta.get("MpesaReceiptNumber")
-    trx_date = _parse_mpesa_datetime(meta.get("TransactionDate"))
+    with transaction.atomic():
+        wd = WithdrawalRequest.objects.select_for_update().select_related("user").get(id=withdrawal_id)
 
-    if receipt:
-        tx.mpesa_receipt_number = str(receipt)
-    if trx_date:
-        tx.transaction_date = trx_date
+        if wd.status != "APPROVED":
+            raise ValueError(f"Withdrawal must be APPROVED to payout. Current: {wd.status}")
 
-    tx.status = "SUCCESS"
-    tx.save(update_fields=[
-        "status",
-        "callback_payload",
-        "result_code",
-        "result_desc",
-        "mpesa_receipt_number",
-        "transaction_date",
-        "updated_at",
-    ])
+        if wd.is_final:
+            raise ValueError("Withdrawal already finalized")
 
-    # ✅ Create ledger CREDIT once
-    if not PaymentLedger.objects.filter(mpesa_tx=tx).exists():
-        PaymentLedger.objects.create(
-            user=tx.user,
-            entry_type="CREDIT",
-            category=purpose_to_ledger_category(tx.purpose),
-            amount=tx.amount,
-            narration=f"M-Pesa payment ({tx.purpose})",
-            reference=tx.mpesa_receipt_number or f"MPESA_TX_{tx.id}",
-            mpesa_tx=tx,
-            target_content_type=tx.target_content_type,
-            target_object_id=tx.target_object_id,
+        if wd.source == "MERRY" and not wd.can_withdraw_merry:
+            raise ValueError("Merry withdrawal not allowed yet (not payout date).")
+
+        # ✅ HARDEN: CHECK BALANCE BEFORE PAYOUT
+        source_category = _withdrawal_source_to_category(wd.source)
+        available = get_user_balance(user=wd.user, category=source_category)
+        if wd.amount > available:
+            raise ValidationError(f"Insufficient {source_category} balance. Available: {available}")
+
+        fee = calculate_b2c_fee(wd.amount)
+        payout_amount = wd.amount - fee
+
+        if payout_amount <= Decimal("0"):
+            raise ValueError("Withdrawal amount too small after fee")
+
+        ct, oid = _set_generic_target(wd.target_object)
+
+        tx = MpesaTransaction.objects.create(
+            user=wd.user,
+            phone=wd.phone,
+            amount=payout_amount,
+            direction="OUT",
+            channel="B2C",
+            purpose="WITHDRAWAL",
+            status="INITIATED",
+            reference=f"WD#{wd.id}",
+            request_payload={
+                "withdrawal_id": wd.id,
+                "requested_amount": str(wd.amount),
+                "fee": str(fee),
+                "payout_amount": str(payout_amount),
+                "source": wd.source,
+            },
+            callback_payload=None,
+            target_content_type=ct,
+            target_object_id=oid,
         )
 
-    return tx
+        wd.status = "PROCESSING"
+        wd.mpesa_tx = tx
+        wd.save(update_fields=["status", "mpesa_tx"])
 
+    result_url = _build_callback_url("/payments/mpesa/b2c/result/")
+    timeout_url = _build_callback_url("/payments/mpesa/b2c/timeout/")
 
-# ============================================================
-# WITHDRAWALS: Admin approve -> B2C payout
-# ============================================================
-
-@transaction.atomic
-def approve_withdrawal_and_start_payout(*, withdrawal: WithdrawalRequest, admin_user, data: Optional[dict] = None) -> WithdrawalRequest:
-    """
-    ✅ EXACT function name + signature your view imports/calls:
-      approve_withdrawal_and_start_payout(withdrawal=w, admin_user=request.user, data=ser.validated_data)
-
-    data is optional (you can use it later e.g. remarks, override phone, etc.)
-    """
-    cfg = get_mpesa_config()
-
-    w = WithdrawalRequest.objects.select_for_update().select_related("user").get(id=withdrawal.id)
-
-    if w.status != "PENDING":
-        raise ValidationError("Only PENDING withdrawals can be approved.")
-
-    # Optional override phone from validated data if you ever add it to serializer
-    if data and data.get("phone"):
-        w.phone = str(data["phone"])
-
-    phone_norm = normalize_ke_phone(w.phone)
-    w.phone = phone_norm
-
-    # Mark approved
-    w.status = "APPROVED"
-    w.approved_by = admin_user
-    w.approved_at = timezone.now()
-    w.save(update_fields=["status", "approved_by", "approved_at", "phone", "updated_at"])
-
-    # Create outgoing tx
-    tx = MpesaTransaction.objects.create(
-        user=w.user,
-        phone=phone_norm,
-        amount=w.amount,
-        direction="OUT",
-        channel="B2C",
-        purpose="WITHDRAWAL",
-        status="PENDING",
-        reference=f"WITHDRAWAL:{w.id}",
-        request_payload={"withdrawal_id": w.id, "approved_by": getattr(admin_user, "id", None), "data": data or {}},
-        target_content_type=w.target_content_type,
-        target_object_id=w.target_object_id,
+    res = client.b2c_payout(
+        phone=wd.phone,
+        amount=payout_amount,
+        remarks=f"Withdrawal WD#{wd.id}",
+        occasion="Withdrawal",
+        result_url=result_url,
+        timeout_url=timeout_url,
     )
 
-    # Call B2C API
-    url = f"{cfg.base_url}/mpesa/b2c/v1/paymentrequest"
+    MpesaTransaction.objects.filter(id=tx.id).update(
+        conversation_id=res.conversation_id,
+        originator_conversation_id=res.originator_conversation_id or "",
+        status="PENDING",
+        updated_at=timezone.now(),
+    )
 
-    # You can use serializer validated data to customize remarks if you add it later
-    remarks = f"Withdrawal {w.id}"
-
-    payload = {
-        "InitiatorName": cfg.b2c_initiator_name,
-        "SecurityCredential": cfg.b2c_security_credential,
-        "CommandID": "BusinessPayment",
-        "Amount": int(q2(w.amount)),
-        "PartyA": cfg.b2c_shortcode,
-        "PartyB": phone_norm,
-        "Remarks": remarks,
-        "QueueTimeOutURL": cfg.b2c_timeout_url,
-        "ResultURL": cfg.b2c_result_url,
-        "Occasion": f"W{w.id}",
-    }
-
-    r = requests.post(url, headers=_auth_headers(), data=json.dumps(payload), timeout=25)
-    try:
-        resp = r.json()
-    except Exception:
-        resp = {"raw": r.text}
-
-    tx.request_payload = {**(tx.request_payload or {}), "mpesa_request": payload, "mpesa_response": resp}
-
-    if r.status_code != 200:
-        tx.status = "FAILED"
-        tx.result_desc = "B2C initiation failed"
-        tx.save(update_fields=["status", "result_desc", "request_payload", "updated_at"])
-
-        w.status = "FAILED"
-        w.save(update_fields=["status", "updated_at"])
-        raise ValidationError(f"B2C initiation failed: {resp}")
-
-    tx.conversation_id = resp.get("ConversationID") or ""
-    tx.originator_conversation_id = resp.get("OriginatorConversationID") or ""
-    tx.save(update_fields=["conversation_id", "originator_conversation_id", "request_payload", "updated_at"])
-
-    # Link withdrawal and mark processing
-    w.mpesa_tx = tx
-    w.status = "PROCESSING"
-    w.save(update_fields=["mpesa_tx", "status", "updated_at"])
-
-    return w
-
-
-@transaction.atomic
-def handle_b2c_result(payload: dict) -> Optional[MpesaTransaction]:
-    """
-    ✅ EXACT signature your view uses.
-    Updates:
-      - MpesaTransaction
-      - WithdrawalRequest
-      - Ledger DEBIT once on success
-    """
-    result = payload.get("Result") or {}
-
-    conv_id = result.get("ConversationID") or ""
-    orig_id = result.get("OriginatorConversationID") or ""
-
-    tx = None
-    if conv_id:
-        tx = MpesaTransaction.objects.select_for_update().filter(channel="B2C", conversation_id=conv_id).first()
-    if not tx and orig_id:
-        tx = MpesaTransaction.objects.select_for_update().filter(channel="B2C", originator_conversation_id=orig_id).first()
-    if not tx:
-        return None
-
-    tx.callback_payload = payload
-
-    result_code = str(result.get("ResultCode")) if result.get("ResultCode") is not None else ""
-    result_desc = result.get("ResultDesc", "") or ""
-    tx.result_code = result_code
-    tx.result_desc = result_desc
-
-    transaction_id = result.get("TransactionID")
-    if transaction_id:
-        tx.mpesa_receipt_number = str(transaction_id)
-
-    # if already final, keep payload only
-    if tx.status in ("SUCCESS", "FAILED", "CANCELLED"):
-        tx.save(update_fields=["callback_payload", "result_code", "result_desc", "mpesa_receipt_number", "updated_at"])
-        return tx
-
-    tx.status = "SUCCESS" if result_code == "0" else "FAILED"
-    tx.save(update_fields=["status", "callback_payload", "result_code", "result_desc", "mpesa_receipt_number", "updated_at"])
-
-    w = WithdrawalRequest.objects.select_for_update().filter(mpesa_tx=tx).first()
-    if not w:
-        return tx
-
-    if tx.status == "SUCCESS":
-        w.status = "PAID"
-        w.save(update_fields=["status", "updated_at"])
-
-        if not PaymentLedger.objects.filter(mpesa_tx=tx).exists():
-            PaymentLedger.objects.create(
-                user=w.user,
-                entry_type="DEBIT",
-                category="WITHDRAWAL",
-                amount=w.amount,
-                narration="M-Pesa withdrawal payout",
-                reference=tx.mpesa_receipt_number or f"B2C_TX_{tx.id}",
-                mpesa_tx=tx,
-                target_content_type=w.target_content_type,
-                target_object_id=w.target_object_id,
-            )
-    else:
-        w.status = "FAILED"
-        w.save(update_fields=["status", "updated_at"])
-
+    tx.refresh_from_db()
     return tx
 
 
 @transaction.atomic
-def handle_b2c_timeout(payload: dict) -> Optional[MpesaTransaction]:
-    """
-    ✅ EXACT signature your view uses.
+def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction:
+    result = (callback_payload or {}).get("Result") or {}
+    conversation_id = result.get("ConversationID") or result.get("ConversationId") or ""
+    result_code = str(result.get("ResultCode")) if result.get("ResultCode") is not None else ""
+    result_desc = result.get("ResultDesc") or ""
 
-    NOTE: Your MpesaTransaction.STATUS_CHOICES does NOT include "TIMEOUT".
-    So we mark FAILED and set result_desc="TIMEOUT".
-    """
-    result = payload.get("Result") or {}
+    if not conversation_id:
+        raise ValueError("Invalid B2C callback: missing ConversationID")
 
-    conv_id = (result.get("ConversationID") or payload.get("ConversationID") or "")
-    orig_id = (result.get("OriginatorConversationID") or payload.get("OriginatorConversationID") or "")
-
-    tx = None
-    if conv_id:
-        tx = MpesaTransaction.objects.select_for_update().filter(channel="B2C", conversation_id=conv_id).first()
-    if not tx and orig_id:
-        tx = MpesaTransaction.objects.select_for_update().filter(channel="B2C", originator_conversation_id=orig_id).first()
+    tx = MpesaTransaction.objects.select_for_update().filter(conversation_id=conversation_id).first()
     if not tx:
-        return None
+        raise ValueError("Unknown ConversationID (no matching transaction)")
 
-    # final? just store payload
-    if tx.status in ("SUCCESS", "FAILED", "CANCELLED"):
-        tx.callback_payload = payload
-        if not tx.result_desc:
-            tx.result_desc = "TIMEOUT"
-        tx.save(update_fields=["callback_payload", "result_desc", "updated_at"])
+    tx.result_code = result_code
+    tx.result_desc = result_desc
+    tx.callback_payload = callback_payload
+    tx.status = "SUCCESS" if result_code == "0" else "FAILED"
+    tx.updated_at = timezone.now()
+    tx.save(update_fields=["result_code", "result_desc", "callback_payload", "status", "updated_at"])
+
+    wd = WithdrawalRequest.objects.select_for_update().filter(mpesa_tx=tx).first()
+    if wd:
+        wd.status = "PAID" if tx.status == "SUCCESS" else "FAILED"
+        wd.save(update_fields=["status"])
+
+    if tx.status != "SUCCESS" or tx.ledger_posted:
         return tx
 
-    tx.callback_payload = payload
-    tx.status = "FAILED"
-    tx.result_desc = "TIMEOUT"
-    tx.save(update_fields=["callback_payload", "status", "result_desc", "updated_at"])
+    if not tx.user_id:
+        tx.ledger_posted = True
+        tx.save(update_fields=["ledger_posted"])
+        return tx
 
-    w = WithdrawalRequest.objects.select_for_update().filter(mpesa_tx=tx).first()
-    if w and w.status == "PROCESSING":
-        w.status = "FAILED"
-        w.save(update_fields=["status", "updated_at"])
+    payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+    fee = _safe_decimal(payload.get("fee", "0"))
+
+    # ✅ Deduct from SOURCE bucket, not WITHDRAWAL bucket
+    source_category = _withdrawal_source_to_category(payload.get("source", "SAVINGS"))
+    requested_amount = _safe_decimal(payload.get("requested_amount", "0"))
+    if requested_amount <= Decimal("0"):
+        # fallback: requested_amount = payout + fee
+        requested_amount = tx.amount + fee
+
+    create_ledger_entry(
+        user=tx.user,
+        entry_type="DEBIT",
+        category=source_category,
+        amount=requested_amount,
+        narration=f"Withdrawal ({tx.reference})",
+        reference=tx.reference or f"B2C#{tx.id}",
+        mpesa_tx=tx,
+        target_object=tx.target_object,
+    )
+
+    if fee > Decimal("0"):
+        create_ledger_entry(
+            user=tx.user,
+            entry_type="DEBIT",
+            category="WITHDRAWAL_FEE",
+            amount=fee,
+            narration=f"Withdrawal fee ({tx.reference})",
+            reference=f"FEE-{tx.reference or tx.id}",
+            mpesa_tx=tx,
+            target_object=tx.target_object,
+        )
+
+    tx.ledger_posted = True
+    tx.save(update_fields=["ledger_posted"])
+    return tx
+
+
+@transaction.atomic
+def handle_b2c_timeout_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction:
+    result = (callback_payload or {}).get("Result") or {}
+    conversation_id = result.get("ConversationID") or result.get("ConversationId") or ""
+
+    if not conversation_id:
+        raise ValueError("Invalid B2C timeout callback: missing ConversationID")
+
+    tx = MpesaTransaction.objects.select_for_update().filter(conversation_id=conversation_id).first()
+    if not tx:
+        raise ValueError("Unknown ConversationID (no matching transaction)")
+
+    tx.status = "TIMEOUT"
+    tx.callback_payload = callback_payload
+    tx.updated_at = timezone.now()
+    tx.save(update_fields=["status", "callback_payload", "updated_at"])
+
+    wd = WithdrawalRequest.objects.select_for_update().filter(mpesa_tx=tx).first()
+    if wd and not wd.is_final:
+        wd.status = "FAILED"
+        wd.save(update_fields=["status"])
 
     return tx

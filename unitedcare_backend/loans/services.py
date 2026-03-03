@@ -62,8 +62,7 @@ from loans.models import (
     LoanProduct,
     MerryCreditHold,
 )
-from merry.models import Member, Contribution, Payout
-from merry.models import Member as MerryMember
+from merry.models import MerryMember, MerryContribution, MerryPayout
 from groups.models import GroupMembership
 from savings.models import SavingsAccount, SavingsTransaction
 
@@ -329,24 +328,20 @@ def generate_weekly_installments(loan: Loan) -> List[LoanInstallment]:
 
 def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
     """
-    Merry credit available as security:
-        sum(paid contributions) - sum(confirmed payouts) - sum(active holds)
-
-    Uses your models:
-      Member, Contribution(paid=True), Payout(confirmed=True), MerryCreditHold(is_active=True)
+    available credit = sum(PAID contributions) - sum(PAID payouts) - sum(active holds)
     """
-    member = Member.objects.filter(merry_id=merry_id, user_id=user.id).first()
+    member = MerryMember.objects.filter(merry_id=merry_id, user_id=user.id, is_active=True).first()
     if not member:
         raise ValidationError("You must be a member of this Merry to use Merry credit as security.")
 
     contrib_total = (
-        Contribution.objects.filter(member=member, paid=True)
+        MerryContribution.objects.filter(member=member, status="PAID")
         .aggregate(total=Sum("amount"))["total"]
         or Decimal("0.00")
     )
 
     payout_total = (
-        Payout.objects.filter(member=member, merry_id=merry_id, confirmed=True)
+        MerryPayout.objects.filter(merry_id=merry_id, member=member, status="PAID")
         .aggregate(total=Sum("amount"))["total"]
         or Decimal("0.00")
     )

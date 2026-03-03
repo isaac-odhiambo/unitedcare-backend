@@ -5,11 +5,17 @@ from django.conf.urls.static import static
 
 urlpatterns = [
     path("admin/", admin.site.urls),
+
     path("api/accounts/", include("accounts.urls")),
     path("api/merry/", include("merry.urls")),
     path("api/loans/", include("loans.urls")),
     path("api/savings/", include("savings.urls")),
-    
+
+    # ✅ ADD GROUPS HERE (router urls)
+    path("api/groups/", include("groups.urls")),
+
+    # payments is NOT under /api/ in your project
+    path("payments/", include("payments.urls")),
 ]
 
 if settings.DEBUG:

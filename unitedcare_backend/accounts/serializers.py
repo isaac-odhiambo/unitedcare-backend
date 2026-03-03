@@ -2,19 +2,18 @@ from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from rest_framework import serializers
-from .models import KYCProfile
+from .models import OTP, KYCProfile
 import re
-
-from .models import OTP
 
 User = get_user_model()
 
 MAX_FAILED_ATTEMPTS = 5
+MAX_OTP_ATTEMPTS = 5
 
 
-# =========================
+# =========================================================
 # 🔐 REGISTER SERIALIZER
-# =========================
+# =========================================================
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
 
@@ -25,26 +24,31 @@ class RegisterSerializer(serializers.ModelSerializer):
             "phone",
             "id_number",
             "password",
-            # ❌ role removed (server decides role)
         ]
 
     def validate_username(self, value):
-        if not re.match(r"^[A-Za-z]+$", value):
-            raise serializers.ValidationError("Username must contain letters only")
+        value = " ".join(value.strip().split())
+        if not re.match(r"^[A-Za-z\s'-]+$", value):
+            raise serializers.ValidationError(
+                "Name can contain letters, spaces, hyphens, and apostrophes only"
+            )
         return value
 
     def validate_phone(self, value):
         if not re.match(r"^(07|01)\d{8}$", value):
-            raise serializers.ValidationError("Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)")
+            raise serializers.ValidationError(
+                "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)"
+            )
         return value
 
     def validate_id_number(self, value):
         if value and not re.match(r"^\d{1,9}$", value):
-            raise serializers.ValidationError("ID number must be numeric and not exceed 9 digits")
+            raise serializers.ValidationError(
+                "ID number must be numeric and not exceed 9 digits"
+            )
         return value
 
     def validate_password(self, value):
-        # ✅ uses Django password validators (set min length in settings)
         validate_password(value)
         return value
 
@@ -54,16 +58,16 @@ class RegisterSerializer(serializers.ModelSerializer):
             phone=validated_data["phone"],
             id_number=validated_data.get("id_number"),
             password=validated_data["password"],
-            role="member",        # ✅ force member at signup
-            status="pending",     # ✅ default
-            is_active=False,      # ✅ activated via OTP
+            role="member",
+            status="pending",
+            is_active=False,
         )
         return user
 
 
-# =========================
-# 🔐 LOGIN SERIALIZER
-# =========================
+# =========================================================
+# 🔐 LOGIN SERIALIZER (WITH ACCOUNT LOCKING)
+# =========================================================
 class LoginSerializer(serializers.Serializer):
     phone = serializers.CharField()
     password = serializers.CharField(write_only=True)
@@ -77,20 +81,24 @@ class LoginSerializer(serializers.Serializer):
         except User.DoesNotExist:
             raise serializers.ValidationError("Invalid phone or password")
 
-        # 🚫 Blocked account
         if user.status == "blocked":
-            raise serializers.ValidationError("Your account has been blocked. Contact support.")
+            raise serializers.ValidationError(
+                "Your account has been blocked. Contact support."
+            )
 
-        # 🚫 Account not activated
         if not user.is_active:
-            raise serializers.ValidationError("Account not activated. Please verify OTP.")
+            raise serializers.ValidationError(
+                "Account not activated. Please verify OTP."
+            )
 
-        # 🔒 Account locked
         if user.is_locked():
-            remaining = int((user.locked_until - timezone.now()).total_seconds() / 60) + 1
-            raise serializers.ValidationError(f"Account locked. Try again in {remaining} minutes.")
+            remaining = int(
+                (user.locked_until - timezone.now()).total_seconds() / 60
+            ) + 1
+            raise serializers.ValidationError(
+                f"Account locked. Try again in {remaining} minutes."
+            )
 
-        # 🔑 Authenticate (USERNAME_FIELD=phone, so username=phone)
         auth_user = authenticate(
             request=self.context.get("request"),
             username=phone,
@@ -103,20 +111,23 @@ class LoginSerializer(serializers.Serializer):
 
             if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
                 user.lock_account()
-                raise serializers.ValidationError("Too many failed attempts. Account locked for 15 minutes.")
+                raise serializers.ValidationError(
+                    "Too many failed attempts. Account locked for 15 minutes."
+                )
 
             remaining = MAX_FAILED_ATTEMPTS - user.failed_login_attempts
-            raise serializers.ValidationError(f"Invalid credentials. {remaining} attempts remaining.")
+            raise serializers.ValidationError(
+                f"Invalid credentials. {remaining} attempts remaining."
+            )
 
-        # ✅ Successful login
         user.reset_failed_attempts()
         data["user"] = user
         return data
 
 
-# =========================
+# =========================================================
 # 📩 FORGOT PASSWORD (REQUEST OTP)
-# =========================
+# =========================================================
 class ForgotPasswordSerializer(serializers.Serializer):
     phone = serializers.CharField()
 
@@ -125,14 +136,16 @@ class ForgotPasswordSerializer(serializers.Serializer):
             raise serializers.ValidationError("Enter a valid Kenyan phone number")
 
         if not User.objects.filter(phone=value).exists():
-            raise serializers.ValidationError("User with this phone does not exist")
+            raise serializers.ValidationError(
+                "User with this phone does not exist"
+            )
 
         return value
 
 
-# =========================
-# 🔄 RESET PASSWORD (VERIFY OTP)
-# =========================
+# =========================================================
+# 🔄 RESET PASSWORD (WITH OTP ATTEMPT LIMITING)
+# =========================================================
 class ResetPasswordSerializer(serializers.Serializer):
     phone = serializers.CharField()
     otp = serializers.CharField()
@@ -144,38 +157,102 @@ class ResetPasswordSerializer(serializers.Serializer):
         password = data["new_password"]
 
         try:
-            otp = OTP.objects.filter(phone=phone, code=otp_code, is_used=False).latest("created_at")
+            otp = OTP.objects.filter(
+                phone=phone,
+                is_used=False
+            ).latest("created_at")
         except OTP.DoesNotExist:
             raise serializers.ValidationError("Invalid or expired OTP")
 
+        # 🔒 Expiration check
         if otp.is_expired():
+            otp.is_used = True
+            otp.save(update_fields=["is_used"])
             raise serializers.ValidationError("OTP has expired")
 
+        # 🔐 Attempt limit check
+        if otp.attempts >= MAX_OTP_ATTEMPTS:
+            otp.is_used = True
+            otp.save(update_fields=["is_used"])
+            raise serializers.ValidationError(
+                "Too many incorrect attempts. Request a new OTP."
+            )
+
+        # ❌ Wrong OTP
+        if otp.code != otp_code:
+            otp.attempts += 1
+            otp.save(update_fields=["attempts"])
+
+            remaining = MAX_OTP_ATTEMPTS - otp.attempts
+
+            if remaining <= 0:
+                otp.is_used = True
+                otp.save(update_fields=["is_used"])
+                raise serializers.ValidationError(
+                    "Too many incorrect attempts. OTP locked."
+                )
+
+            raise serializers.ValidationError(
+                f"Incorrect OTP. {remaining} attempts remaining."
+            )
+
+        # ✅ Correct OTP
         validate_password(password)
 
         data["otp_obj"] = otp
         return data
 
+    def save(self):
+        phone = self.validated_data["phone"]
+        password = self.validated_data["new_password"]
+        otp = self.validated_data["otp_obj"]
+
+        user = User.objects.get(phone=phone)
+        user.set_password(password)
+        user.save(update_fields=["password"])
+
+        otp.is_used = True
+        otp.save(update_fields=["is_used"])
+
+        return user
+
+
+# =========================================================
+# 🔁 RESEND OTP
+# =========================================================
 class ResendOTPSerializer(serializers.Serializer):
     phone = serializers.CharField()
 
     def validate_phone(self, value):
         if not re.match(r"^(07|01)\d{8}$", value):
-            raise serializers.ValidationError("Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)")
+            raise serializers.ValidationError(
+                "Enter a valid Kenyan phone number"
+            )
 
         try:
             user = User.objects.get(phone=value)
         except User.DoesNotExist:
-            raise serializers.ValidationError("User with this phone does not exist")
+            raise serializers.ValidationError(
+                "User with this phone does not exist"
+            )
 
         if user.is_active:
-            raise serializers.ValidationError("Account is already verified.")
+            raise serializers.ValidationError(
+                "Account is already verified."
+            )
 
         if user.status == "blocked":
-            raise serializers.ValidationError("Your account has been blocked. Contact support.")
+            raise serializers.ValidationError(
+                "Your account has been blocked."
+            )
 
         self.context["user"] = user
         return value
+
+
+# =========================================================
+# 👤 CURRENT USER
+# =========================================================
 class MeSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -188,19 +265,25 @@ class UpdateMeSerializer(serializers.ModelSerializer):
         fields = ["username", "email"]
 
     def validate_username(self, value):
-        if value and not value.isalpha():
-            raise serializers.ValidationError("Username must contain letters only")
+        if not re.match(r"^[A-Za-z\s'-]+$", value):
+            raise serializers.ValidationError(
+                "Name can contain letters, spaces, hyphens, and apostrophes only"
+            )
         return value
 
 
+# =========================================================
+# 🧾 KYC SUBMISSION
+# =========================================================
 class KYCSubmitSerializer(serializers.ModelSerializer):
     class Meta:
         model = KYCProfile
         fields = ["passport_photo", "id_front", "id_back"]
 
     def validate(self, attrs):
-        # Ensure all files are provided
-        for f in ["passport_photo", "id_front", "id_back"]:
-            if not attrs.get(f):
-                raise serializers.ValidationError({f: "This file is required."})
+        for field in ["passport_photo", "id_front", "id_back"]:
+            if not attrs.get(field):
+                raise serializers.ValidationError(
+                    {field: "This file is required."}
+                )
         return attrs

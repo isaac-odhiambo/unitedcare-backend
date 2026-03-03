@@ -1,35 +1,36 @@
 from datetime import timedelta
 from django.conf import settings
-
-from django.contrib.auth import get_user_model
+from django.contrib.auth import get_user_model, authenticate
 from django.utils import timezone
 
 from rest_framework import status
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from .serializers import ResendOTPSerializer
-from .serializers import MeSerializer, UpdateMeSerializer, KYCSubmitSerializer
-from .models import KYCProfile
-from rest_framework.permissions import IsAuthenticated
 
-
-from .models import OTP
 from .serializers import (
     RegisterSerializer,
     LoginSerializer,
     ForgotPasswordSerializer,
     ResetPasswordSerializer,
+    ResendOTPSerializer,
+    MeSerializer,
+    UpdateMeSerializer,
+    KYCSubmitSerializer,
 )
+from .models import OTP, KYCProfile
 from .throttles import LoginThrottle, OTPThrottle
 from .utils.phone import normalize_kenyan_phone
 from .utils.sms import send_sms
 
-User = get_user_model()
+UserModel = get_user_model()
 
+# Constants
 OTP_COOLDOWN_SECONDS = 60
 OTP_MAX_PER_HOUR = 5
+MAX_OTP_ATTEMPTS = 5
+MAX_LOGIN_ATTEMPTS = 5
 
 
 # =========================
@@ -76,33 +77,42 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        phone = normalize_kenyan_phone(phone)
+
         try:
-            otp = OTP.objects.filter(phone=phone, code=code, is_used=False).latest("created_at")
-        except OTP.DoesNotExist:
+            user = UserModel.objects.get(phone=phone)
+        except UserModel.DoesNotExist:
+            return Response(
+                {"detail": "User not found"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Locked accounts
+        if user.is_locked():
+            return Response(
+                {"detail": "Too many failed attempts. Account temporarily locked."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        otp = OTP.objects.filter(phone=phone, code=code, is_used=False).order_by("-created_at").first()
+
+        if not otp or otp.is_expired():
+            # Increase failed attempts
+            user.failed_login_attempts += 1
+            if user.failed_login_attempts >= MAX_OTP_ATTEMPTS:
+                user.lock_account()
+            else:
+                user.save(update_fields=["failed_login_attempts"])
             return Response(
                 {"detail": "Invalid or expired OTP"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if otp.is_expired():
-            return Response(
-                {"detail": "OTP has expired"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        try:
-            user = User.objects.get(phone=phone)
-        except User.DoesNotExist:
-            return Response(
-                {"detail": "User not found for this phone."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # ✅ Activate account
+        # ✅ Success
         user.is_active = True
+        user.reset_failed_attempts()
         user.save(update_fields=["is_active"])
 
-        # ✅ Mark OTP used
         otp.is_used = True
         otp.save(update_fields=["is_used"])
 
@@ -110,7 +120,7 @@ class VerifyOTPView(APIView):
 
 
 # =========================
-# 🔑 LOGIN (JWT) + BEST-PRACTICE CHECKS
+# 🔑 LOGIN (JWT) + SECURE
 # =========================
 class LoginView(APIView):
     permission_classes = [AllowAny]
@@ -122,28 +132,28 @@ class LoginView(APIView):
 
         user = serializer.validated_data["user"]
 
-        # ✅ 1) Block locked accounts
+        # Locked?
         if user.is_locked():
             return Response(
                 {"detail": "Account temporarily locked. Try again later."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # ✅ 2) Must be OTP-activated
+        # Must be OTP-activated
         if not user.is_active:
             return Response(
                 {"detail": "Account not activated. Verify OTP first."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # ✅ 3) Blocked users cannot login (recommended)
-        if getattr(user, "status", "") == "blocked":
+        # Blocked
+        if user.status == "blocked":
             return Response(
                 {"detail": "Account blocked. Contact admin."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        # ✅ reset failed attempts after successful login
+        # ✅ Successful login
         user.reset_failed_attempts()
 
         refresh = RefreshToken.for_user(user)
@@ -154,7 +164,7 @@ class LoginView(APIView):
                 "refresh": str(refresh),
                 "role": user.role,
                 "status": user.status,
-                "is_admin": getattr(user, "is_admin", False),
+                "is_admin": user.is_admin,
             },
             status=status.HTTP_200_OK,
         )
@@ -171,7 +181,7 @@ class ForgotPasswordView(APIView):
         serializer = ForgotPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        phone = serializer.validated_data["phone"]
+        phone = normalize_kenyan_phone(serializer.validated_data["phone"])
         now = timezone.now()
 
         # ⏱️ Cooldown: 1 OTP per minute
@@ -191,13 +201,12 @@ class ForgotPasswordView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        # 🔐 Generate OTP
+        # Generate OTP
         otp_code = OTP.generate()
         OTP.objects.create(phone=phone, code=otp_code)
 
-        phone_intl = normalize_kenyan_phone(phone)
         message = f"Your password reset OTP is {otp_code}. Valid for 5 minutes."
-        send_sms(phone_intl, message)
+        send_sms(phone, message)
 
         return Response({"message": "OTP sent successfully"}, status=status.HTTP_200_OK)
 
@@ -212,31 +221,28 @@ class ResetPasswordView(APIView):
         serializer = ResetPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        phone = serializer.validated_data["phone"]
+        phone = normalize_kenyan_phone(serializer.validated_data["phone"])
         new_password = serializer.validated_data["new_password"]
         otp = serializer.validated_data["otp_obj"]
 
         try:
-            user = User.objects.get(phone=phone)
-        except User.DoesNotExist:
+            user = UserModel.objects.get(phone=phone)
+        except UserModel.DoesNotExist:
             return Response({"detail": "User not found."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # 🔐 Reset password
+        # Reset password
         user.set_password(new_password)
 
-        # ✅ Ensure account is active after password reset
+        # Ensure account is active
         user.is_active = True
-
-        # ✅ Reset lock state too
         user.failed_login_attempts = 0
         user.locked_until = None
         user.save(update_fields=["password", "is_active", "failed_login_attempts", "locked_until"])
 
-        # ✅ Mark OTP as used
+        # Mark OTP used
         otp.is_used = True
         otp.save(update_fields=["is_used"])
 
-        # 🔑 AUTO LOGIN
         refresh = RefreshToken.for_user(user)
 
         return Response(
@@ -249,45 +255,57 @@ class ResetPasswordView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+# =========================
+# 🔁 RESEND OTP
+# =========================
 class ResendOTPView(APIView):
     permission_classes = [AllowAny]
+    throttle_classes = [OTPThrottle]
+
     def post(self, request):
         serializer = ResendOTPSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
 
-        phone = serializer.validated_data["phone"]
+        phone = normalize_kenyan_phone(serializer.validated_data["phone"])
+        now = timezone.now()
 
-        # 🔁 optional: limit spam (1 OTP per 60 seconds)
+        # Cooldown 60s
         last = OTP.objects.filter(phone=phone).order_by("-created_at").first()
-        if last and (timezone.now() - last.created_at).total_seconds() < 60:
-            wait = 60 - int((timezone.now() - last.created_at).total_seconds())
+        if last and (now - last.created_at).total_seconds() < 60:
+            wait = 60 - int((now - last.created_at).total_seconds())
             return Response(
                 {"detail": f"Please wait {wait} seconds before requesting a new OTP."},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        # ✅ create new OTP
+        # Max 5 per hour
+        hour_ago = now - timedelta(hours=1)
+        if OTP.objects.filter(phone=phone, created_at__gte=hour_ago).count() >= 5:
+            return Response(
+                {"detail": "OTP request limit reached. Try again later."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         code = OTP.generate()
-        otp = OTP.objects.create(phone=phone, code=code)
+        OTP.objects.create(phone=phone, code=code)
+        message = f"Your verification code is {code}. Valid for 5 minutes."
+        send_sms(phone, message)
 
-        # ✅ TODO: send SMS here
-        # For now DEV mode:
-        if settings.DEBUG:
-            print(f"DEV RESEND OTP for {phone}: {code}")
+        return Response({"detail": "OTP resent successfully."}, status=status.HTTP_200_OK)
 
-        return Response(
-            {"detail": "OTP resent. Please check your phone."},
-            status=status.HTTP_200_OK
-        )
+
+# =========================
+# 👤 USER INFO
+# =========================
 class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         user = request.user
         data = MeSerializer(user).data
-
-        # add is_admin computed flag
-        data["is_admin"] = getattr(user, "is_admin", False)
+        data["is_admin"] = user.is_admin
         return Response(data, status=status.HTTP_200_OK)
 
     def patch(self, request):
@@ -297,27 +315,25 @@ class MeView(APIView):
         serializer.save()
 
         data = MeSerializer(user).data
-        data["is_admin"] = getattr(user, "is_admin", False)
+        data["is_admin"] = user.is_admin
         return Response(data, status=status.HTTP_200_OK)
 
 
 # =========================
-# 🪪 KYC SUBMIT (multipart)
+# 🪪 KYC SUBMISSION
 # =========================
 class KYCSubmitView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user = request.user
-
-        # create or update KYC profile
         kyc_obj, _ = KYCProfile.objects.get_or_create(user=user)
 
-        serializer = KYCSubmitSerializer(kyc_obj, data=request.data, partial=False)
+        serializer = KYCSubmitSerializer(kyc_obj, data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        # optional: set status to submitted automatically
+        # Auto-update status
         if kyc_obj.status != "submitted":
             kyc_obj.status = "submitted"
             kyc_obj.save(update_fields=["status"])
@@ -326,4 +342,3 @@ class KYCSubmitView(APIView):
             {"message": "KYC submitted successfully", "kyc_status": kyc_obj.status},
             status=status.HTTP_200_OK,
         )
-    

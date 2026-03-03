@@ -1,236 +1,102 @@
+# payments/serializers.py
 from decimal import Decimal
 from rest_framework import serializers
-from django.contrib.contenttypes.models import ContentType
 
-from .models import MpesaTransaction, PaymentLedger, WithdrawalRequest
-
-
-# =========================
-# Small helpers
-# =========================
-def _to_decimal(value) -> Decimal:
-    try:
-        return Decimal(str(value))
-    except Exception:
-        return Decimal("0")
+from .models import WithdrawalRequest, PaymentLedger, MpesaTransaction
+from .balances import get_user_balance
+from .utils import calculate_b2c_fee
 
 
-# =========================
-# Mpesa Transaction Serializer
-# =========================
-class MpesaTransactionSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = MpesaTransaction
-        fields = [
-            "id",
-            "user",
-            "phone",
-            "amount",
-            "direction",
-            "channel",
-            "purpose",
-            "status",
-            "merchant_request_id",
-            "checkout_request_id",
-            "conversation_id",
-            "originator_conversation_id",
-            "result_code",
-            "result_desc",
-            "mpesa_receipt_number",
-            "transaction_date",
-            "request_payload",
-            "callback_payload",
-            "created_at",
-            "updated_at",
-        ]
-        read_only_fields = fields
+def _source_to_category(source: str) -> str:
+    s = (source or "").upper()
+    if s in ("SAVINGS", "MERRY", "GROUP"):
+        return s
+    return "SAVINGS"
 
 
-# =========================
-# Ledger / History Serializer
-# =========================
-class PaymentLedgerSerializer(serializers.ModelSerializer):
-    mpesa = serializers.SerializerMethodField()
-
-    class Meta:
-        model = PaymentLedger
-        fields = [
-            "id",
-            "entry_type",
-            "category",
-            "amount",
-            "narration",
-            "reference",
-            "created_at",
-            "mpesa",
-        ]
-
-    def get_mpesa(self, obj):
-        if not obj.mpesa_tx:
-            return None
-        return {
-            "id": obj.mpesa_tx.id,
-            "status": obj.mpesa_tx.status,
-            "receipt": obj.mpesa_tx.mpesa_receipt_number,
-            "channel": obj.mpesa_tx.channel,
-            "direction": obj.mpesa_tx.direction,
-            "phone": obj.mpesa_tx.phone,
-        }
-
-
-# =========================
-# Withdrawal - Create (Member)
-# =========================
 class WithdrawalCreateSerializer(serializers.ModelSerializer):
-    """
-    Member creates:
-    - amount
-    - phone (optional, defaults to user's phone if you want in views)
-    - source: SAVINGS / MERRY / OTHER
-    - (optional) link to a specific object via content_type + object_id
-    """
-
-    # Optional generic target linking
-    target_app_label = serializers.CharField(required=False, allow_blank=True)
-    target_model = serializers.CharField(required=False, allow_blank=True)
-    target_object_id = serializers.IntegerField(required=False)
-
     class Meta:
         model = WithdrawalRequest
-        fields = [
-            "id",
-            "phone",
-            "amount",
-            "source",
-            "target_app_label",
-            "target_model",
-            "target_object_id",
-            "status",
-            "created_at",
-        ]
-        read_only_fields = ["id", "status", "created_at"]
+        fields = ["phone", "amount", "source"]
 
-    def validate_amount(self, value):
-        amt = _to_decimal(value)
-        if amt <= 0:
-            raise serializers.ValidationError("Amount must be greater than zero.")
+    def validate_amount(self, value: Decimal):
+        if value is None or value <= Decimal("0"):
+            raise serializers.ValidationError("Amount must be greater than 0.")
         return value
 
+    def validate_source(self, value: str):
+        v = (value or "SAVINGS").upper()
+        if v not in ("SAVINGS", "MERRY", "GROUP", "OTHER"):
+            raise serializers.ValidationError("Invalid source. Use SAVINGS, MERRY, GROUP or OTHER.")
+        return v
+
     def validate(self, attrs):
-        # If they provide target info, they must provide all
-        has_any = any(
-            [
-                attrs.get("target_app_label"),
-                attrs.get("target_model"),
-                attrs.get("target_object_id") is not None,
-            ]
-        )
-        has_all = (
-            bool(attrs.get("target_app_label"))
-            and bool(attrs.get("target_model"))
-            and attrs.get("target_object_id") is not None
-        )
-        if has_any and not has_all:
-            raise serializers.ValidationError(
-                "Provide target_app_label + target_model + target_object_id together."
-            )
+        """
+        Early guard (UX/security):
+        - block obvious insufficient balance requests
+        NOTE: services.py will enforce again at payout time.
+        """
+        request = self.context.get("request")
+        if not request or not request.user or not request.user.is_authenticated:
+            return attrs
+
+        amount = Decimal(str(attrs.get("amount") or "0"))
+        source = (attrs.get("source") or "SAVINGS").upper()
+
+        # Only enforce balance for known sources
+        if source in ("SAVINGS", "MERRY", "GROUP"):
+            category = _source_to_category(source)
+            available = get_user_balance(user=request.user, category=category)
+
+            # Your current payout logic: payout = amount - fee (fee is inside amount)
+            # Therefore the required balance is at least "amount"
+            # If you ever change to "fee on top", change this to amount + fee.
+            if amount > available:
+                raise serializers.ValidationError(
+                    {"amount": f"Insufficient {category} balance. Available: {available}."}
+                )
+
+            # Optional: prevent too-small withdrawals after fee
+            fee = calculate_b2c_fee(amount)
+            payout_amount = amount - fee
+            if payout_amount <= Decimal("0"):
+                raise serializers.ValidationError(
+                    {"amount": "Amount is too small after withdrawal fee. Increase amount."}
+                )
+
         return attrs
 
     def create(self, validated_data):
-        # Extract target info if provided
-        app_label = validated_data.pop("target_app_label", None)
-        model = validated_data.pop("target_model", None)
-        obj_id = validated_data.pop("target_object_id", None)
-
-        user = self.context["request"].user
-        withdrawal = WithdrawalRequest.objects.create(
-            user=user,
-            status="PENDING",
-            **validated_data,
-        )
-
-        if app_label and model and obj_id is not None:
-            try:
-                ct = ContentType.objects.get(app_label=app_label, model=model)
-                withdrawal.target_content_type = ct
-                withdrawal.target_object_id = int(obj_id)
-                withdrawal.save(update_fields=["target_content_type", "target_object_id"])
-            except ContentType.DoesNotExist:
-                # Keep request valid even if target is wrong; you can also raise error if you prefer
-                raise serializers.ValidationError(
-                    {"target_model": "Invalid target model/app_label."}
-                )
-
-        return withdrawal
+        request = self.context["request"]
+        # Serializer only creates request. Admin approval + payout handled by services/views.
+        return WithdrawalRequest.objects.create(user=request.user, **validated_data)
 
 
-# =========================
-# Withdrawal - List/Detail
-# =========================
 class WithdrawalSerializer(serializers.ModelSerializer):
-    mpesa = serializers.SerializerMethodField()
-    approved_by_username = serializers.SerializerMethodField()
-    rejected_by_username = serializers.SerializerMethodField()
-
     class Meta:
         model = WithdrawalRequest
-        fields = [
-            "id",
-            "user",
-            "phone",
-            "amount",
-            "source",
-            "status",
-            "rejection_reason",
-            "approved_by",
-            "approved_by_username",
-            "approved_at",
-            "rejected_by",
-            "rejected_by_username",
-            "rejected_at",
-            "created_at",
-            "updated_at",
-            "mpesa",
-        ]
-        read_only_fields = fields
-
-    def get_approved_by_username(self, obj):
-        return getattr(obj.approved_by, "username", None) if obj.approved_by else None
-
-    def get_rejected_by_username(self, obj):
-        return getattr(obj.rejected_by, "username", None) if obj.rejected_by else None
-
-    def get_mpesa(self, obj):
-        if not obj.mpesa_tx:
-            return None
-        return {
-            "id": obj.mpesa_tx.id,
-            "status": obj.mpesa_tx.status,
-            "channel": obj.mpesa_tx.channel,
-            "receipt": obj.mpesa_tx.mpesa_receipt_number,
-            "result_desc": obj.mpesa_tx.result_desc,
-        }
+        fields = "__all__"
+        read_only_fields = "__all__"
 
 
-# =========================
-# Admin - Approve / Reject
-# =========================
 class WithdrawalApproveSerializer(serializers.Serializer):
-    """
-    Admin approves -> set APPROVED.
-    After approving, your view/service can start B2C payout and move to PROCESSING.
-    """
-    approve = serializers.BooleanField(default=True)
-
-    def validate(self, attrs):
-        if attrs.get("approve") is not True:
-            raise serializers.ValidationError("approve must be true for approval.")
-        return attrs
+    # keep for future fields (remarks, admin_pin etc.)
+    pass
 
 
 class WithdrawalRejectSerializer(serializers.Serializer):
-    rejection_reason = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    rejection_reason = serializers.CharField(required=False, allow_blank=True)
 
-    def validate(self, attrs):
-        # optional reason, but good to have
-        return attrs
+
+class PaymentLedgerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentLedger
+        fields = "__all__"
+        read_only_fields = "__all__"
+
+
+class MpesaTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MpesaTransaction
+        fields = "__all__"
+        read_only_fields = "__all__"

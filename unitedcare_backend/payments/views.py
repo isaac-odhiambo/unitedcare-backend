@@ -1,11 +1,15 @@
+# payments/views.py
 from decimal import Decimal
+import logging
+
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import ValidationError, PermissionDenied
 
 from .models import WithdrawalRequest, PaymentLedger, MpesaTransaction
 from .serializers import (
@@ -16,14 +20,66 @@ from .serializers import (
     PaymentLedgerSerializer,
     MpesaTransactionSerializer,
 )
-
 from .permissions import IsAdmin
+
+# ✅ Throttling (STK spam protection)
+from .throttles import StkPushUserThrottle, StkPushPhoneThrottle
+
+logger = logging.getLogger(__name__)
+
+# =========================================================
+# Security helpers
+# =========================================================
+def _require_callback_token(request) -> None:
+    """
+    If MPESA_CALLBACK_TOKEN is set, require it on callback URLs as ?token=...
+    """
+    token = getattr(settings, "MPESA_CALLBACK_TOKEN", "")
+    if not token:
+        return  # dev: allow
+
+    provided = (request.query_params.get("token") or "").strip()
+    if provided != token:
+        raise PermissionDenied("Invalid callback token")
+
+
+def _get_client_ip(request) -> str:
+    """
+    Prefer X-Forwarded-For when behind proxy/load balancer.
+    """
+    xff = request.META.get("HTTP_X_FORWARDED_FOR")
+    if xff:
+        # first IP in the chain is the original client
+        return xff.split(",")[0].strip()
+    return (request.META.get("REMOTE_ADDR") or "").strip()
+
+
+def _require_safaricom_ip(request) -> None:
+    """
+    Strong protection: block fake callbacks.
+    In production: set MPESA_CALLBACK_IP_ALLOWLIST = ["1.2.3.4", ...]
+    If not set, we allow (dev mode).
+    """
+    allowlist = getattr(settings, "MPESA_CALLBACK_IP_ALLOWLIST", None)
+    if not allowlist:
+        return  # dev: allow
+
+    ip = _get_client_ip(request)
+    if ip not in set(allowlist):
+        raise PermissionDenied("Callback IP not allowed")
+
+
+def _accepted_callback_response():
+    """
+    Safer callback behavior:
+    - Always respond Accepted to reduce retries and avoid leaking errors.
+    """
+    return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
 
 
 # =========================================================
 # Optional services wiring (safe import)
 # =========================================================
-
 def _svc(name: str):
     """
     Import a function from payments/services.py if it exists.
@@ -36,18 +92,20 @@ def _svc(name: str):
         return None
 
 
+# ✅ Service names
 initiate_stk_push = _svc("initiate_stk_push")
 handle_stk_callback = _svc("handle_stk_callback")
 
-approve_withdrawal_and_start_payout = _svc("approve_withdrawal_and_start_payout")
-handle_b2c_result = _svc("handle_b2c_result")
-handle_b2c_timeout = _svc("handle_b2c_timeout")
+approve_withdrawal_request = _svc("approve_withdrawal_request")
+initiate_b2c_payout_for_withdrawal = _svc("initiate_b2c_payout_for_withdrawal")
+
+handle_b2c_result_callback = _svc("handle_b2c_result_callback")
+handle_b2c_timeout_callback = _svc("handle_b2c_timeout_callback")
 
 
 # =========================================================
 # Withdrawal (Member)
 # =========================================================
-
 class MyWithdrawalsView(generics.ListAPIView):
     """
     Member: list my withdrawal requests
@@ -57,7 +115,12 @@ class MyWithdrawalsView(generics.ListAPIView):
     serializer_class = WithdrawalSerializer
 
     def get_queryset(self):
-        return WithdrawalRequest.objects.filter(user=self.request.user).order_by("-id")
+        return (
+            WithdrawalRequest.objects
+            .filter(user=self.request.user)
+            .select_related("mpesa_tx")
+            .order_by("-id")
+        )
 
 
 class RequestWithdrawalView(generics.CreateAPIView):
@@ -87,7 +150,6 @@ class RequestWithdrawalView(generics.CreateAPIView):
 # =========================================================
 # Withdrawal (Admin)
 # =========================================================
-
 class AdminWithdrawalsView(generics.ListAPIView):
     """
     Admin: list all withdrawals
@@ -97,9 +159,11 @@ class AdminWithdrawalsView(generics.ListAPIView):
     serializer_class = WithdrawalSerializer
 
     def get_queryset(self):
-        qs = WithdrawalRequest.objects.select_related(
-            "user", "approved_by", "rejected_by"
-        ).order_by("-id")
+        qs = (
+            WithdrawalRequest.objects
+            .select_related("user", "approved_by", "rejected_by", "mpesa_tx")
+            .order_by("-id")
+        )
 
         st = self.request.query_params.get("status")
         if st:
@@ -128,19 +192,23 @@ class ApproveWithdrawalView(APIView):
         if w.status != "PENDING":
             raise ValidationError("Only PENDING withdrawals can be approved.")
 
-        # If services exist, let services own the full workflow:
-        # - mark approved
-        # - create OUT Mpesa tx
-        # - call B2C
-        # - set PROCESSING
-        if approve_withdrawal_and_start_payout:
-            w = approve_withdrawal_and_start_payout(withdrawal=w, admin_user=request.user, data=ser.validated_data)
+        if approve_withdrawal_request and initiate_b2c_payout_for_withdrawal:
+            # 1) approve
+            approve_withdrawal_request(withdrawal_id=w.id, approved_by=request.user)
+            # 2) payout (services will balance-check again before payout)
+            tx = initiate_b2c_payout_for_withdrawal(withdrawal_id=w.id)
+
+            w.refresh_from_db()
             return Response(
-                {"message": "Withdrawal approved. Payout initiated.", "withdrawal": WithdrawalSerializer(w).data},
+                {
+                    "message": "Withdrawal approved. Payout initiated.",
+                    "withdrawal": WithdrawalSerializer(w).data,
+                    "mpesa_tx": MpesaTransactionSerializer(tx).data,
+                },
                 status=status.HTTP_200_OK,
             )
 
-        # Fallback (keeps your previous behavior)
+        # Fallback (dev only)
         w.status = "APPROVED"
         w.approved_by = request.user
         w.approved_at = timezone.now()
@@ -187,10 +255,9 @@ class RejectWithdrawalView(APIView):
 # =========================================================
 # Ledger / History
 # =========================================================
-
 class MyLedgerHistoryView(generics.ListAPIView):
     """
-    Member: list my ledger entries (history for savings, loans, merry, etc.)
+    Member: list my ledger entries
     GET /payments/ledger/my/
     """
     permission_classes = [permissions.IsAuthenticated]
@@ -230,10 +297,9 @@ class AdminLedgerHistoryView(generics.ListAPIView):
 # =========================================================
 # Mpesa Debug / Admin list
 # =========================================================
-
 class AdminMpesaTransactionsView(generics.ListAPIView):
     """
-    Admin: view mpesa tx (optional)
+    Admin: view mpesa tx
     GET /payments/mpesa/admin/
     """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -256,15 +322,27 @@ class AdminMpesaTransactionsView(generics.ListAPIView):
 # =========================================================
 # Mpesa endpoints (hooks)
 # =========================================================
-
 class MpesaStkPushView(APIView):
     """
     Start STK push for deposits (savings, contributions, loan repayments, merry, etc.)
 
     POST /payments/mpesa/stk-push/
-    body: { phone, amount, purpose, reference? }
+    body: { phone, amount, purpose, reference?, narration? }
+
+    ✅ Security:
+    - Throttling per user + per phone to prevent STK spam
+    - Allow only known purposes
     """
     permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [StkPushUserThrottle, StkPushPhoneThrottle]
+
+    ALLOWED_PURPOSES = {
+        "SAVINGS_DEPOSIT",
+        "MERRY_CONTRIBUTION",
+        "GROUP_CONTRIBUTION",
+        "LOAN_REPAYMENT",
+        "OTHER",
+    }
 
     @transaction.atomic
     def post(self, request):
@@ -272,15 +350,22 @@ class MpesaStkPushView(APIView):
         amount = request.data.get("amount")
         purpose = (request.data.get("purpose") or "SAVINGS_DEPOSIT").strip().upper()
         reference = (request.data.get("reference") or "").strip()
+        narration = (request.data.get("narration") or "").strip()
 
         if not phone:
             raise ValidationError({"phone": "Phone is required."})
 
-        amt = Decimal(str(amount or "0"))
+        try:
+            amt = Decimal(str(amount or "0"))
+        except Exception:
+            amt = Decimal("0")
+
         if amt <= 0:
             raise ValidationError({"amount": "Amount must be greater than 0."})
 
-        # ✅ If services exist: actually call Safaricom + store CheckoutRequestID etc.
+        if purpose not in self.ALLOWED_PURPOSES:
+            raise ValidationError({"purpose": f"Invalid purpose. Use one of: {sorted(self.ALLOWED_PURPOSES)}"})
+
         if initiate_stk_push:
             tx = initiate_stk_push(
                 user=request.user,
@@ -288,14 +373,15 @@ class MpesaStkPushView(APIView):
                 amount=amt,
                 purpose=purpose,
                 reference=reference,
-                raw_request=request.data,
+                narration=narration,
+                target_object=None,
             )
             return Response(
                 {"message": "STK push initiated.", "tx": MpesaTransactionSerializer(tx).data},
                 status=status.HTTP_200_OK,
             )
 
-        # Fallback: store as INITIATED only (your old behavior)
+        # Fallback (dev only)
         tx = MpesaTransaction.objects.create(
             user=request.user,
             phone=phone,
@@ -317,84 +403,71 @@ class MpesaStkPushView(APIView):
 class MpesaStkCallbackView(APIView):
     """
     Callback from Safaricom for STK push
-    POST /payments/mpesa/stk/callback/
+    POST /payments/mpesa/stk/callback/?token=...
+
+    ✅ Security:
+    - Requires callback token (if set)
+    - Requires callback IP allowlist (if set)
+    - Calls service which does STK Query verification before credit
+    - Always returns Accepted (no info leak)
     """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
     def post(self, request):
-        data = request.data
-
-        # ✅ If services exist: do full confirmation + ledger posting + idempotency
-        if handle_stk_callback:
-            handle_stk_callback(data)
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
-
-        # Fallback: store payload only (your old behavior)
-        checkout_id = None
         try:
-            checkout_id = data["Body"]["stkCallback"]["CheckoutRequestID"]
-        except Exception:
-            checkout_id = None
-
-        if checkout_id:
-            tx = MpesaTransaction.objects.select_for_update().filter(checkout_request_id=checkout_id).first()
-            if tx:
-                tx.callback_payload = data
-                tx.updated_at = timezone.now()
-                tx.save(update_fields=["callback_payload", "updated_at"])
-
-        return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
+            _require_callback_token(request)
+            _require_safaricom_ip(request)
+            if handle_stk_callback:
+                handle_stk_callback(callback_payload=request.data)
+        except Exception as e:
+            logger.exception("STK callback handling error: %s", str(e))
+        return _accepted_callback_response()
 
 
 class MpesaB2CResultView(APIView):
     """
     B2C result callback (withdrawals payout)
-    POST /payments/mpesa/b2c/result/
+    POST /payments/mpesa/b2c/result/?token=...
+
+    ✅ Security:
+    - Requires callback token (if set)
+    - Requires callback IP allowlist (if set)
+    - Always returns Accepted (no info leak)
     """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
     def post(self, request):
-        data = request.data
-
-        if handle_b2c_result:
-            handle_b2c_result(data)
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
-
-        conversation_id = data.get("Result", {}).get("ConversationID")
-        if conversation_id:
-            tx = MpesaTransaction.objects.select_for_update().filter(conversation_id=conversation_id).first()
-            if tx:
-                tx.callback_payload = data
-                tx.updated_at = timezone.now()
-                tx.save(update_fields=["callback_payload", "updated_at"])
-
-        return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
+        try:
+            _require_callback_token(request)
+            _require_safaricom_ip(request)
+            if handle_b2c_result_callback:
+                handle_b2c_result_callback(callback_payload=request.data)
+        except Exception as e:
+            logger.exception("B2C result callback handling error: %s", str(e))
+        return _accepted_callback_response()
 
 
 class MpesaB2CTimeoutView(APIView):
     """
     B2C timeout callback
-    POST /payments/mpesa/b2c/timeout/
+    POST /payments/mpesa/b2c/timeout/?token=...
+
+    ✅ Security:
+    - Requires callback token (if set)
+    - Requires callback IP allowlist (if set)
+    - Always returns Accepted (no info leak)
     """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
     def post(self, request):
-        data = request.data
-
-        if handle_b2c_timeout:
-            handle_b2c_timeout(data)
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
-
-        conversation_id = data.get("Result", {}).get("ConversationID") or data.get("ConversationID")
-        if conversation_id:
-            tx = MpesaTransaction.objects.select_for_update().filter(conversation_id=conversation_id).first()
-            if tx:
-                tx.callback_payload = data
-                tx.status = "TIMEOUT"
-                tx.updated_at = timezone.now()
-                tx.save(update_fields=["callback_payload", "status", "updated_at"])
-
-        return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
+        try:
+            _require_callback_token(request)
+            _require_safaricom_ip(request)
+            if handle_b2c_timeout_callback:
+                handle_b2c_timeout_callback(callback_payload=request.data)
+        except Exception as e:
+            logger.exception("B2C timeout callback handling error: %s", str(e))
+        return _accepted_callback_response()

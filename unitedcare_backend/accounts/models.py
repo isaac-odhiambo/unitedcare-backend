@@ -16,8 +16,8 @@ phone_validator = RegexValidator(
 )
 
 username_validator = RegexValidator(
-    regex=r"^[A-Za-z]+$",
-    message="Username must contain letters only"
+    regex=r"^[A-Za-z\s'-]+$",
+    message="Name can contain letters, spaces, hyphens, and apostrophes only"
 )
 
 id_number_validator = RegexValidator(
@@ -42,17 +42,14 @@ class User(AbstractUser):
         ("blocked", "Blocked"),
     )
 
-    # ✅ Email is OPTIONAL (not needed for chama members)
     email = models.EmailField(null=True, blank=True)
 
-    # 🔤 Username: letters only
     username = models.CharField(
         max_length=150,
         unique=True,
         validators=[username_validator]
     )
 
-    # 📱 Phone number (LOGIN FIELD) - indexed for faster lookup
     phone = models.CharField(
         max_length=10,
         unique=True,
@@ -60,7 +57,6 @@ class User(AbstractUser):
         validators=[phone_validator]
     )
 
-    # 🪪 National ID (OPTIONAL – trusted only when KYC approved)
     id_number = models.CharField(
         max_length=9,
         unique=True,
@@ -75,26 +71,22 @@ class User(AbstractUser):
         default="member"
     )
 
-    # Business approval workflow
     status = models.CharField(
         max_length=10,
         choices=STATUS_CHOICES,
         default="pending"
     )
 
-    # 🔐 OTP-based activation (login requires is_active=True)
     is_active = models.BooleanField(default=False)
 
-    # 🔒 Login security
     failed_login_attempts = models.PositiveIntegerField(default=0)
     locked_until = models.DateTimeField(null=True, blank=True)
 
-    # 🔑 Authentication config
     USERNAME_FIELD = "phone"
     REQUIRED_FIELDS = ["username"]
 
     # =========================
-    # 🔒 SECURITY METHODS
+    # 🔒 ACCOUNT LOCK SECURITY
     # =========================
 
     def is_locked(self) -> bool:
@@ -111,14 +103,11 @@ class User(AbstractUser):
         self.save(update_fields=["failed_login_attempts", "locked_until"])
 
     # =========================
-    # ✅ BEST PRACTICE HELPERS
+    # ✅ HELPERS
     # =========================
 
     @property
     def is_admin(self) -> bool:
-        """
-        Best practice: allow Django built-in admin flags too.
-        """
         return self.is_superuser or self.is_staff or self.role == "admin"
 
     @property
@@ -131,9 +120,6 @@ class User(AbstractUser):
 
     @property
     def is_kyc_approved(self) -> bool:
-        """
-        ID number is only trusted when KYC is approved.
-        """
         return hasattr(self, "kycprofile") and self.kycprofile.status == "approved"
 
     def __str__(self):
@@ -141,33 +127,72 @@ class User(AbstractUser):
 
 
 # =========================
-# 🔢 OTP MODEL
+# 🔢 OTP MODEL (UPDATED WITH ATTEMPT LIMITING)
 # =========================
 
 class OTP(models.Model):
     phone = models.CharField(max_length=10, validators=[phone_validator])
     code = models.CharField(max_length=6)
+
     created_at = models.DateTimeField(auto_now_add=True)
     is_used = models.BooleanField(default=False)
+
+    # 🔐 NEW SECURITY FIELD
+    attempts = models.PositiveIntegerField(default=0)
 
     class Meta:
         indexes = [
             models.Index(fields=["phone", "created_at"]),
         ]
 
+    # =========================
+    # 🔒 OTP SECURITY METHODS
+    # =========================
+
     def is_expired(self):
         return timezone.now() > self.created_at + timedelta(minutes=5)
+
+    def is_locked(self):
+        """
+        Locked if too many incorrect attempts
+        """
+        return self.attempts >= 5
+
+    def mark_used(self):
+        self.is_used = True
+        self.save(update_fields=["is_used"])
+
+    def increment_attempts(self):
+        self.attempts += 1
+        self.save(update_fields=["attempts"])
+
+    # =========================
+    # 🔐 GENERATION
+    # =========================
 
     @staticmethod
     def generate():
         return str(random.randint(100000, 999999))
+
+    @staticmethod
+    def can_request_new(phone):
+        """
+        Optional rate limiting:
+        Prevent OTP spam (1 per 60 seconds)
+        """
+        last_otp = OTP.objects.filter(phone=phone).order_by("-created_at").first()
+
+        if not last_otp:
+            return True
+
+        return timezone.now() > last_otp.created_at + timedelta(seconds=60)
 
     def __str__(self):
         return f"{self.phone} - {self.code}"
 
 
 # =========================
-# 🧾 KYC MODEL (APPLIED LATER)
+# 🧾 KYC MODEL
 # =========================
 
 class KYCProfile(models.Model):
@@ -188,7 +213,6 @@ class KYCProfile(models.Model):
     id_front = models.ImageField(upload_to="kyc/id_front/")
     id_back = models.ImageField(upload_to="kyc/id_back/")
 
-    # ⚠️ KYC DOES NOT BLOCK LOGIN
     status = models.CharField(
         max_length=20,
         choices=KYC_STATUS,
