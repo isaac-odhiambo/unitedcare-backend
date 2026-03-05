@@ -138,19 +138,16 @@ class MpesaTransaction(models.Model):
             models.Index(fields=["phone", "created_at"]),
         ]
         constraints = [
-            # ✅ STK idempotency (callback retries safe)
             models.UniqueConstraint(
                 fields=["checkout_request_id"],
                 name="uniq_checkout_request_id",
                 condition=Q(checkout_request_id__isnull=False) & ~Q(checkout_request_id=""),
             ),
-            # ✅ strongest uniqueness when SUCCESS (receipt should never repeat)
             models.UniqueConstraint(
                 fields=["mpesa_receipt_number"],
                 name="uniq_mpesa_receipt_number",
                 condition=Q(mpesa_receipt_number__isnull=False) & ~Q(mpesa_receipt_number=""),
             ),
-            # ✅ B2C idempotency
             models.UniqueConstraint(
                 fields=["conversation_id"],
                 name="uniq_conversation_id",
@@ -173,16 +170,19 @@ class PaymentLedger(models.Model):
     """
 
     ENTRY_CHOICES = (("CREDIT", "Credit (Money In)"), ("DEBIT", "Debit (Money Out)"))
+
     CATEGORY_CHOICES = (
-    ("SAVINGS", "Savings"),
-    ("LOANS", "Loans"),
-    ("MERRY", "Merry-go-round"),
-    ("GROUP", "Group"),
-    ("WITHDRAWAL", "Withdrawal"),
-    ("WITHDRAWAL_FEE", "Withdrawal Fee"),
-    ("TRANSACTION_FEE", "Transaction Fee"),  # ✅ ADD THIS
-    ("OTHER", "Other"),
-)
+        ("SAVINGS", "Savings"),
+        ("LOANS", "Loans"),
+        ("MERRY", "Merry-go-round"),
+        ("GROUP", "Group"),
+        ("WITHDRAWAL", "Withdrawal"),
+        ("WITHDRAWAL_FEE", "Withdrawal Fee"),
+        # ✅ ADDED: used by services.py when Merry STK fee is enabled
+        ("TRANSACTION_FEE", "Transaction Fee"),
+        ("OTHER", "Other"),
+    )
+
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -201,7 +201,6 @@ class PaymentLedger(models.Model):
     narration = models.CharField(max_length=255, blank=True, default="")
     reference = models.CharField(max_length=120, blank=True, default="", db_index=True)
 
-    # Link to mpesa transaction if mpesa-based
     mpesa_tx = models.ForeignKey(
         MpesaTransaction,
         on_delete=models.SET_NULL,
@@ -211,7 +210,6 @@ class PaymentLedger(models.Model):
         db_index=True,
     )
 
-    # Link to anything (Loan, SavingsAccount, Merry, Contribution, etc.)
     target_content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
     target_object_id = models.PositiveIntegerField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
@@ -266,7 +264,6 @@ class WithdrawalRequest(models.Model):
         db_index=True,
     )
 
-    # Link withdrawal to specific object: SavingsAccount / Merry / Group / etc.
     target_content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
     target_object_id = models.PositiveIntegerField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
@@ -278,7 +275,6 @@ class WithdrawalRequest(models.Model):
         db_index=True,
     )
 
-    # Admin decision fields
     approved_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -298,7 +294,6 @@ class WithdrawalRequest(models.Model):
     rejected_at = models.DateTimeField(null=True, blank=True)
     rejection_reason = models.CharField(max_length=255, null=True, blank=True)
 
-    # Linked payout transaction (B2C)
     mpesa_tx = models.OneToOneField(
         MpesaTransaction,
         on_delete=models.SET_NULL,

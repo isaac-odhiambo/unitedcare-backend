@@ -1,46 +1,11 @@
-"""
-loans/services.py (COMPLETE + UPDATED)
--------------------------------------
-
-✅ What this version supports (best-practice + adjustable):
-1) Loan context required: either Merry OR Group (not both)
-2) Borrower must be a member of the chosen context
-3) Savings are PERSONAL (NOT tied to merry/group):
-   - Use user's active FLEXIBLE SavingsAccount as primary account
-4) Eligibility:
-   - Must have DEPOSITs for 3 consecutive months (including current month)
-   - Max loan principal = 3 × available_balance
-   - Borrower must NOT have another active loan with outstanding_balance > 0
-5) Weekly repayment schedule (Monday by default, based on LoanProduct.repayment_weekday)
-6) Approval security (coverage-based):
-   - Security target = SECURITY_COVERAGE_RATIO × principal
-   - Borrower contributes: savings reserve first + optional Merry credit hold (unpaid-out contributions)
-   - Remaining gap covered by 1+ accepted guarantors (weighted or equal split)
-   - Stores exact reserved amounts for accurate release
-7) Completion:
-   - Releases borrower savings reserve
-   - Releases guarantor reserves
-   - Releases Merry credit hold
-
-⚠️ REQUIRED MODEL FIELDS (add via migrations):
-- loans.models.Loan:
-    borrower_reserved_savings (DecimalField)
-    borrower_reserved_merry_credit (DecimalField)
-    security_target (DecimalField)
-- loans.models.LoanGuarantor:
-    reserved_amount (DecimalField)
-- loans.models.MerryCreditHold:
-    (loan OneToOne, merry_id, user, amount, is_active, timestamps)
-
-Assumptions (match your models):
-- savings.models has:
-    SavingsAccount(balance, reserved_amount, available_balance property, account_type, is_active),
-    SavingsTransaction(txn_type, created_at, account)
-- merry.models has:
-    Member(merry, user), Contribution(member, amount, paid), Payout(member, merry, amount, confirmed)
-- loans.models has:
-    Loan, LoanGuarantor, LoanInstallment, LoanPayment, LoanProduct, MerryCreditHold
-"""
+# loans/services.py (COMPLETE + UPDATED)
+# -------------------------------------
+# ✅ Updated to match your NEW Merry models (Seat + Slot dues):
+#   - Replaced old MerryContribution usage with MerryContributionDue (paid_amount allocations)
+#   - Updated payout aggregation to use seat-based payouts (MerryPayout.seat -> member)
+# ✅ Adds MPESA repayment hook for centralized payments app:
+#   - apply_mpesa_repayment(...) called by payments/services.py on STK SUCCESS (LOAN_REPAYMENT)
+#   - Idempotent (prevents double-applying the same MpesaTransaction)
 
 from __future__ import annotations
 
@@ -62,10 +27,16 @@ from loans.models import (
     LoanProduct,
     MerryCreditHold,
 )
-from merry.models import MerryMember, MerryContribution, MerryPayout
+
+# ✅ UPDATED IMPORTS (MerryContribution removed)
+from merry.models import (
+    MerryMember,
+    MerryContributionDue,
+    MerryPayout,
+)
+
 from groups.models import GroupMembership
 from savings.models import SavingsAccount, SavingsTransaction
-
 
 # ==========================================================
 # ✅ ADJUST HERE (POLICY)
@@ -118,7 +89,7 @@ def ensure_membership(user, ctx: LoanContext) -> None:
     ctx.validate()
 
     if ctx.merry_id:
-        if not MerryMember.objects.filter(merry_id=ctx.merry_id, user_id=user.id).exists():
+        if not MerryMember.objects.filter(merry_id=ctx.merry_id, user_id=user.id, is_active=True).exists():
             raise ValidationError("You must join this Merry before requesting a loan.")
     else:
         if not GroupMembership.objects.filter(group_id=ctx.group_id, user_id=user.id, is_active=True).exists():
@@ -323,32 +294,48 @@ def generate_weekly_installments(loan: Loan) -> List[LoanInstallment]:
 
 
 # ==========================================================
-# Merry Credit Security (using YOUR Merry models)
+# ✅ Merry Credit Security (UPDATED for your NEW Merry models)
 # ==========================================================
 
 def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
     """
-    available credit = sum(PAID contributions) - sum(PAID payouts) - sum(active holds)
+    ✅ NEW MODEL LOGIC
+
+    available credit = (total allocated into dues for this member)
+                     - (total PAID payouts for this member's seats)
+                     - (total active holds)
+
+    Notes:
+    - Contributions are represented by MerryContributionDue.paid_amount (allocated confirmed payments).
+    - Payouts are seat-based: MerryPayout.seat -> seat.member.
     """
-    member = MerryMember.objects.filter(merry_id=merry_id, user_id=user.id, is_active=True).first()
+    member = MerryMember.objects.filter(
+        merry_id=merry_id, user_id=user.id, is_active=True
+    ).first()
     if not member:
         raise ValidationError("You must be a member of this Merry to use Merry credit as security.")
 
+    # Total "contributed" = total allocated money into dues for ALL seats of this member (all periods)
     contrib_total = (
-        MerryContribution.objects.filter(member=member, status="PAID")
-        .aggregate(total=Sum("amount"))["total"]
+        MerryContributionDue.objects.filter(seat__member=member, seat__is_active=True)
+        .aggregate(total=Sum("paid_amount"))
+        .get("total")
         or Decimal("0.00")
     )
 
+    # Total payouts already received = sum of PAID payouts for this member's seats
     payout_total = (
-        MerryPayout.objects.filter(merry_id=merry_id, member=member, status="PAID")
-        .aggregate(total=Sum("amount"))["total"]
+        MerryPayout.objects.filter(seat__member=member, status="PAID")
+        .aggregate(total=Sum("amount"))
+        .get("total")
         or Decimal("0.00")
     )
 
+    # Existing credit holds for active loans
     held_total = (
         MerryCreditHold.objects.filter(user_id=user.id, merry_id=merry_id, is_active=True)
-        .aggregate(total=Sum("amount"))["total"]
+        .aggregate(total=Sum("amount"))
+        .get("total")
         or Decimal("0.00")
     )
 
@@ -434,8 +421,8 @@ def reserve_security_for_loan(loan: Loan) -> Dict[str, Decimal]:
     Approval-time security reserve:
     1) security_target = SECURITY_COVERAGE_RATIO × principal
     2) Reserve borrower savings up to BORROWER_SAVINGS_RESERVE_RATIO × principal (capped by available)
-    3) Optionally hold Merry credit (unpaid-out contributions) if allowed
-    4) Remaining gap covered by 1+ accepted guarantors (weighted or equal)
+    3) Optionally hold Merry credit
+    4) Remaining gap covered by 1+ accepted guarantors
     5) Store exact allocations for audit + accurate release
     """
     principal = q2(Decimal(loan.principal))
@@ -635,7 +622,7 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
 
 
 # -------------------------
-# Payments
+# Payments (manual + MPESA hook)
 # -------------------------
 
 @transaction.atomic
@@ -693,6 +680,57 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
 
     if loan.status == "COMPLETED":
         release_reserved_security_for_loan(loan)
+
+    return loan
+
+
+@transaction.atomic
+def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
+    """
+    ✅ Centralized MPESA repayment hook used by payments/services.py:
+
+    Called after STK SUCCESS for purpose=LOAN_REPAYMENT.
+
+    - Idempotent: prevents applying the same MpesaTransaction twice
+    - Creates LoanPayment(method="MPESA") linked by reference MPESA_TX#<id>
+    - Applies the amount to installments + updates balances
+    - Releases reserved security if loan completes
+
+    Note:
+      We accept mpesa_tx as an object to avoid hard import cycles.
+      (payments.models.MpesaTransaction instance)
+    """
+    loan = Loan.objects.select_for_update().select_related("product", "borrower").filter(id=loan_id).first()
+    if not loan:
+        raise ValidationError("Loan not found.")
+
+    amt = q2(Decimal(amount))
+    if amt <= 0:
+        raise ValidationError("Repayment amount must be greater than 0.")
+
+    if loan.status not in ("APPROVED", "DEFAULTED"):
+        raise ValidationError("You can only repay an approved/defaulted loan.")
+
+    tx_id = getattr(mpesa_tx, "id", None)
+    if not tx_id:
+        raise ValidationError("Invalid mpesa_tx supplied (missing id).")
+
+    ref = f"MPESA_TX#{tx_id}"
+
+    # ✅ Idempotency guard
+    if LoanPayment.objects.filter(loan=loan, method="MPESA", reference=ref).exists():
+        return loan
+
+    # Record payment row (audit)
+    LoanPayment.objects.create(
+        loan=loan,
+        amount=amt,
+        method="MPESA",
+        reference=ref,
+    )
+
+    # Apply to schedule
+    apply_payment_to_loan(loan, amt)
 
     return loan
 

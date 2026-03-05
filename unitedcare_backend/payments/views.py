@@ -28,6 +28,46 @@ from .throttles import StkPushUserThrottle, StkPushPhoneThrottle
 logger = logging.getLogger(__name__)
 
 # =========================================================
+# ✅ ADDED: reference helpers (keeps views aligned with services conventions)
+# =========================================================
+def _extract_id(reference: str, prefix: str):
+    ref = (reference or "").strip()
+    if not ref.startswith(prefix):
+        return None
+    try:
+        return int(ref.replace(prefix, "").strip())
+    except Exception:
+        return None
+
+
+def _require_reference_format(purpose: str, reference: str) -> None:
+    """
+    ✅ ADDED: Validate reference format early (friendly errors) BEFORE calling services.
+
+    Matches your payments/services.py routing conventions:
+      - MERRY_CONTRIBUTION => "MERRY-PAYMENT-<payment_id>"
+      - LOAN_REPAYMENT     => "LOAN-<loan_id>"
+      - GROUP_CONTRIBUTION => "GROUP-<group_id>"   (and services will enforce membership)
+    """
+    p = (purpose or "").upper()
+    ref = (reference or "").strip()
+
+    if p == "MERRY_CONTRIBUTION":
+        if _extract_id(ref, "MERRY-PAYMENT-") is None:
+            raise ValidationError(
+                {"reference": "For MERRY_CONTRIBUTION, reference must be 'MERRY-PAYMENT-<payment_id>'."}
+            )
+
+    if p == "LOAN_REPAYMENT":
+        if _extract_id(ref, "LOAN-") is None:
+            raise ValidationError({"reference": "For LOAN_REPAYMENT, reference must be 'LOAN-<loan_id>'."})
+
+    if p == "GROUP_CONTRIBUTION":
+        if _extract_id(ref, "GROUP-") is None:
+            raise ValidationError({"reference": "For GROUP_CONTRIBUTION, reference must be 'GROUP-<group_id>'."})
+
+
+# =========================================================
 # Security helpers
 # =========================================================
 def _require_callback_token(request) -> None:
@@ -87,6 +127,7 @@ def _svc(name: str):
     """
     try:
         from . import services
+
         return getattr(services, name, None)
     except Exception:
         return None
@@ -111,13 +152,13 @@ class MyWithdrawalsView(generics.ListAPIView):
     Member: list my withdrawal requests
     GET /payments/withdrawals/my/
     """
+
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = WithdrawalSerializer
 
     def get_queryset(self):
         return (
-            WithdrawalRequest.objects
-            .filter(user=self.request.user)
+            WithdrawalRequest.objects.filter(user=self.request.user)
             .select_related("mpesa_tx")
             .order_by("-id")
         )
@@ -128,6 +169,7 @@ class RequestWithdrawalView(generics.CreateAPIView):
     Member: create withdrawal request
     POST /payments/withdrawals/request/
     """
+
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = WithdrawalCreateSerializer
 
@@ -155,13 +197,13 @@ class AdminWithdrawalsView(generics.ListAPIView):
     Admin: list all withdrawals
     GET /payments/withdrawals/admin/
     """
+
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = WithdrawalSerializer
 
     def get_queryset(self):
         qs = (
-            WithdrawalRequest.objects
-            .select_related("user", "approved_by", "rejected_by", "mpesa_tx")
+            WithdrawalRequest.objects.select_related("user", "approved_by", "rejected_by", "mpesa_tx")
             .order_by("-id")
         )
 
@@ -177,6 +219,7 @@ class ApproveWithdrawalView(APIView):
     Admin: approve a withdrawal request and start payout (B2C) via services
     PATCH /payments/withdrawals/<id>/approve/
     """
+
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     @transaction.atomic
@@ -225,6 +268,7 @@ class RejectWithdrawalView(APIView):
     Admin: reject withdrawal
     PATCH /payments/withdrawals/<id>/reject/
     """
+
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     @transaction.atomic
@@ -260,13 +304,13 @@ class MyLedgerHistoryView(generics.ListAPIView):
     Member: list my ledger entries
     GET /payments/ledger/my/
     """
+
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = PaymentLedgerSerializer
 
     def get_queryset(self):
         return (
-            PaymentLedger.objects
-            .filter(user=self.request.user)
+            PaymentLedger.objects.filter(user=self.request.user)
             .select_related("mpesa_tx")
             .order_by("-id")
         )
@@ -277,6 +321,7 @@ class AdminLedgerHistoryView(generics.ListAPIView):
     Admin: list all ledger entries
     GET /payments/ledger/admin/
     """
+
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = PaymentLedgerSerializer
 
@@ -302,6 +347,7 @@ class AdminMpesaTransactionsView(generics.ListAPIView):
     Admin: view mpesa tx
     GET /payments/mpesa/admin/
     """
+
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = MpesaTransactionSerializer
 
@@ -333,6 +379,7 @@ class MpesaStkPushView(APIView):
     - Throttling per user + per phone to prevent STK spam
     - Allow only known purposes
     """
+
     permission_classes = [permissions.IsAuthenticated]
     throttle_classes = [StkPushUserThrottle, StkPushPhoneThrottle]
 
@@ -365,6 +412,13 @@ class MpesaStkPushView(APIView):
 
         if purpose not in self.ALLOWED_PURPOSES:
             raise ValidationError({"purpose": f"Invalid purpose. Use one of: {sorted(self.ALLOWED_PURPOSES)}"})
+
+        # =========================================================
+        # ✅ ADDED: validate reference formats (so frontend follows conventions)
+        # (services.py also enforces GROUP_CONTRIBUTION membership, but this
+        # gives clean early errors)
+        # =========================================================
+        _require_reference_format(purpose, reference)
 
         if initiate_stk_push:
             tx = initiate_stk_push(
@@ -411,6 +465,7 @@ class MpesaStkCallbackView(APIView):
     - Calls service which does STK Query verification before credit
     - Always returns Accepted (no info leak)
     """
+
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -435,6 +490,7 @@ class MpesaB2CResultView(APIView):
     - Requires callback IP allowlist (if set)
     - Always returns Accepted (no info leak)
     """
+
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -459,6 +515,7 @@ class MpesaB2CTimeoutView(APIView):
     - Requires callback IP allowlist (if set)
     - Always returns Accepted (no info leak)
     """
+
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic

@@ -306,6 +306,9 @@ class MeView(APIView):
         user = request.user
         data = MeSerializer(user).data
         data["is_admin"] = user.is_admin
+        # ✅ add this
+        kyc = getattr(user, "kycprofile", None)
+        data["kyc_status"] = getattr(kyc, "status", "not_submitted")
         return Response(data, status=status.HTTP_200_OK)
 
     def patch(self, request):
