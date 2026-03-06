@@ -1,32 +1,51 @@
 # payments/urls.py
 from django.urls import path
+
 from .views import (
-    MyWithdrawalsView, RequestWithdrawalView,
-    AdminWithdrawalsView, ApproveWithdrawalView, RejectWithdrawalView,
-    MyLedgerHistoryView, AdminLedgerHistoryView,
+    AdminFeeConfigDetailView,
+    AdminFeeConfigListCreateView,
+    AdminLedgerHistoryView,
     AdminMpesaTransactionsView,
-    MpesaStkPushView, MpesaStkCallbackView,
-    MpesaB2CResultView, MpesaB2CTimeoutView,
+    AdminWithdrawalsView,
+    ApproveWithdrawalView,
+    MpesaB2CResultView,
+    MpesaB2CTimeoutView,
+    MpesaStkCallbackView,
+    MpesaStkPushView,
+    MyLedgerHistoryView,
+    MyWithdrawalsView,
+    RejectWithdrawalView,
+    RequestWithdrawalView,
 )
 
 urlpatterns = [
-    # withdrawals
-    path("withdrawals/my/", MyWithdrawalsView.as_view()),
-    path("withdrawals/request/", RequestWithdrawalView.as_view()),
-    path("withdrawals/admin/", AdminWithdrawalsView.as_view()),
-    path("withdrawals/<int:pk>/approve/", ApproveWithdrawalView.as_view()),
-    path("withdrawals/<int:pk>/reject/", RejectWithdrawalView.as_view()),
+    # =========================================================
+    # Fee Config (Admin)
+    # =========================================================
+    path("fees/admin/", AdminFeeConfigListCreateView.as_view(), name="admin-fee-config-list-create"),
+    path("fees/admin/<int:pk>/", AdminFeeConfigDetailView.as_view(), name="admin-fee-config-detail"),
 
-    # ledger
-    path("ledger/my/", MyLedgerHistoryView.as_view()),
-    path("ledger/admin/", AdminLedgerHistoryView.as_view()),
+    # =========================================================
+    # Withdrawals
+    # =========================================================
+    path("withdrawals/my/", MyWithdrawalsView.as_view(), name="my-withdrawals"),
+    path("withdrawals/request/", RequestWithdrawalView.as_view(), name="request-withdrawal"),
+    path("withdrawals/admin/", AdminWithdrawalsView.as_view(), name="admin-withdrawals"),
+    path("withdrawals/<int:pk>/approve/", ApproveWithdrawalView.as_view(), name="approve-withdrawal"),
+    path("withdrawals/<int:pk>/reject/", RejectWithdrawalView.as_view(), name="reject-withdrawal"),
 
-    # mpesa tx admin
-    path("mpesa/admin/", AdminMpesaTransactionsView.as_view()),
+    # =========================================================
+    # Ledger
+    # =========================================================
+    path("ledger/my/", MyLedgerHistoryView.as_view(), name="my-ledger"),
+    path("ledger/admin/", AdminLedgerHistoryView.as_view(), name="admin-ledger"),
 
-    # mpesa initiation + callbacks
-    path("mpesa/stk-push/", MpesaStkPushView.as_view()),
-    path("mpesa/stk/callback/", MpesaStkCallbackView.as_view()),
-    path("mpesa/b2c/result/", MpesaB2CResultView.as_view()),
-    path("mpesa/b2c/timeout/", MpesaB2CTimeoutView.as_view()),
+    # =========================================================
+    # Mpesa / STK / B2C
+    # =========================================================
+    path("mpesa/admin/", AdminMpesaTransactionsView.as_view(), name="admin-mpesa-transactions"),
+    path("mpesa/stk-push/", MpesaStkPushView.as_view(), name="mpesa-stk-push"),
+    path("mpesa/stk/callback/", MpesaStkCallbackView.as_view(), name="mpesa-stk-callback"),
+    path("mpesa/b2c/result/", MpesaB2CResultView.as_view(), name="mpesa-b2c-result"),
+    path("mpesa/b2c/timeout/", MpesaB2CTimeoutView.as_view(), name="mpesa-b2c-timeout"),
 ]

@@ -1,102 +1,222 @@
 # payments/serializers.py
 from decimal import Decimal
+
+from django.core.validators import RegexValidator
 from rest_framework import serializers
 
-from .models import WithdrawalRequest, PaymentLedger, MpesaTransaction
-from .balances import get_user_balance
-from .utils import calculate_b2c_fee
+from .models import (
+    MpesaTransaction,
+    PaymentLedger,
+    TransactionFeeConfig,
+    WithdrawalRequest,
+)
 
 
-def _source_to_category(source: str) -> str:
-    s = (source or "").upper()
-    if s in ("SAVINGS", "MERRY", "GROUP"):
-        return s
-    return "SAVINGS"
+# =========================================================
+# Shared validators
+# =========================================================
+phone_validator = RegexValidator(
+    regex=r"^(07|01)\d{8}$",
+    message="Phone number must be a valid Kenyan number (07XXXXXXXX or 01XXXXXXXX).",
+)
+
+
+def _money(v) -> Decimal:
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return Decimal("0.00")
+
+
+# =========================================================
+# Fee Config
+# =========================================================
+class TransactionFeeConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TransactionFeeConfig
+        fields = [
+            "id",
+            "purpose",
+            "fixed_fee",
+            "percentage_fee",
+            "is_active",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "updated_at"]
+
+    def validate_fixed_fee(self, value):
+        if value is None:
+            return Decimal("0.00")
+        if value < Decimal("0.00"):
+            raise serializers.ValidationError("Fixed fee cannot be negative.")
+        return value
+
+    def validate_percentage_fee(self, value):
+        if value is None:
+            return Decimal("0.00")
+        if value < Decimal("0.00"):
+            raise serializers.ValidationError("Percentage fee cannot be negative.")
+        if value > Decimal("100.00"):
+            raise serializers.ValidationError("Percentage fee cannot exceed 100.")
+        return value
+
+
+# =========================================================
+# Mpesa Transaction
+# =========================================================
+class MpesaTransactionSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(source="user.id", read_only=True)
+
+    class Meta:
+        model = MpesaTransaction
+        fields = [
+            "id",
+            "user_id",
+            "phone",
+            "amount",
+            "base_amount",
+            "transaction_fee",
+            "direction",
+            "channel",
+            "purpose",
+            "status",
+            "reference",
+            "merchant_request_id",
+            "checkout_request_id",
+            "conversation_id",
+            "originator_conversation_id",
+            "result_code",
+            "result_desc",
+            "mpesa_receipt_number",
+            "transaction_date",
+            "request_payload",
+            "callback_payload",
+            "ledger_posted",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "user_id",
+            "direction",
+            "channel",
+            "status",
+            "merchant_request_id",
+            "checkout_request_id",
+            "conversation_id",
+            "originator_conversation_id",
+            "result_code",
+            "result_desc",
+            "mpesa_receipt_number",
+            "transaction_date",
+            "request_payload",
+            "callback_payload",
+            "ledger_posted",
+            "created_at",
+            "updated_at",
+        ]
+
+
+# =========================================================
+# Ledger
+# =========================================================
+class PaymentLedgerSerializer(serializers.ModelSerializer):
+    mpesa_tx = MpesaTransactionSerializer(read_only=True)
+
+    class Meta:
+        model = PaymentLedger
+        fields = [
+            "id",
+            "entry_type",
+            "category",
+            "amount",
+            "narration",
+            "reference",
+            "mpesa_tx",
+            "created_at",
+        ]
+        read_only_fields = fields
+
+
+# =========================================================
+# Withdrawal
+# =========================================================
+class WithdrawalSerializer(serializers.ModelSerializer):
+    mpesa_tx = MpesaTransactionSerializer(read_only=True)
+    user_id = serializers.IntegerField(source="user.id", read_only=True)
+    approved_by_id = serializers.IntegerField(source="approved_by.id", read_only=True)
+    rejected_by_id = serializers.IntegerField(source="rejected_by.id", read_only=True)
+    is_final = serializers.BooleanField(read_only=True)
+    can_withdraw_merry = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = WithdrawalRequest
+        fields = [
+            "id",
+            "user_id",
+            "phone",
+            "amount",
+            "source",
+            "status",
+            "approved_by_id",
+            "approved_at",
+            "rejected_by_id",
+            "rejected_at",
+            "rejection_reason",
+            "mpesa_tx",
+            "is_final",
+            "can_withdraw_merry",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
 
 
 class WithdrawalCreateSerializer(serializers.ModelSerializer):
+    phone = serializers.CharField(validators=[phone_validator])
+
     class Meta:
         model = WithdrawalRequest
-        fields = ["phone", "amount", "source"]
+        fields = [
+            "phone",
+            "amount",
+            "source",
+        ]
 
-    def validate_amount(self, value: Decimal):
-        if value is None or value <= Decimal("0"):
+    def validate_amount(self, value):
+        if value is None or value <= Decimal("0.00"):
             raise serializers.ValidationError("Amount must be greater than 0.")
         return value
 
-    def validate_source(self, value: str):
-        v = (value or "SAVINGS").upper()
-        if v not in ("SAVINGS", "MERRY", "GROUP", "OTHER"):
-            raise serializers.ValidationError("Invalid source. Use SAVINGS, MERRY, GROUP or OTHER.")
-        return v
-
-    def validate(self, attrs):
-        """
-        Early guard (UX/security):
-        - block obvious insufficient balance requests
-        NOTE: services.py will enforce again at payout time.
-        """
-        request = self.context.get("request")
-        if not request or not request.user or not request.user.is_authenticated:
-            return attrs
-
-        amount = Decimal(str(attrs.get("amount") or "0"))
-        source = (attrs.get("source") or "SAVINGS").upper()
-
-        # Only enforce balance for known sources
-        if source in ("SAVINGS", "MERRY", "GROUP"):
-            category = _source_to_category(source)
-            available = get_user_balance(user=request.user, category=category)
-
-            # Your current payout logic: payout = amount - fee (fee is inside amount)
-            # Therefore the required balance is at least "amount"
-            # If you ever change to "fee on top", change this to amount + fee.
-            if amount > available:
-                raise serializers.ValidationError(
-                    {"amount": f"Insufficient {category} balance. Available: {available}."}
-                )
-
-            # Optional: prevent too-small withdrawals after fee
-            fee = calculate_b2c_fee(amount)
-            payout_amount = amount - fee
-            if payout_amount <= Decimal("0"):
-                raise serializers.ValidationError(
-                    {"amount": "Amount is too small after withdrawal fee. Increase amount."}
-                )
-
-        return attrs
+    def validate_source(self, value):
+        value = (value or "SAVINGS").upper()
+        allowed = {c[0] if isinstance(c, tuple) else c for c in WithdrawalRequest._meta.get_field("source").choices}
+        if value not in allowed:
+            raise serializers.ValidationError(f"Invalid source. Choose from: {sorted(allowed)}")
+        return value
 
     def create(self, validated_data):
         request = self.context["request"]
-        # Serializer only creates request. Admin approval + payout handled by services/views.
-        return WithdrawalRequest.objects.create(user=request.user, **validated_data)
-
-
-class WithdrawalSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = WithdrawalRequest
-        fields = "__all__"
-        read_only_fields = "__all__"
+        return WithdrawalRequest.objects.create(
+            user=request.user,
+            phone=validated_data["phone"],
+            amount=validated_data["amount"],
+            source=validated_data.get("source", "SAVINGS"),
+            status="PENDING",
+        )
 
 
 class WithdrawalApproveSerializer(serializers.Serializer):
-    # keep for future fields (remarks, admin_pin etc.)
-    pass
+    """
+    Kept intentionally light.
+    Add optional admin fields later if needed.
+    """
+    note = serializers.CharField(required=False, allow_blank=True, max_length=255)
 
 
 class WithdrawalRejectSerializer(serializers.Serializer):
-    rejection_reason = serializers.CharField(required=False, allow_blank=True)
-
-
-class PaymentLedgerSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = PaymentLedger
-        fields = "__all__"
-        read_only_fields = "__all__"
-
-
-class MpesaTransactionSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = MpesaTransaction
-        fields = "__all__"
-        read_only_fields = "__all__"
+    rejection_reason = serializers.CharField(
+        required=True,
+        allow_blank=False,
+        max_length=255,
+    )

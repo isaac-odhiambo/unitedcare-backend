@@ -2,13 +2,12 @@
 from decimal import Decimal
 
 from django.conf import settings
+from django.contrib.contenttypes.fields import GenericForeignKey
+from django.contrib.contenttypes.models import ContentType
 from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models
 from django.db.models import Q
 from django.utils import timezone
-
-from django.contrib.contenttypes.fields import GenericForeignKey
-from django.contrib.contenttypes.models import ContentType
 
 
 # =========================
@@ -21,6 +20,64 @@ phone_validator = RegexValidator(
 
 
 # =========================
+# Fee Configuration
+# =========================
+class TransactionFeeConfig(models.Model):
+    """
+    Central source of truth for transaction fees.
+
+    Examples:
+    - SAVINGS_DEPOSIT
+    - MERRY_CONTRIBUTION
+    - GROUP_CONTRIBUTION
+    - LOAN_REPAYMENT
+    - WITHDRAWAL
+
+    Fee formula:
+      total_fee = fixed_fee + (percentage_fee % of base_amount)
+    """
+
+    PURPOSE_CHOICES = (
+        ("SAVINGS_DEPOSIT", "Savings Deposit"),
+        ("MERRY_CONTRIBUTION", "Merry Contribution"),
+        ("GROUP_CONTRIBUTION", "Group Contribution"),
+        ("LOAN_REPAYMENT", "Loan Repayment"),
+        ("WITHDRAWAL", "Withdrawal"),
+        ("OTHER", "Other"),
+    )
+
+    purpose = models.CharField(
+        max_length=40,
+        choices=PURPOSE_CHOICES,
+        unique=True,
+        db_index=True,
+    )
+    fixed_fee = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+    )
+    percentage_fee = models.DecimalField(
+        max_digits=7,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Percentage applied on base amount, e.g. 2.50 means 2.5%",
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["purpose"]
+        verbose_name = "Transaction Fee Config"
+        verbose_name_plural = "Transaction Fee Configs"
+
+    def __str__(self):
+        return f"{self.purpose} | fixed={self.fixed_fee} | pct={self.percentage_fee}%"
+
+
+# =========================
 # MpesaTransaction (STK + B2C ONLY)
 # =========================
 class MpesaTransaction(models.Model):
@@ -29,13 +86,12 @@ class MpesaTransaction(models.Model):
     - STK Push (customer pays you): direction=IN, channel=STK
     - B2C payout (you pay customer): direction=OUT, channel=B2C
 
-    Option A (simple + realistic + safe):
-    - Allow multiple ledger entries per MpesaTransaction (fees/splits)
-    - Prevent duplicate/rush/double callbacks using UNIQUE Mpesa identifiers:
-        * checkout_request_id (STK)
-        * mpesa_receipt_number (SUCCESS)
-        * conversation_id (B2C)
-    - Use ledger_posted flag to make ledger posting idempotent.
+    Amount design:
+    - amount = final transaction amount actually used in Mpesa call
+      * STK: total charged to customer
+      * B2C: actual payout sent to customer
+    - base_amount = business/base amount before fee
+    - transaction_fee = fee portion applied by backend
     """
 
     DIRECTION_CHOICES = (("IN", "Money In"), ("OUT", "Money Out"))
@@ -69,16 +125,39 @@ class MpesaTransaction(models.Model):
     )
 
     phone = models.CharField(max_length=20, validators=[phone_validator], db_index=True)
+
     amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Final amount used for the actual Mpesa transaction.",
+    )
+
+    base_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Original business/base amount before fee.",
+    )
+
+    transaction_fee = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Fee portion charged or deducted by backend.",
     )
 
     direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES, default="IN")
     channel = models.CharField(max_length=10, choices=CHANNEL_CHOICES, default="STK")
     purpose = models.CharField(max_length=30, choices=PURPOSE_CHOICES, default="OTHER")
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="INITIATED", db_index=True)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="INITIATED",
+        db_index=True,
+    )
 
     # Business/internal reference (optional)
     reference = models.CharField(max_length=120, blank=True, default="", db_index=True)
@@ -121,7 +200,12 @@ class MpesaTransaction(models.Model):
     callback_payload = models.JSONField(null=True, blank=True)
 
     # Link to "what this payment was for" (any model)
-    target_content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
+    target_content_type = models.ForeignKey(
+        ContentType,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     target_object_id = models.PositiveIntegerField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
 
@@ -136,6 +220,7 @@ class MpesaTransaction(models.Model):
         indexes = [
             models.Index(fields=["status", "channel", "direction"]),
             models.Index(fields=["phone", "created_at"]),
+            models.Index(fields=["purpose", "created_at"]),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -156,7 +241,10 @@ class MpesaTransaction(models.Model):
         ]
 
     def __str__(self):
-        return f"MpesaTx#{self.id} {self.channel} {self.direction} {self.amount} {self.status}"
+        return (
+            f"MpesaTx#{self.id} {self.channel} {self.direction} "
+            f"amount={self.amount} base={self.base_amount} fee={self.transaction_fee} {self.status}"
+        )
 
 
 # =========================
@@ -165,7 +253,7 @@ class MpesaTransaction(models.Model):
 class PaymentLedger(models.Model):
     """
     UI-friendly money history.
-    Realistic: allow MULTIPLE ledger lines per MpesaTransaction
+    Allows multiple ledger lines per MpesaTransaction
     (e.g. withdrawal + withdrawal fee).
     """
 
@@ -178,7 +266,6 @@ class PaymentLedger(models.Model):
         ("GROUP", "Group"),
         ("WITHDRAWAL", "Withdrawal"),
         ("WITHDRAWAL_FEE", "Withdrawal Fee"),
-        # ✅ ADDED: used by services.py when Merry STK fee is enabled
         ("TRANSACTION_FEE", "Transaction Fee"),
         ("OTHER", "Other"),
     )
@@ -190,7 +277,12 @@ class PaymentLedger(models.Model):
         db_index=True,
     )
     entry_type = models.CharField(max_length=10, choices=ENTRY_CHOICES, db_index=True)
-    category = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default="OTHER", db_index=True)
+    category = models.CharField(
+        max_length=20,
+        choices=CATEGORY_CHOICES,
+        default="OTHER",
+        db_index=True,
+    )
 
     amount = models.DecimalField(
         max_digits=12,
@@ -210,7 +302,12 @@ class PaymentLedger(models.Model):
         db_index=True,
     )
 
-    target_content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
+    target_content_type = models.ForeignKey(
+        ContentType,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     target_object_id = models.PositiveIntegerField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
 
@@ -255,6 +352,7 @@ class WithdrawalRequest(models.Model):
         max_digits=12,
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
+        help_text="Requested/base payout amount before fee deduction.",
     )
 
     source = models.CharField(
@@ -264,7 +362,12 @@ class WithdrawalRequest(models.Model):
         db_index=True,
     )
 
-    target_content_type = models.ForeignKey(ContentType, on_delete=models.SET_NULL, null=True, blank=True)
+    target_content_type = models.ForeignKey(
+        ContentType,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     target_object_id = models.PositiveIntegerField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
 

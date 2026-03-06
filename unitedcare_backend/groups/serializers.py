@@ -1,59 +1,33 @@
-# groups/serializers.py
-from django.contrib.auth import get_user_model
+# groups/serializers.py (NEW - COMPLETE)
 from rest_framework import serializers
-from .models import Group, GroupMembership
-
-User = get_user_model()
+from .models import GroupFund, GroupMemberShare, GroupContribution
 
 
-class UserPublicSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ["id", "username", "phone", "role", "status"]
-
-
-class GroupSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Group
-        fields = ["id", "name", "created_at"]
-
-
-class GroupMembershipSerializer(serializers.ModelSerializer):
-    user = UserPublicSerializer(read_only=True)
-
-    user_id = serializers.PrimaryKeyRelatedField(
-        source="user",
-        queryset=User.objects.all(),
-        write_only=True,
-        required=True,
-    )
-    group_id = serializers.PrimaryKeyRelatedField(
-        source="group",
-        queryset=Group.objects.all(),
-        write_only=True,
-        required=True,
-    )
+class GroupFundSerializer(serializers.ModelSerializer):
+    available_balance = serializers.CharField(read_only=True)
 
     class Meta:
-        model = GroupMembership
-        fields = [
-            "id",
-            "group",
-            "group_id",
-            "user",
-            "user_id",
-            "role",
-            "is_active",
-            "joined_at",
-        ]
-        read_only_fields = ["id", "group", "user", "joined_at"]
+        model = GroupFund
+        fields = ("group", "balance", "reserved_amount", "available_balance", "created_at")
 
-    def validate(self, attrs):
-        group = attrs.get("group") or getattr(self.instance, "group", None)
-        user = attrs.get("user") or getattr(self.instance, "user", None)
 
-        if group and user:
-            exists = GroupMembership.objects.filter(group=group, user=user).exists()
-            if not self.instance and exists:
-                raise serializers.ValidationError("User is already a member of this group.")
-        return attrs
+class GroupMemberShareSerializer(serializers.ModelSerializer):
+    available_share = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = GroupMemberShare
+        fields = ("group", "user", "total_contributed", "reserved_share", "available_share", "updated_at")
+
+
+class GroupContributionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GroupContribution
+        fields = ("id", "group", "user", "amount", "reference", "note", "created_at")
+        read_only_fields = ("id", "created_at")
+
+
+class PostContributionSerializer(serializers.Serializer):
+    group_id = serializers.IntegerField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    reference = serializers.CharField(required=False, allow_blank=True)
+    note = serializers.CharField(required=False, allow_blank=True)

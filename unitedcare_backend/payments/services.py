@@ -1,17 +1,8 @@
 # payments/services.py
-# REALISTIC + PRACTICAL (UPDATED)
-# ✅ STK Push (IN) + STK Callback verification (STK Query) + idempotent ledger posting
-# ✅ Routes SUCCESS payments into business modules:
-#    - SAVINGS_DEPOSIT  -> ledger credit (and optional hook)
-#    - MERRY_CONTRIBUTION -> confirms MerryPayment + allocates into dues (slot-first)
-#    - LOAN_REPAYMENT -> calls loans.services.apply_mpesa_repayment() (hook you implement once)
-#    - GROUP_CONTRIBUTION -> ledger credit (and optional hook)
-# ✅ B2C Withdrawals with balance check + fee + idempotent posting
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Tuple
 
 from django.conf import settings
@@ -23,17 +14,14 @@ from django.db import transaction
 from django.utils import timezone
 
 from .balances import get_user_balance
-from .models import MpesaTransaction, PaymentLedger, WithdrawalRequest
-from .utils import calculate_b2c_fee
+from .models import MpesaTransaction, PaymentLedger, TransactionFeeConfig, WithdrawalRequest
 
 UserModel = get_user_model()
 
 # ============================================================
-# Constants / Fees
+# Constants
 # ============================================================
-# If you want to add a fee on top of merry contributions.
-# NOTE: we post fee as DEBIT in ledger under TRANSACTION_FEE.
-MERRY_STK_FEE = Decimal("0")  # set to Decimal("50") if you still want it
+DECIMAL_2 = Decimal("0.01")
 
 
 # ============================================================
@@ -54,6 +42,10 @@ def _safe_decimal(v: Any) -> Decimal:
         return d if d.is_finite() else Decimal("0")
     except Exception:
         return Decimal("0")
+
+
+def _money(v: Any) -> Decimal:
+    return _safe_decimal(v).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
 
 
 def _set_generic_target(obj: Optional[object]) -> Tuple[Optional[ContentType], Optional[int]]:
@@ -85,6 +77,7 @@ def _extract_id(reference: str, prefix: str) -> Optional[int]:
     Extract integer id from a reference like:
       "LOAN-12"  with prefix "LOAN-"
       "MERRY-PAYMENT-99" with prefix "MERRY-PAYMENT-"
+      "GROUP-7" with prefix "GROUP-"
     """
     ref = (reference or "").strip()
     if not ref.startswith(prefix):
@@ -95,21 +88,76 @@ def _extract_id(reference: str, prefix: str) -> Optional[int]:
         return None
 
 
+def _create_mpesa_tx(**kwargs) -> MpesaTransaction:
+    """
+    Backward-safe create:
+    if your MpesaTransaction model already has base_amount / transaction_fee,
+    they will be stored; if not, they will be ignored without crashing.
+    """
+    model_fields = {f.name for f in MpesaTransaction._meta.get_fields()}
+    clean = {k: v for k, v in kwargs.items() if k in model_fields}
+    return MpesaTransaction.objects.create(**clean)
+
+
 # ============================================================
-# ✅ ADDED: Group membership guard for GROUP_CONTRIBUTION
-# (so only active members can contribute to a group)
+# Central Fee Logic
+# ============================================================
+def get_fee_config(purpose: str) -> Optional[TransactionFeeConfig]:
+    purpose_u = (purpose or "").upper().strip()
+    if not purpose_u:
+        return None
+
+    return (
+        TransactionFeeConfig.objects.filter(purpose=purpose_u, is_active=True)
+        .order_by("-updated_at", "-id")
+        .first()
+    )
+
+
+def calculate_transaction_fee(*, purpose: str, base_amount: Decimal) -> Decimal:
+    """
+    Central fee calculator.
+    - fixed_fee applies directly
+    - percentage_fee is % of base amount
+    - both are allowed together
+    """
+    amount = _money(base_amount)
+    if amount <= Decimal("0"):
+        return Decimal("0.00")
+
+    cfg = get_fee_config(purpose)
+    if not cfg:
+        return Decimal("0.00")
+
+    fixed_fee = _money(getattr(cfg, "fixed_fee", Decimal("0.00")))
+    pct = _safe_decimal(getattr(cfg, "percentage_fee", Decimal("0.00")))
+
+    percentage_part = Decimal("0.00")
+    if pct > 0:
+        percentage_part = (amount * pct / Decimal("100")).quantize(
+            DECIMAL_2, rounding=ROUND_HALF_UP
+        )
+
+    return (fixed_fee + percentage_part).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+
+
+def calculate_total_charge(*, purpose: str, base_amount: Decimal) -> Decimal:
+    amount = _money(base_amount)
+    fee = calculate_transaction_fee(purpose=purpose, base_amount=amount)
+    return (amount + fee).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+
+
+# ============================================================
+# Group membership guard for GROUP_CONTRIBUTION
 # ============================================================
 def _require_active_group_membership(*, user: AbstractBaseUser, group_id: int) -> None:
     """
-    ✅ ADDED: prevents non-members from paying into a group.
-
-    Requires groups app to exist. If groups app not installed, we do NOT block
-    (keeps dev flexible), but in your setup groups exists so it will enforce.
+    Prevent non-members from paying into a group.
     """
     try:
         from groups.models import GroupMembership
     except Exception:
-        return  # dev fallback: don't block if groups app isn't installed
+        return
 
     is_member = GroupMembership.objects.filter(
         group_id=group_id,
@@ -137,7 +185,7 @@ def create_ledger_entry(
         user=user,
         entry_type=entry_type,
         category=category,
-        amount=amount,
+        amount=_money(amount),
         narration=narration or "",
         reference=reference or "",
         mpesa_tx=mpesa_tx,
@@ -148,7 +196,7 @@ def create_ledger_entry(
 
 
 # ============================================================
-# Daraja Client (plug your implementation here)
+# Daraja Client
 # ============================================================
 @dataclass
 class STKPushResult:
@@ -165,14 +213,6 @@ class B2CResult:
 
 
 class DarajaClient:
-    """
-    Replace these with your real implementation.
-
-    IMPORTANT:
-    - stk_query() is required for verification (security).
-    - you can add request timeouts/retries inside your RealClient.
-    """
-
     def stk_push(
         self,
         *,
@@ -201,22 +241,11 @@ class DarajaClient:
 
 
 def get_daraja_client():
-    """
-    Uses your real Daraja client from payments/daraja.py
-    Keep import here to avoid circular imports at module load.
-    """
     from .daraja import DarajaClient as RealClient
-
     return RealClient()
 
 
 def _build_callback_url(path: str) -> str:
-    """
-    Builds a public callback URL your Safaricom callbacks can reach.
-    Example:
-      MPESA_CALLBACK_BASE_URL=https://yourdomain.com
-      -> https://yourdomain.com/payments/mpesa/stk/callback/?token=...
-    """
     base = getattr(settings, "MPESA_CALLBACK_BASE_URL", "").rstrip("/")
     if not base:
         raise RuntimeError("MPESA_CALLBACK_BASE_URL missing in settings")
@@ -229,7 +258,7 @@ def _build_callback_url(path: str) -> str:
 
 
 # ============================================================
-# STK VERIFICATION (SECURITY)
+# STK VERIFICATION
 # ============================================================
 def _stk_query_is_success(data: Dict[str, Any]) -> bool:
     rc = data.get("ResultCode")
@@ -249,12 +278,6 @@ def _verify_stk_with_query(client: DarajaClient, tx: MpesaTransaction) -> Dict[s
 # ============================================================
 @transaction.atomic
 def _apply_merry_contribution(tx: MpesaTransaction) -> None:
-    """
-    Confirms MerryPayment and allocates into dues.
-
-    Requires reference format:
-      reference="MERRY-PAYMENT-<payment_id>"
-    """
     payment_id = _extract_id(tx.reference or "", "MERRY-PAYMENT-")
     if not payment_id:
         return
@@ -283,12 +306,6 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
 
 @transaction.atomic
 def _apply_loan_repayment(tx: MpesaTransaction) -> None:
-    """
-    Calls a loans hook to reduce outstanding and mark completion.
-
-    Requires reference format:
-      reference="LOAN-<loan_id>"
-    """
     loan_id = _extract_id(tx.reference or "", "LOAN-")
     if not loan_id:
         return
@@ -300,14 +317,13 @@ def _apply_loan_repayment(tx: MpesaTransaction) -> None:
 
     fn = getattr(loan_services, "apply_mpesa_repayment", None)
     if callable(fn):
-        fn(loan_id=loan_id, amount=tx.amount, mpesa_tx=tx)
+        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+        base_amount = _money(payload.get("base_amount", tx.amount))
+        fn(loan_id=loan_id, amount=base_amount, mpesa_tx=tx)
 
 
 @transaction.atomic
 def _apply_savings_deposit(tx: MpesaTransaction) -> None:
-    """
-    Optional hook if you want SavingsAccount balances updated here.
-    """
     try:
         from savings import services as savings_services
     except Exception:
@@ -315,16 +331,13 @@ def _apply_savings_deposit(tx: MpesaTransaction) -> None:
 
     fn = getattr(savings_services, "apply_mpesa_deposit", None)
     if callable(fn):
-        fn(user=tx.user, amount=tx.amount, mpesa_tx=tx, reference=tx.reference or "")
+        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+        base_amount = _money(payload.get("base_amount", tx.amount))
+        fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
 
 
 @transaction.atomic
 def _apply_group_contribution(tx: MpesaTransaction) -> None:
-    """
-    Optional hook for group contributions.
-
-    If you want: implement groups/services.py -> apply_mpesa_contribution(...)
-    """
     try:
         from groups import services as group_services
     except Exception:
@@ -332,14 +345,12 @@ def _apply_group_contribution(tx: MpesaTransaction) -> None:
 
     fn = getattr(group_services, "apply_mpesa_contribution", None)
     if callable(fn):
-        fn(user=tx.user, amount=tx.amount, mpesa_tx=tx, reference=tx.reference or "")
+        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+        base_amount = _money(payload.get("base_amount", tx.amount))
+        fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
 
 
 def _route_success_tx(tx: MpesaTransaction) -> None:
-    """
-    Called after SUCCESS + ledger_posted=True.
-    Keeps routing independent from ledger logic.
-    """
     purpose = (tx.purpose or "").upper()
 
     if purpose == "MERRY_CONTRIBUTION":
@@ -368,36 +379,29 @@ def initiate_stk_push(
     """
     Starts STK push and creates MpesaTransaction.
 
-    - Keeps a 60s "rush guard" to avoid duplicate STK prompts
-    - For merry, can optionally add MERRY_STK_FEE on top (if enabled)
+    IMPORTANT:
+    - amount here is the BASE amount from frontend
+    - fee is calculated centrally from TransactionFeeConfig
+    - total_amount = base_amount + fee
     """
     phone_n = normalize_phone(phone)
-    base_amount = _safe_decimal(amount)
-    if base_amount <= Decimal("0"):
+    base_amount = _money(amount)
+    if base_amount <= Decimal("0.00"):
         raise ValueError("Amount must be greater than 0")
 
     purpose_u = (purpose or "OTHER").upper()
 
-    # ============================================================
-    # ✅ ADDED: enforce group membership + reference format for GROUP_CONTRIBUTION
-    # Frontend should send: purpose="GROUP_CONTRIBUTION", reference="GROUP-<group_id>"
-    # ============================================================
     if purpose_u == "GROUP_CONTRIBUTION":
         group_id = _extract_id(reference or "", "GROUP-")
         if not group_id:
             raise ValidationError("GROUP_CONTRIBUTION requires reference='GROUP-<group_id>'")
         _require_active_group_membership(user=user, group_id=group_id)
 
-    # Optional fee rule
-    fee = Decimal("0")
-    total_amount = base_amount
-    if purpose_u == "MERRY_CONTRIBUTION" and MERRY_STK_FEE > 0:
-        fee = MERRY_STK_FEE
-        total_amount = base_amount + fee
+    fee = calculate_transaction_fee(purpose=purpose_u, base_amount=base_amount)
+    total_amount = (base_amount + fee).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
 
     ct, oid = _set_generic_target(target_object)
 
-    # Rush guard: reuse a recent INITIATED/PENDING tx within 60s (same payload)
     recent = (
         MpesaTransaction.objects.filter(
             user=user,
@@ -415,10 +419,12 @@ def initiate_stk_push(
     if recent:
         return recent
 
-    tx = MpesaTransaction.objects.create(
+    tx = _create_mpesa_tx(
         user=user,
         phone=phone_n,
-        amount=total_amount,
+        amount=total_amount,            # total charged to phone
+        base_amount=base_amount,        # stored if field exists
+        transaction_fee=fee,            # stored if field exists
         direction="IN",
         channel="STK",
         purpose=purpose_u,
@@ -461,9 +467,9 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     """
     Handles STK callback:
     - updates MpesaTransaction status fields
-    - verifies SUCCESS using STK Query (optional but recommended ON)
+    - verifies SUCCESS using STK Query
     - posts ledger entries (idempotent)
-    - routes to business modules (merry dues allocation, loan repayment, etc.)
+    - routes to business modules
     """
     stk = (((callback_payload or {}).get("Body") or {}).get("stkCallback")) or {}
     checkout_id = stk.get("CheckoutRequestID") or ""
@@ -478,7 +484,6 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     if not tx:
         raise ValueError("Unknown CheckoutRequestID (no matching transaction)")
 
-    # audit store
     tx.merchant_request_id = tx.merchant_request_id or merchant_id
     tx.callback_payload = callback_payload
     tx.result_code = callback_result_code
@@ -486,13 +491,11 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     tx.updated_at = timezone.now()
     tx.save(update_fields=["merchant_request_id", "callback_payload", "result_code", "result_desc", "updated_at"])
 
-    # cancelled/failed
     if callback_result_code != "0":
         tx.status = "CANCELLED" if callback_result_code in ("1032",) else "FAILED"
         tx.save(update_fields=["status"])
         return tx
 
-    # already posted? idempotent return
     if tx.ledger_posted:
         tx.status = "SUCCESS"
         tx.save(update_fields=["status"])
@@ -524,7 +527,6 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
         if receipt and not tx.mpesa_receipt_number:
             tx.mpesa_receipt_number = str(receipt)
 
-        # ✅ Strict amount match (best security)
         if amount_q > Decimal("0") and amount_q != tx.amount:
             if getattr(settings, "MPESA_STRICT_AMOUNT_MATCH", True):
                 tx.status = "FAILED"
@@ -535,63 +537,44 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
         if tx_date and not tx.transaction_date:
             tx.transaction_date = timezone.now()
 
-    # mark success
     tx.status = "SUCCESS"
     tx.updated_at = timezone.now()
     tx.save(update_fields=["status", "updated_at", "mpesa_receipt_number", "transaction_date"])
 
-    # ===== Ledger posting (idempotent) =====
     if tx.user_id:
         category = _purpose_to_ledger_category(tx.purpose)
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
 
-        base_amount = _safe_decimal(payload.get("base_amount", tx.amount))
-        fee = _safe_decimal(payload.get("fee", "0"))
-        total = _safe_decimal(payload.get("total_amount", tx.amount))
+        base_amount = _money(payload.get("base_amount", tx.amount))
+        fee = _money(payload.get("fee", "0"))
+        total = _money(payload.get("total_amount", tx.amount))
 
-        # ============================================================
-        # ✅ CHANGED: keep business reference as ledger reference (GROUP-12 / LOAN-4 / MERRY-PAYMENT-9)
-        # and keep receipt only for narration/audit.
-        #
-        # Previous line was:
-        #   ref = tx.mpesa_receipt_number or tx.reference or f"STK#{tx.id}"
-        # ============================================================
         business_ref = (tx.reference or "").strip()
         receipt_ref = (tx.mpesa_receipt_number or "").strip()
-        ref = business_ref or (receipt_ref or f"STK#{tx.id}")  # ✅ CHANGED
-
-        # optional: append receipt to narration for audit (does not affect balances)
+        ref = business_ref or (receipt_ref or f"STK#{tx.id}")
         receipt_note = f" ({receipt_ref})" if receipt_ref else ""
 
-        if tx.purpose == "MERRY_CONTRIBUTION" and fee > 0:
-            create_ledger_entry(
-                user=tx.user,
-                entry_type="CREDIT",
-                category="MERRY",
-                amount=base_amount,
-                narration="Merry contribution via STK" + receipt_note,  # ✅ CHANGED (audit only)
-                reference=ref,
-                mpesa_tx=tx,
-                target_object=tx.target_object,
-            )
+        # Credit business/base amount only
+        create_ledger_entry(
+            user=tx.user,
+            entry_type="CREDIT",
+            category=category,
+            amount=base_amount,
+            narration=f"{tx.purpose.replace('_', ' ').title()} via STK" + receipt_note,
+            reference=ref,
+            mpesa_tx=tx,
+            target_object=tx.target_object,
+        )
+
+        # Post fee separately if present
+        if fee > Decimal("0.00"):
             create_ledger_entry(
                 user=tx.user,
                 entry_type="DEBIT",
                 category="TRANSACTION_FEE",
                 amount=fee,
-                narration="Merry contribution transaction fee" + receipt_note,  # ✅ CHANGED (audit only)
+                narration=f"{tx.purpose.replace('_', ' ').title()} transaction fee" + receipt_note,
                 reference=f"FEE-{ref}",
-                mpesa_tx=tx,
-                target_object=tx.target_object,
-            )
-        else:
-            create_ledger_entry(
-                user=tx.user,
-                entry_type="CREDIT",
-                category=category,
-                amount=total,
-                narration=f"{tx.purpose.replace('_', ' ').title()} via STK" + receipt_note,  # ✅ CHANGED (audit only)
-                reference=ref,
                 mpesa_tx=tx,
                 target_object=tx.target_object,
             )
@@ -600,7 +583,6 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     tx.save(update_fields=["ledger_posted"])
 
     _route_success_tx(tx)
-
     return tx
 
 
@@ -617,7 +599,7 @@ def create_withdrawal_request(
     target_object: Optional[object] = None,
 ) -> WithdrawalRequest:
     phone_n = normalize_phone(phone)
-    amt = _safe_decimal(amount)
+    amt = _money(amount)
     if amt <= Decimal("0"):
         raise ValueError("Amount must be greater than 0")
 
@@ -625,7 +607,7 @@ def create_withdrawal_request(
     wd = WithdrawalRequest.objects.create(
         user=user,
         phone=phone_n,
-        amount=amt,
+        amount=amt,  # requested/base payout amount
         source=(source or "SAVINGS").upper(),
         target_content_type=ct,
         target_object_id=oid,
@@ -650,9 +632,12 @@ def approve_withdrawal_request(*, withdrawal_id: int, approved_by: AbstractBaseU
 def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransaction:
     """
     Creates an OUT/B2C MpesaTransaction and triggers Daraja B2C payout.
-    - balance check happens BEFORE payout
-    - fee deducted
-    - ledger posted only after SUCCESS callback (idempotent)
+
+    Logic:
+    - wd.amount is the requested/base payout amount
+    - WITHDRAWAL fee is calculated centrally
+    - user receives payout_amount = requested_amount - fee
+    - later ledger deducts requested amount + separate fee entry
     """
     client = get_daraja_client()
 
@@ -668,23 +653,30 @@ def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransactio
         if wd.source == "MERRY" and not wd.can_withdraw_merry:
             raise ValueError("Merry withdrawal not allowed yet (not payout date).")
 
-        # ✅ HARD CHECK balance before payout
         source_category = _withdrawal_source_to_category(wd.source)
         available = get_user_balance(user=wd.user, category=source_category)
-        if wd.amount > available:
-            raise ValidationError(f"Insufficient {source_category} balance. Available: {available}")
+        requested_amount = _money(wd.amount)
+        fee = calculate_transaction_fee(purpose="WITHDRAWAL", base_amount=requested_amount)
+        total_deduction = requested_amount + fee
 
-        fee = calculate_b2c_fee(wd.amount)
-        payout_amount = wd.amount - fee
-        if payout_amount <= Decimal("0"):
+        if total_deduction > available:
+            raise ValidationError(
+                f"Insufficient {source_category} balance. "
+                f"Available: {available}. Required: {total_deduction}."
+            )
+
+        payout_amount = (requested_amount - fee).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+        if payout_amount <= Decimal("0.00"):
             raise ValueError("Withdrawal amount too small after fee")
 
         ct, oid = _set_generic_target(wd.target_object)
 
-        tx = MpesaTransaction.objects.create(
+        tx = _create_mpesa_tx(
             user=wd.user,
             phone=wd.phone,
-            amount=payout_amount,
+            amount=payout_amount,           # actual B2C sent to phone
+            base_amount=requested_amount,   # requested/base amount
+            transaction_fee=fee,
             direction="OUT",
             channel="B2C",
             purpose="WITHDRAWAL",
@@ -692,10 +684,11 @@ def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransactio
             reference=f"WD#{wd.id}",
             request_payload={
                 "withdrawal_id": wd.id,
-                "requested_amount": str(wd.amount),
+                "requested_amount": str(requested_amount),
                 "fee": str(fee),
                 "payout_amount": str(payout_amount),
                 "source": wd.source,
+                "total_deduction": str(total_deduction),
             },
             callback_payload=None,
             target_content_type=ct,
@@ -735,6 +728,7 @@ def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTran
     B2C result:
     - updates tx + withdrawal status
     - posts ledger once (DEBIT source + fee)
+    - applies real SavingsAccount deduction when source=SAVINGS
     """
     result = (callback_payload or {}).get("Result") or {}
     conversation_id = result.get("ConversationID") or result.get("ConversationId") or ""
@@ -760,7 +754,6 @@ def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTran
         wd.status = "PAID" if tx.status == "SUCCESS" else "FAILED"
         wd.save(update_fields=["status"])
 
-    # do nothing if failed or already posted
     if tx.status != "SUCCESS" or tx.ledger_posted:
         return tx
 
@@ -770,13 +763,28 @@ def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTran
         return tx
 
     payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-    fee = _safe_decimal(payload.get("fee", "0"))
-
-    # ✅ Deduct from SOURCE bucket
+    fee = _money(payload.get("fee", "0"))
     source_category = _withdrawal_source_to_category(payload.get("source", "SAVINGS"))
-    requested_amount = _safe_decimal(payload.get("requested_amount", "0"))
-    if requested_amount <= Decimal("0"):
-        requested_amount = tx.amount + fee  # fallback
+    requested_amount = _money(payload.get("requested_amount", "0"))
+
+    if requested_amount <= Decimal("0.00"):
+        requested_amount = _money(tx.amount + fee)
+
+    if wd and wd.status == "PAID" and source_category == "SAVINGS":
+        try:
+            from savings import services as savings_services
+
+            fn = getattr(savings_services, "apply_mpesa_withdrawal_payout", None)
+            if callable(fn):
+                fn(
+                    user=tx.user,
+                    requested_amount=requested_amount,
+                    withdrawal_ref=tx.reference or f"WD#{wd.id}",
+                    target_object=wd.target_object,
+                    mpesa_tx=tx,
+                )
+        except Exception:
+            raise
 
     create_ledger_entry(
         user=tx.user,
@@ -789,7 +797,7 @@ def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTran
         target_object=tx.target_object,
     )
 
-    if fee > Decimal("0"):
+    if fee > Decimal("0.00"):
         create_ledger_entry(
             user=tx.user,
             entry_type="DEBIT",

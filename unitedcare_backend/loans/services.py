@@ -6,6 +6,10 @@
 # ✅ Adds MPESA repayment hook for centralized payments app:
 #   - apply_mpesa_repayment(...) called by payments/services.py on STK SUCCESS (LOAN_REPAYMENT)
 #   - Idempotent (prevents double-applying the same MpesaTransaction)
+# ✅ NEW: GROUP SHARE COLLATERAL (NO loan model changes)
+#   - For GROUP loans, borrower can use their GroupMemberShare as additional collateral
+#   - Uses groups.services reserve/release functions which create GroupShareHold records
+#   - Members do NOT see GroupFund totals (handled in groups views; unrelated here)
 
 from __future__ import annotations
 
@@ -36,6 +40,13 @@ from merry.models import (
 )
 
 from groups.models import GroupMembership
+
+# ✅ NEW: group-share collateral helpers (no loan model changes)
+from groups.services import (
+    reserve_group_share_for_loan,
+    release_group_share_for_loan,
+)
+
 from savings.models import SavingsAccount, SavingsTransaction
 
 # ==========================================================
@@ -62,6 +73,12 @@ ALLOW_MERRY_CREDIT_SECURITY = True
 # Only use Merry credit if the loan itself is a Merry loan
 # (recommended safest default)
 MERRY_CREDIT_ONLY_IF_SAME_CONTEXT = True
+
+# ✅ NEW: Use GROUP share (member contributions within same group) as additional security?
+ALLOW_GROUP_SHARE_SECURITY = True
+
+# Only use group share if the loan itself is a GROUP loan (recommended safest default)
+GROUP_SHARE_ONLY_IF_SAME_CONTEXT = True
 
 # Split guarantor shares weighted by their available savings (recommended)
 WEIGHTED_GUARANTOR_SPLIT = True
@@ -299,15 +316,9 @@ def generate_weekly_installments(loan: Loan) -> List[LoanInstallment]:
 
 def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
     """
-    ✅ NEW MODEL LOGIC
-
     available credit = (total allocated into dues for this member)
                      - (total PAID payouts for this member's seats)
                      - (total active holds)
-
-    Notes:
-    - Contributions are represented by MerryContributionDue.paid_amount (allocated confirmed payments).
-    - Payouts are seat-based: MerryPayout.seat -> seat.member.
     """
     member = MerryMember.objects.filter(
         merry_id=merry_id, user_id=user.id, is_active=True
@@ -315,7 +326,6 @@ def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
     if not member:
         raise ValidationError("You must be a member of this Merry to use Merry credit as security.")
 
-    # Total "contributed" = total allocated money into dues for ALL seats of this member (all periods)
     contrib_total = (
         MerryContributionDue.objects.filter(seat__member=member, seat__is_active=True)
         .aggregate(total=Sum("paid_amount"))
@@ -323,7 +333,6 @@ def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
         or Decimal("0.00")
     )
 
-    # Total payouts already received = sum of PAID payouts for this member's seats
     payout_total = (
         MerryPayout.objects.filter(seat__member=member, status="PAID")
         .aggregate(total=Sum("amount"))
@@ -331,7 +340,6 @@ def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
         or Decimal("0.00")
     )
 
-    # Existing credit holds for active loans
     held_total = (
         MerryCreditHold.objects.filter(user_id=user.id, merry_id=merry_id, is_active=True)
         .aggregate(total=Sum("amount"))
@@ -345,9 +353,6 @@ def get_available_merry_credit(*, user, merry_id: int) -> Decimal:
 
 @transaction.atomic
 def hold_merry_credit_for_loan(*, loan: Loan, merry_id: int, amount: Decimal) -> None:
-    """
-    Create/update a hold record so payout logic can block cashout while loan active.
-    """
     amount = q2(Decimal(amount))
     if amount <= 0:
         return
@@ -421,13 +426,32 @@ def reserve_security_for_loan(loan: Loan) -> Dict[str, Decimal]:
     Approval-time security reserve:
     1) security_target = SECURITY_COVERAGE_RATIO × principal
     2) Reserve borrower savings up to BORROWER_SAVINGS_RESERVE_RATIO × principal (capped by available)
-    3) Optionally hold Merry credit
-    4) Remaining gap covered by 1+ accepted guarantors
-    5) Store exact allocations for audit + accurate release
+    3) ✅ For GROUP loans: optionally reserve borrower's GROUP SHARE (same group)
+    4) Optionally hold Merry credit (for Merry loans)
+    5) Remaining gap covered by 1+ accepted guarantors
+    6) Store exact allocations for audit + accurate release
+
+    NOTE:
+    - We do NOT change Loan model. Group share locks are stored in GroupShareHold (groups app).
     """
+
     principal = q2(Decimal(loan.principal))
     if principal <= 0:
         raise ValidationError("Loan principal must be > 0.")
+
+    # ✅ Safety: if this loan already has reserves/holds (rare), release first to avoid double-locking
+    has_any_guarantor_reserve = LoanGuarantor.objects.filter(loan=loan, reserved_amount__gt=0).exists()
+    has_any_merry_hold = MerryCreditHold.objects.filter(loan=loan, is_active=True).exists()
+
+    # group holds exist? (safe to call release; it will no-op if none)
+    has_group_ctx = bool(loan.group_id)
+    if (
+        Decimal(loan.borrower_reserved_savings or Decimal("0.00")) > 0
+        or Decimal(loan.borrower_reserved_merry_credit or Decimal("0.00")) > 0
+        or has_any_guarantor_reserve
+        or has_any_merry_hold
+    ):
+        release_reserved_security_for_loan(loan)
 
     # Reset stored allocations (safe in same atomic flow)
     loan.borrower_reserved_savings = Decimal("0.00")
@@ -453,19 +477,43 @@ def reserve_security_for_loan(loan: Loan) -> Dict[str, Decimal]:
 
     covered = q2(loan.borrower_reserved_savings)
 
-    # --- Merry credit hold (optional) ---
-    if ALLOW_MERRY_CREDIT_SECURITY:
-        if loan.merry_id:
-            if (not MERRY_CREDIT_ONLY_IF_SAME_CONTEXT) or (loan.merry_id is not None):
-                available_credit = q2(get_available_merry_credit(user=loan.borrower, merry_id=int(loan.merry_id)))
-                remaining_need = q2(target - covered)
-                use_credit = q2(min(available_credit, remaining_need))
+    # --- ✅ Group share reserve (optional; GROUP loan only) ---
+    group_share_reserved = Decimal("0.00")
+    if ALLOW_GROUP_SHARE_SECURITY and loan.group_id:
+        if (not GROUP_SHARE_ONLY_IF_SAME_CONTEXT) or (loan.group_id is not None):
+            remaining_need = q2(target - covered)
+            if remaining_need > 0:
+                # This will:
+                # - validate membership
+                # - lock GroupMemberShare.reserved_share
+                # - create GroupShareHold(loan_id, amount)
+                try_amount = remaining_need  # cap happens inside groups service via available_share check
+                try:
+                    hold = reserve_group_share_for_loan(
+                        group_id=int(loan.group_id),
+                        user=loan.borrower,
+                        loan_id=int(loan.id),
+                        amount=try_amount,
+                    )
+                    group_share_reserved = q2(Decimal(getattr(hold, "amount", Decimal("0.00"))))
+                    covered = q2(covered + group_share_reserved)
+                except ValidationError:
+                    # If no available group share, we just continue with other security sources.
+                    # (Don't fail approval purely because group share isn't available.)
+                    group_share_reserved = Decimal("0.00")
 
-                if use_credit > 0:
-                    hold_merry_credit_for_loan(loan=loan, merry_id=int(loan.merry_id), amount=use_credit)
-                    loan.borrower_reserved_merry_credit = use_credit
-                    loan.save(update_fields=["borrower_reserved_merry_credit"])
-                    covered = q2(covered + use_credit)
+    # --- Merry credit hold (optional) ---
+    if ALLOW_MERRY_CREDIT_SECURITY and loan.merry_id:
+        if (not MERRY_CREDIT_ONLY_IF_SAME_CONTEXT) or (loan.merry_id is not None):
+            available_credit = q2(get_available_merry_credit(user=loan.borrower, merry_id=int(loan.merry_id)))
+            remaining_need = q2(target - covered)
+            use_credit = q2(min(available_credit, remaining_need))
+
+            if use_credit > 0:
+                hold_merry_credit_for_loan(loan=loan, merry_id=int(loan.merry_id), amount=use_credit)
+                loan.borrower_reserved_merry_credit = use_credit
+                loan.save(update_fields=["borrower_reserved_merry_credit"])
+                covered = q2(covered + use_credit)
 
     # --- Guarantors cover the remainder ---
     remaining_need = q2(target - covered)
@@ -474,6 +522,7 @@ def reserve_security_for_loan(loan: Loan) -> Dict[str, Decimal]:
             "security_target": target,
             "borrower_reserved_savings": loan.borrower_reserved_savings,
             "borrower_reserved_merry_credit": loan.borrower_reserved_merry_credit,
+            "borrower_reserved_group_share": group_share_reserved,
             "guarantors_reserved_total": Decimal("0.00"),
             "covered_total": target,
         }
@@ -526,13 +575,14 @@ def reserve_security_for_loan(loan: Loan) -> Dict[str, Decimal]:
         short = q2(target - covered)
         raise ValidationError(
             f"Insufficient security coverage. Need additional {short}. "
-            f"Add guarantor(s), increase savings, or reduce the loan amount."
+            f"Add guarantor(s), increase savings/share, or reduce the loan amount."
         )
 
     return {
         "security_target": target,
         "borrower_reserved_savings": loan.borrower_reserved_savings,
         "borrower_reserved_merry_credit": loan.borrower_reserved_merry_credit,
+        "borrower_reserved_group_share": group_share_reserved,
         "guarantors_reserved_total": guarantors_reserved_total,
         "covered_total": covered,
     }
@@ -542,6 +592,9 @@ def reserve_security_for_loan(loan: Loan) -> Dict[str, Decimal]:
 def release_reserved_security_for_loan(loan: Loan) -> None:
     """
     Releases EXACT reserved amounts (best practice).
+    Also releases:
+    - ✅ group share holds (GROUP loan)
+    - merry credit hold (Merry loan)
     """
     # borrower savings
     borrower_acct = get_primary_savings_account(loan.borrower)
@@ -571,6 +624,10 @@ def release_reserved_security_for_loan(loan: Loan) -> None:
         g.reserved_amount = Decimal("0.00")
         g.save(update_fields=["reserved_amount"])
 
+    # ✅ group share holds (safe no-op if none)
+    if loan.group_id:
+        release_group_share_for_loan(group_id=int(loan.group_id), loan_id=int(loan.id))
+
     # merry hold
     if Decimal(loan.borrower_reserved_merry_credit or Decimal("0.00")) > 0:
         release_merry_credit_for_loan(loan=loan)
@@ -592,7 +649,7 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
     - require accepted guarantor(s)
     - re-check eligibility
     - compute totals
-    - reserve security (borrower savings + optional merry credit + guarantors)
+    - reserve security (borrower savings + ✅ group share (group loans) + optional merry credit + guarantors)
     - generate weekly installments
     """
     if loan.status not in ("PENDING", "UNDER_REVIEW"):
@@ -695,10 +752,6 @@ def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
     - Creates LoanPayment(method="MPESA") linked by reference MPESA_TX#<id>
     - Applies the amount to installments + updates balances
     - Releases reserved security if loan completes
-
-    Note:
-      We accept mpesa_tx as an object to avoid hard import cycles.
-      (payments.models.MpesaTransaction instance)
     """
     loan = Loan.objects.select_for_update().select_related("product", "borrower").filter(id=loan_id).first()
     if not loan:
