@@ -78,24 +78,30 @@ class TransactionFeeConfig(models.Model):
 
 
 # =========================
-# MpesaTransaction (STK + B2C ONLY)
+# MpesaTransaction (STK + C2B + B2C)
 # =========================
 class MpesaTransaction(models.Model):
     """
     Source-of-truth table for Mpesa:
     - STK Push (customer pays you): direction=IN, channel=STK
+    - C2B Paybill (customer pays manually): direction=IN, channel=C2B
     - B2C payout (you pay customer): direction=OUT, channel=B2C
 
     Amount design:
     - amount = final transaction amount actually used in Mpesa call
       * STK: total charged to customer
+      * C2B: amount actually received from customer
       * B2C: actual payout sent to customer
     - base_amount = business/base amount before fee
     - transaction_fee = fee portion applied by backend
     """
 
     DIRECTION_CHOICES = (("IN", "Money In"), ("OUT", "Money Out"))
-    CHANNEL_CHOICES = (("STK", "STK Push"), ("B2C", "B2C Payout"))
+    CHANNEL_CHOICES = (
+        ("STK", "STK Push"),
+        ("C2B", "C2B Paybill"),
+        ("B2C", "B2C Payout"),
+    )
     STATUS_CHOICES = (
         ("INITIATED", "Initiated"),
         ("PENDING", "Pending"),

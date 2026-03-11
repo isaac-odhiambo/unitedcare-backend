@@ -364,6 +364,206 @@ def _route_success_tx(tx: MpesaTransaction) -> None:
 
 
 # ============================================================
+# SHARED SUCCESS POSTING (STK / C2B)
+# ============================================================
+@transaction.atomic
+def _finalize_successful_incoming_tx(tx: MpesaTransaction, *, channel_label: str) -> MpesaTransaction:
+    """
+    Shared finalization for successful incoming transactions.
+    Posts ledger once and routes to business modules.
+    """
+    if tx.ledger_posted:
+        if tx.status != "SUCCESS":
+            tx.status = "SUCCESS"
+            tx.updated_at = timezone.now()
+            tx.save(update_fields=["status", "updated_at"])
+        _route_success_tx(tx)
+        return tx
+
+    if tx.user_id:
+        category = _purpose_to_ledger_category(tx.purpose)
+        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+
+        base_amount = _money(payload.get("base_amount", tx.amount))
+        fee = _money(payload.get("fee", "0"))
+
+        business_ref = (tx.reference or "").strip()
+        receipt_ref = (tx.mpesa_receipt_number or "").strip()
+        ref = business_ref or (receipt_ref or f"{channel_label}#{tx.id}")
+        receipt_note = f" ({receipt_ref})" if receipt_ref else ""
+
+        create_ledger_entry(
+            user=tx.user,
+            entry_type="CREDIT",
+            category=category,
+            amount=base_amount,
+            narration=f"{tx.purpose.replace('_', ' ').title()} via {channel_label}" + receipt_note,
+            reference=ref,
+            mpesa_tx=tx,
+            target_object=tx.target_object,
+        )
+
+        if fee > Decimal("0.00"):
+            create_ledger_entry(
+                user=tx.user,
+                entry_type="DEBIT",
+                category="TRANSACTION_FEE",
+                amount=fee,
+                narration=f"{tx.purpose.replace('_', ' ').title()} transaction fee" + receipt_note,
+                reference=f"FEE-{ref}",
+                mpesa_tx=tx,
+                target_object=tx.target_object,
+            )
+
+    tx.ledger_posted = True
+    tx.status = "SUCCESS"
+    tx.updated_at = timezone.now()
+    tx.save(update_fields=["ledger_posted", "status", "updated_at"])
+
+    _route_success_tx(tx)
+    return tx
+
+
+# ============================================================
+# C2B SERVICES
+# ============================================================
+def handle_c2b_validation_callback(*, callback_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Basic C2B validation.
+    Safaricom sends payment details before final confirmation.
+
+    We only reject clearly invalid references here.
+    """
+    reference = (
+        callback_payload.get("BillRefNumber")
+        or callback_payload.get("BillRef")
+        or callback_payload.get("AccountReference")
+        or ""
+    ).strip()
+
+    amount = _money(callback_payload.get("TransAmount", "0"))
+
+    if amount <= Decimal("0.00"):
+        return {"ResultCode": "C2B00012", "ResultDesc": "Invalid amount"}
+
+    if not reference:
+        return {"ResultCode": "C2B00012", "ResultDesc": "Missing account reference"}
+
+    if reference.startswith("MERRY-PAYMENT-"):
+        if _extract_id(reference, "MERRY-PAYMENT-") is None:
+            return {"ResultCode": "C2B00012", "ResultDesc": "Invalid merry reference"}
+
+    elif reference.startswith("LOAN-"):
+        if _extract_id(reference, "LOAN-") is None:
+            return {"ResultCode": "C2B00012", "ResultDesc": "Invalid loan reference"}
+
+    elif reference.startswith("GROUP-"):
+        if _extract_id(reference, "GROUP-") is None:
+            return {"ResultCode": "C2B00012", "ResultDesc": "Invalid group reference"}
+
+    return {"ResultCode": "0", "ResultDesc": "Accepted"}
+
+
+@transaction.atomic
+def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction:
+    """
+    Handles manual Paybill C2B confirmation callback.
+
+    Expected routing by reference:
+      - MERRY-PAYMENT-<payment_id> -> MERRY_CONTRIBUTION
+      - LOAN-<loan_id>             -> LOAN_REPAYMENT
+      - GROUP-<group_id>           -> GROUP_CONTRIBUTION
+      - anything else              -> SAVINGS_DEPOSIT
+    """
+    receipt = (
+        callback_payload.get("TransID")
+        or callback_payload.get("TransactionID")
+        or callback_payload.get("MpesaReceiptNumber")
+        or ""
+    ).strip()
+
+    if not receipt:
+        raise ValueError("Invalid C2B callback: missing receipt/TransID")
+
+    existing = MpesaTransaction.objects.select_for_update().filter(
+        mpesa_receipt_number=receipt
+    ).first()
+    if existing:
+        return _finalize_successful_incoming_tx(existing, channel_label="C2B")
+
+    phone_raw = (
+        callback_payload.get("MSISDN")
+        or callback_payload.get("MSISDNNumber")
+        or callback_payload.get("PhoneNumber")
+        or callback_payload.get("MobileNumber")
+        or ""
+    )
+    phone = normalize_phone(str(phone_raw))
+
+    amount = _money(
+        callback_payload.get("TransAmount")
+        or callback_payload.get("Amount")
+        or "0"
+    )
+    if amount <= Decimal("0.00"):
+        raise ValueError("Invalid C2B callback: amount must be greater than 0")
+
+    reference = (
+        callback_payload.get("BillRefNumber")
+        or callback_payload.get("BillRef")
+        or callback_payload.get("AccountReference")
+        or ""
+    ).strip()
+
+    if reference.startswith("MERRY-PAYMENT-"):
+        purpose = "MERRY_CONTRIBUTION"
+    elif reference.startswith("LOAN-"):
+        purpose = "LOAN_REPAYMENT"
+    elif reference.startswith("GROUP-"):
+        purpose = "GROUP_CONTRIBUTION"
+    else:
+        purpose = "SAVINGS_DEPOSIT"
+
+    user = None
+    if phone:
+        user = UserModel.objects.filter(phone=phone).first()
+
+    if purpose == "GROUP_CONTRIBUTION" and user:
+        group_id = _extract_id(reference, "GROUP-")
+        if group_id:
+            _require_active_group_membership(user=user, group_id=group_id)
+
+    fee = Decimal("0.00")
+    base_amount = amount
+
+    tx = _create_mpesa_tx(
+        user=user,
+        phone=phone or "0700000000",
+        amount=amount,
+        base_amount=base_amount,
+        transaction_fee=fee,
+        direction="IN",
+        channel="C2B",
+        purpose=purpose,
+        status="SUCCESS",
+        reference=reference,
+        mpesa_receipt_number=receipt,
+        result_code="0",
+        result_desc="C2B confirmed",
+        transaction_date=timezone.now(),
+        request_payload={
+            "base_amount": str(base_amount),
+            "fee": str(fee),
+            "total_amount": str(amount),
+            "source": "C2B",
+        },
+        callback_payload=callback_payload,
+    )
+
+    return _finalize_successful_incoming_tx(tx, channel_label="C2B")
+
+
+# ============================================================
 # STK SERVICES
 # ============================================================
 def initiate_stk_push(
@@ -422,9 +622,9 @@ def initiate_stk_push(
     tx = _create_mpesa_tx(
         user=user,
         phone=phone_n,
-        amount=total_amount,            # total charged to phone
-        base_amount=base_amount,        # stored if field exists
-        transaction_fee=fee,            # stored if field exists
+        amount=total_amount,
+        base_amount=base_amount,
+        transaction_fee=fee,
         direction="IN",
         channel="STK",
         purpose=purpose_u,
@@ -496,12 +696,6 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
         tx.save(update_fields=["status"])
         return tx
 
-    if tx.ledger_posted:
-        tx.status = "SUCCESS"
-        tx.save(update_fields=["status"])
-        _route_success_tx(tx)
-        return tx
-
     enable_verify = getattr(settings, "MPESA_ENABLE_STK_QUERY_VERIFICATION", True)
 
     if enable_verify:
@@ -541,49 +735,7 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     tx.updated_at = timezone.now()
     tx.save(update_fields=["status", "updated_at", "mpesa_receipt_number", "transaction_date"])
 
-    if tx.user_id:
-        category = _purpose_to_ledger_category(tx.purpose)
-        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-
-        base_amount = _money(payload.get("base_amount", tx.amount))
-        fee = _money(payload.get("fee", "0"))
-        total = _money(payload.get("total_amount", tx.amount))
-
-        business_ref = (tx.reference or "").strip()
-        receipt_ref = (tx.mpesa_receipt_number or "").strip()
-        ref = business_ref or (receipt_ref or f"STK#{tx.id}")
-        receipt_note = f" ({receipt_ref})" if receipt_ref else ""
-
-        # Credit business/base amount only
-        create_ledger_entry(
-            user=tx.user,
-            entry_type="CREDIT",
-            category=category,
-            amount=base_amount,
-            narration=f"{tx.purpose.replace('_', ' ').title()} via STK" + receipt_note,
-            reference=ref,
-            mpesa_tx=tx,
-            target_object=tx.target_object,
-        )
-
-        # Post fee separately if present
-        if fee > Decimal("0.00"):
-            create_ledger_entry(
-                user=tx.user,
-                entry_type="DEBIT",
-                category="TRANSACTION_FEE",
-                amount=fee,
-                narration=f"{tx.purpose.replace('_', ' ').title()} transaction fee" + receipt_note,
-                reference=f"FEE-{ref}",
-                mpesa_tx=tx,
-                target_object=tx.target_object,
-            )
-
-    tx.ledger_posted = True
-    tx.save(update_fields=["ledger_posted"])
-
-    _route_success_tx(tx)
-    return tx
+    return _finalize_successful_incoming_tx(tx, channel_label="STK")
 
 
 # ============================================================
@@ -607,7 +759,7 @@ def create_withdrawal_request(
     wd = WithdrawalRequest.objects.create(
         user=user,
         phone=phone_n,
-        amount=amt,  # requested/base payout amount
+        amount=amt,
         source=(source or "SAVINGS").upper(),
         target_content_type=ct,
         target_object_id=oid,
@@ -674,8 +826,8 @@ def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransactio
         tx = _create_mpesa_tx(
             user=wd.user,
             phone=wd.phone,
-            amount=payout_amount,           # actual B2C sent to phone
-            base_amount=requested_amount,   # requested/base amount
+            amount=payout_amount,
+            base_amount=requested_amount,
             transaction_fee=fee,
             direction="OUT",
             channel="B2C",

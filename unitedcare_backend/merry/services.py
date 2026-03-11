@@ -1,9 +1,10 @@
 # merry/services.py
-# UPDATED — Seat/Shares + Slot-based dues + Payments + Allocations + Seat-based payouts
+# FULLY UPDATED — Seat/Shares + Slot-based dues + Payments + Allocations + Seat-based payouts
+# + safer parsing/validation + better locking + duplicate receipt protection
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional, List, Tuple
 
 from django.db import IntegrityError, transaction
@@ -21,6 +22,7 @@ from .models import (
     MerryPaymentAllocation,
     MerryPayout,
 )
+
 
 # -----------------------------
 # Domain errors (clean, explicit)
@@ -52,13 +54,56 @@ def q2(x: Decimal) -> Decimal:
     return Decimal(x).quantize(Decimal("0.01"))
 
 
+def parse_decimal(value, field_name: str) -> Decimal:
+    if value is None or value == "":
+        raise BadState(f"{field_name} is required.")
+    try:
+        return q2(Decimal(str(value)))
+    except (InvalidOperation, ValueError, TypeError):
+        raise BadState(f"{field_name} must be a valid number.")
+
+
+def parse_int(
+    value,
+    field_name: str,
+    *,
+    min_value: Optional[int] = None,
+    max_value: Optional[int] = None,
+) -> int:
+    try:
+        n = int(value)
+    except (ValueError, TypeError):
+        raise BadState(f"{field_name} must be an integer.")
+
+    if min_value is not None and n < min_value:
+        raise BadState(f"{field_name} must be >= {min_value}.")
+    if max_value is not None and n > max_value:
+        raise BadState(f"{field_name} must be <= {max_value}.")
+    return n
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
 def is_admin(user) -> bool:
-    # align with your views.py
     return bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
 
 
 def get_merry(merry_id: int) -> MerryGoRound:
-    merry = MerryGoRound.objects.filter(id=merry_id).first()
+    merry = MerryGoRound.objects.filter(id=merry_id).select_related("created_by").first()
     if not merry:
         raise NotFound("Merry not found.")
     return merry
@@ -72,12 +117,14 @@ def get_join_request(request_id: int) -> MerryJoinRequest:
 
 
 def get_active_member(merry: MerryGoRound, user) -> MerryMember:
-    m = MerryMember.objects.select_related("merry", "user").filter(
-        merry=merry, user=user, is_active=True
-    ).first()
-    if not m:
+    member = (
+        MerryMember.objects.select_related("merry", "user")
+        .filter(merry=merry, user=user, is_active=True)
+        .first()
+    )
+    if not member:
         raise NotFound("You are not an active member of this merry.")
-    return m
+    return member
 
 
 def get_current_period_key(merry: MerryGoRound) -> str:
@@ -103,8 +150,7 @@ def next_payout_position_for_seat(merry: MerryGoRound) -> int:
 def get_next_available_slot(merry: MerryGoRound, period_key: str) -> int:
     limit = payouts_per_period(merry)
     used = set(
-        MerryPayout.objects.filter(merry=merry, period_key=period_key)
-        .values_list("slot_no", flat=True)
+        MerryPayout.objects.filter(merry=merry, period_key=period_key).values_list("slot_no", flat=True)
     )
     for s in range(1, limit + 1):
         if s not in used:
@@ -114,12 +160,11 @@ def get_next_available_slot(merry: MerryGoRound, period_key: str) -> int:
 
 # ---------- period stepping for carry-forward ----------
 def _next_week_period_key(period_key: str) -> str:
-    # format: YYYY-W##
     try:
         year = int(period_key[:4])
         week = int(period_key.split("-W")[1])
     except Exception:
-        raise BadState("Invalid WEEKLY period_key format. Expected YYYY-W##")
+        raise BadState("Invalid WEEKLY period_key format. Expected YYYY-W##.")
 
     from datetime import date, timedelta
 
@@ -129,12 +174,11 @@ def _next_week_period_key(period_key: str) -> str:
 
 
 def _next_month_period_key(period_key: str) -> str:
-    # format: YYYY-MM
     try:
         year = int(period_key[:4])
         month = int(period_key.split("-")[1])
     except Exception:
-        raise BadState("Invalid MONTHLY period_key format. Expected YYYY-MM")
+        raise BadState("Invalid MONTHLY period_key format. Expected YYYY-MM.")
 
     month += 1
     if month == 13:
@@ -163,6 +207,8 @@ def create_merry(
     next_payout_date=None,
     payout_frequency: str = "WEEKLY",
     payouts_per_period: int = 1,
+    is_open: bool = True,
+    max_seats: int = 0,
 ) -> MerryGoRound:
     if not is_admin(creator):
         raise NotAllowed("Admin only.")
@@ -171,30 +217,34 @@ def create_merry(
     if not name:
         raise BadState("name is required.")
 
-    amount = q2(Decimal(str(contribution_amount)))
+    amount = parse_decimal(contribution_amount, "contribution_amount")
     if amount <= 0:
         raise BadState("contribution_amount must be > 0.")
 
-    try:
-        cycle_duration_weeks = int(cycle_duration_weeks)
-    except Exception:
-        raise BadState("cycle_duration_weeks must be an integer.")
-    if cycle_duration_weeks < 1 or cycle_duration_weeks > 520:
-        raise BadState("cycle_duration_weeks must be between 1 and 520.")
+    cycle_duration_weeks = parse_int(
+        cycle_duration_weeks,
+        "cycle_duration_weeks",
+        min_value=1,
+        max_value=520,
+    )
 
+    payout_order_type = (payout_order_type or "manual").strip().lower()
     if payout_order_type not in ("manual", "random"):
         raise BadState("payout_order_type must be 'manual' or 'random'.")
 
-    payout_frequency = (payout_frequency or "WEEKLY").upper()
+    payout_frequency = (payout_frequency or "WEEKLY").upper().strip()
     if payout_frequency not in ("WEEKLY", "MONTHLY"):
         raise BadState("payout_frequency must be 'WEEKLY' or 'MONTHLY'.")
 
-    try:
-        payouts_per_period = int(payouts_per_period)
-    except Exception:
-        raise BadState("payouts_per_period must be an integer.")
-    if payouts_per_period < 1 or payouts_per_period > 14:
-        raise BadState("payouts_per_period must be between 1 and 14.")
+    payouts_per_period = parse_int(
+        payouts_per_period,
+        "payouts_per_period",
+        min_value=1,
+        max_value=14,
+    )
+
+    is_open = parse_bool(is_open, default=True)
+    max_seats = parse_int(max_seats or 0, "max_seats", min_value=0)
 
     merry = MerryGoRound.objects.create(
         name=name,
@@ -205,6 +255,8 @@ def create_merry(
         created_by=creator,
         payout_frequency=payout_frequency,
         payouts_per_period=payouts_per_period,
+        is_open=is_open,
+        max_seats=max_seats,
     )
     return merry
 
@@ -219,6 +271,7 @@ def set_slot_config_bulk(*, admin_user, merry_id: int, items: List[dict]) -> Lis
     """
     if not is_admin(admin_user):
         raise NotAllowed("Admin only.")
+
     merry = get_merry(merry_id)
 
     if not isinstance(items, list) or not items:
@@ -226,14 +279,11 @@ def set_slot_config_bulk(*, admin_user, merry_id: int, items: List[dict]) -> Lis
 
     seen = set()
     for it in items:
-        try:
-            slot_no = int(it.get("slot_no"))
-            weekday = int(it.get("weekday"))
-        except Exception:
-            raise BadState("slot_no and weekday must be integers.")
+        slot_no = parse_int(it.get("slot_no"), "slot_no", min_value=1)
+        weekday = parse_int(it.get("weekday"), "weekday", min_value=0, max_value=6)
+
         validate_slot(merry, slot_no)
-        if weekday < 0 or weekday > 6:
-            raise BadState("weekday must be 0..6 (Mon..Sun).")
+
         if slot_no in seen:
             raise BadState("Duplicate slot_no in payload.")
         seen.add(slot_no)
@@ -243,7 +293,9 @@ def set_slot_config_bulk(*, admin_user, merry_id: int, items: List[dict]) -> Lis
         slot_no = int(it["slot_no"])
         weekday = int(it["weekday"])
         obj, _ = MerrySlotConfig.objects.get_or_create(
-            merry=merry, slot_no=slot_no, defaults={"weekday": weekday}
+            merry=merry,
+            slot_no=slot_no,
+            defaults={"weekday": weekday},
         )
         if obj.weekday != weekday:
             obj.weekday = weekday
@@ -265,46 +317,60 @@ def request_to_join_merry(
     note: str = "",
     requested_seats: int = 1,
 ) -> MerryJoinRequest:
-    merry = get_merry(merry_id)
+    merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
+    if not merry:
+        raise NotFound("Merry not found.")
 
     if MerryMember.objects.filter(merry=merry, user=user, is_active=True).exists():
         raise Conflict("You are already a member of this merry.")
 
     note = (note or "").strip()[:255]
+    requested_seats = parse_int(
+        requested_seats,
+        "requested_seats",
+        min_value=1,
+        max_value=50,
+    )
 
-    try:
-        requested_seats = int(requested_seats)
-    except Exception:
-        raise BadState("requested_seats must be an integer.")
-    if requested_seats < 1 or requested_seats > 50:
-        raise BadState("requested_seats must be between 1 and 50.")
+    if hasattr(merry, "can_accept_join_request"):
+        ok, reason = merry.can_accept_join_request(requested_seats)
+        if not ok:
+            raise BadState(reason)
 
-    existing = MerryJoinRequest.objects.select_for_update().filter(merry=merry, user=user).first()
+    existing_pending = (
+        MerryJoinRequest.objects.select_for_update()
+        .filter(merry=merry, user=user, status="PENDING")
+        .first()
+    )
+    if existing_pending:
+        changed = False
+        if existing_pending.note != note:
+            existing_pending.note = note
+            changed = True
+        if existing_pending.requested_seats != requested_seats:
+            existing_pending.requested_seats = requested_seats
+            changed = True
+        if changed:
+            existing_pending.full_clean()
+            existing_pending.save(update_fields=["note", "requested_seats"])
+        return existing_pending
 
-    if existing:
-        if existing.status == "PENDING":
-            # update fields if needed
-            changed = False
-            if existing.note != note:
-                existing.note = note
-                changed = True
-            if existing.requested_seats != requested_seats:
-                existing.requested_seats = requested_seats
-                changed = True
-            if changed:
-                existing.full_clean()
-                existing.save(update_fields=["note", "requested_seats"])
-            return existing
+    existing_latest = (
+        MerryJoinRequest.objects.select_for_update()
+        .filter(merry=merry, user=user)
+        .order_by("-created_at", "-id")
+        .first()
+    )
 
-        # resubmit
-        existing.status = "PENDING"
-        existing.note = note
-        existing.requested_seats = requested_seats
-        existing.reviewed_by = None
-        existing.reviewed_at = None
-        existing.created_at = timezone.now()
-        existing.full_clean()
-        existing.save(
+    if existing_latest:
+        existing_latest.status = "PENDING"
+        existing_latest.note = note
+        existing_latest.requested_seats = requested_seats
+        existing_latest.reviewed_by = None
+        existing_latest.reviewed_at = None
+        existing_latest.created_at = timezone.now()
+        existing_latest.full_clean()
+        existing_latest.save(
             update_fields=[
                 "status",
                 "note",
@@ -314,10 +380,14 @@ def request_to_join_merry(
                 "created_at",
             ]
         )
-        return existing
+        return existing_latest
 
     jr = MerryJoinRequest(
-        merry=merry, user=user, status="PENDING", note=note, requested_seats=requested_seats
+        merry=merry,
+        user=user,
+        status="PENDING",
+        note=note,
+        requested_seats=requested_seats,
     )
     jr.full_clean()
     jr.save()
@@ -333,6 +403,7 @@ def cancel_join_request(*, user, request_id: int) -> MerryJoinRequest:
         raise NotAllowed("You can only cancel your own join request.")
     if jr.status != "PENDING":
         raise BadState("Only PENDING requests can be cancelled.")
+
     jr.status = "CANCELLED"
     jr.save(update_fields=["status"])
     return jr
@@ -354,18 +425,31 @@ def admin_approve_join_request(*, admin_user, request_id: int) -> Tuple[MerryMem
     if jr.status != "PENDING":
         raise BadState("Only PENDING requests can be approved.")
 
-    merry = jr.merry
+    merry = MerryGoRound.objects.select_for_update().filter(id=jr.merry_id).first()
+    if not merry:
+        raise NotFound("Merry not found.")
+
     user = jr.user
-    seats_requested = int(jr.requested_seats or 1)
+    seats_requested = parse_int(jr.requested_seats or 1, "requested_seats", min_value=1, max_value=50)
+
+    if hasattr(merry, "can_accept_join_request"):
+        ok, reason = merry.can_accept_join_request(seats_requested)
+        if not ok:
+            raise BadState(reason)
 
     member, _ = MerryMember.objects.get_or_create(
         merry=merry,
         user=user,
         defaults={"joined_at": timezone.now(), "is_active": True},
     )
+
     if not member.is_active:
         member.is_active = True
-        member.save(update_fields=["is_active"])
+        if not member.joined_at:
+            member.joined_at = timezone.now()
+            member.save(update_fields=["is_active", "joined_at"])
+        else:
+            member.save(update_fields=["is_active"])
 
     existing_max_seat_no = member.seats.aggregate(m=Max("seat_no")).get("m") or 0
     seat_no_start = int(existing_max_seat_no) + 1
@@ -468,7 +552,7 @@ def create_payment_intent(*, user, merry_id: int, amount: Decimal, payer_phone: 
     merry = get_merry(merry_id)
     member = get_active_member(merry, user)
 
-    amt = q2(Decimal(str(amount)))
+    amt = parse_decimal(amount, "amount")
     if amt <= 0:
         raise BadState("amount must be > 0.")
 
@@ -477,8 +561,6 @@ def create_payment_intent(*, user, merry_id: int, amount: Decimal, payer_phone: 
         raise BadState("payer_phone is required.")
 
     period_key = get_current_period_key(merry)
-
-    # ensure at least this member has dues in current period
     ensure_dues_for_member_period(merry, member, period_key)
 
     return MerryPayment.objects.create(
@@ -508,18 +590,33 @@ def confirm_payment_and_allocate(
     if not p:
         raise NotFound("Payment not found.")
 
+    if mpesa_receipt_number:
+        receipt = (mpesa_receipt_number or "").strip()[:64]
+        exists_elsewhere = (
+            MerryPayment.objects.exclude(id=p.id)
+            .filter(mpesa_receipt_number=receipt)
+            .exists()
+        )
+        if exists_elsewhere:
+            raise Conflict("This M-Pesa receipt number is already used.")
+    else:
+        receipt = None
+
     if p.status == "CONFIRMED":
         return p
 
-    if p.status not in ("PENDING", "FAILED"):
+    if p.status in ("CANCELLED",):
         raise BadState(f"Cannot confirm payment from status={p.status}")
-
-    if mpesa_receipt_number:
-        p.mpesa_receipt_number = (mpesa_receipt_number or "").strip()[:64]
 
     p.status = "CONFIRMED"
     p.paid_at = paid_at or timezone.now()
-    p.save(update_fields=["status", "paid_at", "mpesa_receipt_number"])
+    if receipt:
+        p.mpesa_receipt_number = receipt
+
+    if receipt:
+        p.save(update_fields=["status", "paid_at", "mpesa_receipt_number"])
+    else:
+        p.save(update_fields=["status", "paid_at"])
 
     allocate_payment(payment_id=p.id)
     return p
@@ -532,6 +629,9 @@ def mark_payment_failed(*, payment_id: int) -> MerryPayment:
         raise NotFound("Payment not found.")
     if p.status == "CONFIRMED":
         raise BadState("Cannot fail a CONFIRMED payment.")
+    if p.status == "CANCELLED":
+        raise BadState("Cannot fail a CANCELLED payment.")
+
     p.status = "FAILED"
     p.save(update_fields=["status"])
     return p
@@ -546,7 +646,7 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
     """
     payment = (
         MerryPayment.objects.select_for_update()
-        .select_related("merry", "beneficiary_member")
+        .select_related("merry", "beneficiary_member", "beneficiary_member__user")
         .get(id=payment_id)
     )
 
@@ -555,6 +655,12 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
 
     merry = payment.merry
     member = payment.beneficiary_member
+
+    if member.merry_id != merry.id:
+        raise BadState("Payment beneficiary does not belong to this merry.")
+
+    if not member.is_active:
+        raise BadState("Cannot allocate payment for an inactive member.")
 
     remaining = payment.amount or Decimal("0")
     if remaining <= 0:
@@ -577,6 +683,7 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
                 seat__member=member,
                 seat__is_active=True,
                 period_key=period_key,
+                status__in=["PENDING", "PARTIAL"],
             )
             .select_related("seat")
             .order_by("slot_no", "seat__seat_no", "id")
@@ -593,14 +700,14 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
             if alloc <= 0:
                 continue
 
-            a, _ = MerryPaymentAllocation.objects.get_or_create(
+            allocation, _ = MerryPaymentAllocation.objects.get_or_create(
                 payment=payment,
                 due=due,
                 defaults={"amount_allocated": Decimal("0")},
             )
-            a.amount_allocated = (a.amount_allocated or Decimal("0")) + alloc
-            a.full_clean()
-            a.save(update_fields=["amount_allocated"])
+            allocation.amount_allocated = (allocation.amount_allocated or Decimal("0")) + alloc
+            allocation.full_clean()
+            allocation.save(update_fields=["amount_allocated"])
 
             due.paid_amount = (due.paid_amount or Decimal("0")) + alloc
             due.recalc_status()
@@ -613,13 +720,10 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
         if remaining <= 0:
             break
 
-        # if nothing outstanding in this period, jump forward
-        if not any_needed:
-            period_key = _next_period_key(merry, period_key)
-            continue
-
-        # if fully satisfied and still remaining, go next period
         period_key = _next_period_key(merry, period_key)
+
+        if not any_needed:
+            continue
 
     return payment
 
@@ -659,13 +763,20 @@ def create_payout_record(
     if not is_admin(admin_user):
         raise NotAllowed("Admin only.")
 
-    merry = get_merry(merry_id)
+    merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
+    if not merry:
+        raise NotFound("Merry not found.")
 
-    seat = MerrySeat.objects.filter(id=seat_id, merry=merry, is_active=True).select_related("member").first()
+    seat = (
+        MerrySeat.objects.select_for_update()
+        .filter(id=seat_id, merry=merry, is_active=True)
+        .select_related("member", "member__user")
+        .first()
+    )
     if not seat:
         raise NotFound("Seat not found in this merry.")
 
-    amt = q2(Decimal(str(amount)))
+    amt = parse_decimal(amount, "amount")
     if amt <= 0:
         raise BadState("amount must be > 0.")
 
@@ -674,10 +785,7 @@ def create_payout_record(
     if slot_no is None:
         slot_no = get_next_available_slot(merry, pk)
     else:
-        try:
-            slot_no = int(slot_no)
-        except Exception:
-            raise BadState("slot_no must be an integer.")
+        slot_no = parse_int(slot_no, "slot_no", min_value=1)
         validate_slot(merry, slot_no)
         if MerryPayout.objects.filter(merry=merry, period_key=pk, slot_no=slot_no).exists():
             raise Conflict(f"Slot {slot_no} is already used for period {pk}.")
@@ -706,10 +814,13 @@ def mark_payout_paid(*, payout_id: int, paid_at=None) -> MerryPayout:
     p = MerryPayout.objects.select_for_update().filter(id=payout_id).first()
     if not p:
         raise NotFound("Payout not found.")
+
     if p.status == "PAID":
         return p
-    if p.status not in ("SCHEDULED", "PROCESSING", "FAILED"):
+
+    if p.status == "CANCELLED":
         raise BadState(f"Cannot mark PAID from status={p.status}")
+
     p.status = "PAID"
     p.paid_at = paid_at or timezone.now()
     p.save(update_fields=["status", "paid_at"])
@@ -720,6 +831,7 @@ def mark_payout_paid(*, payout_id: int, paid_at=None) -> MerryPayout:
 # Read helpers (optional)
 # -----------------------------
 def list_my_payments(*, user, limit: int = 200):
+    limit = parse_int(limit, "limit", min_value=1, max_value=1000)
     return (
         MerryPayment.objects.filter(beneficiary_member__user=user)
         .select_related("merry", "beneficiary_member", "beneficiary_member__user")
@@ -732,7 +844,6 @@ def list_dues_for_member(*, user, merry_id: int, period_key: Optional[str] = Non
     member = get_active_member(merry, user)
     pk = (period_key or "").strip() or get_current_period_key(merry)
 
-    # safe auto-ensure (member only)
     with transaction.atomic():
         ensure_dues_for_member_period(merry, member, pk)
 

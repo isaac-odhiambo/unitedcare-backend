@@ -6,16 +6,19 @@
 # ✅ "Seats/Shares": a user can buy 2+ memberships (e.g., 3 seats => contributes 3000 when due=1000)
 # ✅ Admin can generate scheduled dues per period/slot for all seats
 # ✅ Clean admin reporting helpers
+# ✅ Join requests support merry open/closed state
+# ✅ Optional seat capacity limit
+# ✅ Less strict join-request history (only one active pending request at a time)
 
 from __future__ import annotations
-from typing import Tuple
+
 from decimal import Decimal
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
-from django.db.models import Max, Sum, Count
+from django.db.models import Max, Sum, Count, Q
 from django.utils import timezone
 
 
@@ -60,18 +63,20 @@ class MerryGoRound(models.Model):
 
     name = models.CharField(max_length=255)
     contribution_amount = models.DecimalField(max_digits=12, decimal_places=2)  # per seat per slot
-    cycle_duration_weeks = models.PositiveIntegerField(default=1)  # optional (kept)
+    cycle_duration_weeks = models.PositiveIntegerField(default=1)
 
     payout_order_type = models.CharField(max_length=10, choices=ORDER_TYPES, default="manual")
-
-    # Frequency controls how we compute period_key
     payout_frequency = models.CharField(max_length=10, choices=PAYOUT_FREQUENCY, default="WEEKLY")
 
-    # If WEEKLY and payouts_per_period=2 => Slot 1 + Slot 2 (e.g. Mon + Fri)
-    # Also means: contributions are expected per slot (Option B)
+    # If WEEKLY and payouts_per_period=2 => e.g. Monday + Friday
     payouts_per_period = models.PositiveIntegerField(default=1)
 
-    # Used elsewhere (withdrawals)
+    # New members can request to join
+    is_open = models.BooleanField(default=True)
+
+    # 0 means unlimited
+    max_seats = models.PositiveIntegerField(default=0, help_text="0 means unlimited seats")
+
     next_payout_date = models.DateField(null=True, blank=True)
 
     created_by = models.ForeignKey(
@@ -83,6 +88,23 @@ class MerryGoRound(models.Model):
 
     class Meta:
         ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["is_open", "created_at"]),
+            models.Index(fields=["payout_frequency", "created_at"]),
+        ]
+
+    def clean(self):
+        if self.contribution_amount is not None and self.contribution_amount <= 0:
+            raise ValidationError("contribution_amount must be greater than 0.")
+
+        if self.cycle_duration_weeks < 1:
+            raise ValidationError("cycle_duration_weeks must be at least 1.")
+
+        if self.payouts_per_period < 1:
+            raise ValidationError("payouts_per_period must be at least 1.")
+
+        if self.max_seats < 0:
+            raise ValidationError("max_seats cannot be negative.")
 
     # -------- period helpers --------
     def current_period_key(self, dt=None) -> str:
@@ -92,53 +114,62 @@ class MerryGoRound(models.Model):
         return _week_period_key(dt)
 
     def required_amount_per_seat_per_period(self) -> Decimal:
-        """
-        Expected per seat per period = contribution_amount * payouts_per_period
-        (e.g., 1000 * 2 slots = 2000 per seat per week)
-        """
         return (self.contribution_amount or Decimal("0")) * Decimal(self.payouts_per_period or 0)
 
     def total_pool_per_slot(self) -> Decimal:
-        """
-        Total expected pool for one slot (if all seats paid for that slot).
-        """
         seats_count = self.seats.filter(is_active=True).count()
         return Decimal(seats_count) * (self.contribution_amount or Decimal("0"))
 
     def total_pool_per_period(self) -> Decimal:
-        """
-        Total expected pool for the full period (all slots).
-        """
         return self.total_pool_per_slot() * Decimal(self.payouts_per_period or 0)
+
+    # -------- join/capacity helpers --------
+    def active_seats_count(self) -> int:
+        return self.seats.filter(is_active=True).count()
+
+    def available_seats(self) -> Optional[int]:
+        if not self.max_seats or self.max_seats <= 0:
+            return None
+        remaining = self.max_seats - self.active_seats_count()
+        return remaining if remaining > 0 else 0
+
+    def can_accept_join_request(self, requested_seats: int = 1) -> tuple[bool, str]:
+        if not self.is_open:
+            return False, "This merry is closed for joining."
+
+        if requested_seats < 1:
+            return False, "requested_seats must be at least 1."
+
+        if self.max_seats and self.max_seats > 0:
+            remaining = self.available_seats() or 0
+            if requested_seats > remaining:
+                return False, f"Only {remaining} seat(s) remaining."
+
+        return True, "OK"
 
     # -------- payout ordering --------
     def next_payout_position(self) -> int:
-        """
-        Returns next payout_position for a new seat (1..N),
-        based on existing seats in the merry.
-        """
         mx = self.seats.filter(is_active=True).aggregate(m=Max("payout_position")).get("m") or 0
         return int(mx) + 1
 
     # -------- admin schedule generation --------
     @transaction.atomic
     def ensure_dues_for_period(self, period_key: Optional[str] = None) -> int:
-        """
-        Create scheduled dues for ALL active seats for this period and all slots.
-        One due = one seat owes contribution_amount for (period_key, slot_no).
-        Returns number of created dues.
-        """
         period_key = period_key or self.current_period_key()
+
         if (self.payouts_per_period or 0) < 1:
             raise ValidationError("payouts_per_period must be >= 1")
 
         created = 0
         due_amt = self.contribution_amount or Decimal("0")
 
-        active_seats = list(self.seats.filter(is_active=True).select_related("member", "member__user"))
+        active_seats = list(
+            self.seats.filter(is_active=True).select_related("member", "member__user")
+        )
+
         for seat in active_seats:
             for slot_no in range(1, self.payouts_per_period + 1):
-                obj, was_created = MerryContributionDue.objects.get_or_create(
+                _, was_created = MerryContributionDue.objects.get_or_create(
                     merry=self,
                     seat=seat,
                     period_key=period_key,
@@ -160,7 +191,9 @@ class MerryGoRound(models.Model):
         return self.members.select_related("user").order_by("-is_active", "id")
 
     def admin_all_seats_qs(self):
-        return self.seats.select_related("member", "member__user").order_by("-is_active", "payout_position", "id")
+        return self.seats.select_related("member", "member__user").order_by(
+            "-is_active", "payout_position", "id"
+        )
 
     def admin_due_qs(self, period_key: Optional[str] = None, slot_no: Optional[int] = None):
         period_key = period_key or self.current_period_key()
@@ -172,17 +205,11 @@ class MerryGoRound(models.Model):
         return qs.order_by("slot_no", "seat_id")
 
     def admin_who_contributed(self, period_key: Optional[str] = None, slot_no: Optional[int] = None):
-        """
-        Dues with paid_amount > 0 (PARTIAL or PAID) for the given slot/period.
-        """
         return self.admin_due_qs(period_key=period_key, slot_no=slot_no).filter(
             paid_amount__gt=Decimal("0")
         ).order_by("-updated_at", "-id")
 
     def admin_total_collected(self, period_key: Optional[str] = None) -> Decimal:
-        """
-        Total collected from confirmed payments for this period.
-        """
         period_key = period_key or self.current_period_key()
         amt = (
             self.payments.filter(status="CONFIRMED", period_key=period_key)
@@ -192,20 +219,12 @@ class MerryGoRound(models.Model):
         return amt or Decimal("0")
 
     def admin_outstanding_by_member(self, period_key: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Outstanding balances aggregated per USER (member), respecting multiple seats.
-        For each user:
-          required = seats_count * contribution_amount * payouts_per_period
-          paid = sum of allocations into dues for those seats (for that period)
-          outstanding = max(required - paid, 0)
-        """
         period_key = period_key or self.current_period_key()
         due_rows = (
             MerryContributionDue.objects.filter(merry=self, period_key=period_key)
             .select_related("seat__member__user")
         )
 
-        # aggregate in Python (simple + correct)
         by_user: Dict[int, Dict[str, Any]] = {}
         for d in due_rows:
             u = d.seat.member.user
@@ -223,7 +242,6 @@ class MerryGoRound(models.Model):
             by_user[u.id]["paid"] += (d.paid_amount or Decimal("0"))
             by_user[u.id]["required"] += (d.due_amount or Decimal("0"))
 
-        # count seats per user (active seats only)
         seat_counts = (
             self.seats.filter(is_active=True)
             .values("member__user_id")
@@ -232,7 +250,6 @@ class MerryGoRound(models.Model):
         for row in seat_counts:
             uid = row["member__user_id"]
             if uid not in by_user:
-                # user has seats but no dues generated (possible if schedule not created)
                 u = self.members.filter(user_id=uid).select_related("user").first()
                 by_user[uid] = {
                     "user_id": uid,
@@ -249,7 +266,6 @@ class MerryGoRound(models.Model):
             out = (v["required"] or Decimal("0")) - (v["paid"] or Decimal("0"))
             v["outstanding"] = out if out > 0 else Decimal("0")
 
-        # unpaid first
         result = list(by_user.values())
         result.sort(key=lambda x: (x["outstanding"] == Decimal("0"), x["name"]))
         return result
@@ -260,8 +276,7 @@ class MerryGoRound(models.Model):
 
 class MerrySlotConfig(models.Model):
     """
-    Admin: define what weekday each slot happens.
-    Example (weekly 2 slots):
+    Example:
       slot 1 => Monday
       slot 2 => Friday
     """
@@ -290,7 +305,11 @@ class MerrySlotConfig(models.Model):
 # ----------------------------
 class MerryMember(models.Model):
     merry = models.ForeignKey(MerryGoRound, related_name="members", on_delete=models.CASCADE)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="merry_memberships")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="merry_memberships",
+    )
 
     joined_at = models.DateTimeField(default=timezone.now)
     is_active = models.BooleanField(default=True)
@@ -300,26 +319,29 @@ class MerryMember(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["merry", "user"], name="uniq_user_per_merry"),
         ]
+        indexes = [
+            models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["merry", "is_active"]),
+        ]
 
     def __str__(self):
         return f"{self.user_id} - {self.merry.name}"
 
 
 # ----------------------------
-# ✅ Seats/Shares: user can have 2+ "memberships"
+# Seats/Shares
 # ----------------------------
 class MerrySeat(models.Model):
     """
     Each seat behaves like a separate participation unit:
       - owes contribution_amount per slot
-      - gets its own payout turn (payout_position)
-    If Isaac wants to contribute 3000 when due=1000, Isaac gets 3 seats.
+      - gets its own payout turn
     """
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="seats")
     member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="seats")
 
-    seat_no = models.PositiveIntegerField()  # 1..N per member within a merry
-    payout_position = models.PositiveIntegerField(null=True, blank=True)  # seat's turn order
+    seat_no = models.PositiveIntegerField()  # 1..N within member
+    payout_position = models.PositiveIntegerField(null=True, blank=True)
 
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(default=timezone.now)
@@ -328,7 +350,15 @@ class MerrySeat(models.Model):
         ordering = ["payout_position", "id"]
         constraints = [
             models.UniqueConstraint(fields=["member", "seat_no"], name="uniq_seat_no_per_member"),
-            models.UniqueConstraint(fields=["merry", "payout_position"], name="uniq_payout_position_per_merry_seat"),
+            models.UniqueConstraint(
+                fields=["merry", "payout_position"],
+                condition=Q(payout_position__isnull=False),
+                name="uniq_payout_position_per_merry_seat",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["merry", "is_active"]),
+            models.Index(fields=["member", "is_active"]),
         ]
 
     def clean(self):
@@ -353,11 +383,13 @@ class MerryJoinRequest(models.Model):
     )
 
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="join_requests")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="merry_join_requests")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="merry_join_requests",
+    )
 
-    # ✅ NEW: requested number of seats (shares)
     requested_seats = models.PositiveIntegerField(default=1)
-
     status = models.CharField(max_length=20, choices=STATUS, default="PENDING")
     note = models.CharField(max_length=255, blank=True, default="")
 
@@ -375,37 +407,76 @@ class MerryJoinRequest(models.Model):
     class Meta:
         ordering = ["-id"]
         constraints = [
-            models.UniqueConstraint(fields=["merry", "user"], name="uniq_join_request_per_merry_user"),
+            # Practical: allow request history, but only ONE active pending request
+            models.UniqueConstraint(
+                fields=["merry", "user"],
+                condition=Q(status="PENDING"),
+                name="uniq_pending_join_request_per_merry_user",
+            ),
         ]
         indexes = [
-            models.Index(fields=["status", "created_at"]),
+            models.Index(fields=["merry", "status", "created_at"]),
+            models.Index(fields=["user", "status", "created_at"]),
         ]
 
     def clean(self):
         if self.requested_seats < 1:
             raise ValidationError("requested_seats must be >= 1")
+
+        if self.requested_seats > 50:
+            raise ValidationError("requested_seats cannot be more than 50.")
+
+        if self.merry_id:
+            ok, reason = self.merry.can_accept_join_request(self.requested_seats)
+            if not ok:
+                raise ValidationError(reason)
+
         if self.merry_id and self.user_id:
-            if MerryMember.objects.filter(merry_id=self.merry_id, user_id=self.user_id, is_active=True).exists():
+            if MerryMember.objects.filter(
+                merry_id=self.merry_id,
+                user_id=self.user_id,
+                is_active=True,
+            ).exists():
                 raise ValidationError("You are already a member of this merry.")
 
+            pending_qs = MerryJoinRequest.objects.filter(
+                merry_id=self.merry_id,
+                user_id=self.user_id,
+                status="PENDING",
+            )
+            if self.pk:
+                pending_qs = pending_qs.exclude(pk=self.pk)
+            if pending_qs.exists():
+                raise ValidationError("You already have a pending join request for this merry.")
+
     @transaction.atomic
-    def approve(self, admin_user) -> Tuple[MerryMember, List[MerrySeat]]:
+    def approve(self, admin_user) -> Tuple[MerryMember, List["MerrySeat"]]:
         if self.status != "PENDING":
             raise ValidationError("Only PENDING requests can be approved.")
 
-        jr = MerryJoinRequest.objects.select_for_update().select_related("merry").get(id=self.id)
+        jr = (
+            MerryJoinRequest.objects.select_for_update()
+            .select_related("merry", "user")
+            .get(id=self.id)
+        )
 
-        # create or fetch member
+        ok, reason = jr.merry.can_accept_join_request(jr.requested_seats)
+        if not ok:
+            raise ValidationError(reason)
+
         member, _ = MerryMember.objects.get_or_create(
             merry=jr.merry,
             user=jr.user,
             defaults={"joined_at": timezone.now(), "is_active": True},
         )
 
-        # create seats
+        if not member.is_active:
+            member.is_active = True
+            member.joined_at = member.joined_at or timezone.now()
+            member.save(update_fields=["is_active", "joined_at"])
+
         seats_created: List[MerrySeat] = []
 
-        # determine next seat_no within this member
         existing_max_seat_no = member.seats.aggregate(m=Max("seat_no")).get("m") or 0
         seat_no_start = int(existing_max_seat_no) + 1
 
@@ -450,11 +521,14 @@ class MerryJoinRequest(models.Model):
         self.save(update_fields=["status"])
 
     def __str__(self):
-        return f"JoinRequest#{self.id} merry={self.merry_id} user={self.user_id} seats={self.requested_seats} {self.status}"
+        return (
+            f"JoinRequest#{self.id} merry={self.merry_id} user={self.user_id} "
+            f"seats={self.requested_seats} {self.status}"
+        )
 
 
 # ----------------------------
-# ✅ Scheduled slot dues (per SEAT)
+# Scheduled slot dues (per seat)
 # ----------------------------
 class MerryContributionDue(models.Model):
     STATUS_CHOICES = (
@@ -474,8 +548,6 @@ class MerryContributionDue(models.Model):
     paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
-
-    # Optional: for admin display
     due_date = models.DateField(null=True, blank=True)
 
     created_at = models.DateTimeField(default=timezone.now)
@@ -484,11 +556,13 @@ class MerryContributionDue(models.Model):
     class Meta:
         ordering = ["-id"]
         constraints = [
-            # ✅ per seat per period per slot
-            models.UniqueConstraint(fields=["seat", "period_key", "slot_no"], name="uniq_due_per_seat_period_slot"),
+            models.UniqueConstraint(
+                fields=["seat", "period_key", "slot_no"],
+                name="uniq_due_per_seat_period_slot",
+            ),
         ]
         indexes = [
-            models.Index(fields=["period_key", "slot_no"]),
+            models.Index(fields=["merry", "period_key", "slot_no"]),
             models.Index(fields=["status", "updated_at"]),
         ]
 
@@ -499,6 +573,10 @@ class MerryContributionDue(models.Model):
             raise ValidationError("slot_no cannot exceed merry.payouts_per_period")
         if self.merry_id and self.seat_id and self.seat.merry_id != self.merry_id:
             raise ValidationError("Due.merry must match seat.merry")
+        if self.due_amount is not None and self.due_amount <= 0:
+            raise ValidationError("due_amount must be > 0")
+        if self.paid_amount is not None and self.paid_amount < 0:
+            raise ValidationError("paid_amount cannot be negative")
 
     def recalc_status(self):
         if self.status == "CANCELLED":
@@ -521,7 +599,7 @@ class MerryContributionDue(models.Model):
 
 
 # ----------------------------
-# ✅ Payments (STK events) — flexible amounts, any time
+# Payments
 # ----------------------------
 class MerryPayment(models.Model):
     STATUS_CHOICES = (
@@ -533,10 +611,12 @@ class MerryPayment(models.Model):
 
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="payments")
 
-    # The logged-in member who gets the credit (beneficiary)
-    beneficiary_member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="payments")
+    beneficiary_member = models.ForeignKey(
+        MerryMember,
+        on_delete=models.CASCADE,
+        related_name="payments",
+    )
 
-    # Optional: who initiated in-app (usually same as beneficiary_member.user)
     initiated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -545,10 +625,7 @@ class MerryPayment(models.Model):
         related_name="merry_payments_initiated",
     )
 
-    # ✅ Phone that received STK prompt (payer line)
     payer_phone = models.CharField(max_length=20, db_index=True)
-
-    # Store the period at initiation time (used as starting point for allocation)
     period_key = models.CharField(max_length=20, db_index=True)
 
     amount = models.DecimalField(max_digits=12, decimal_places=2)
@@ -562,7 +639,8 @@ class MerryPayment(models.Model):
     class Meta:
         ordering = ["-id"]
         indexes = [
-            models.Index(fields=["status", "created_at"]),
+            models.Index(fields=["merry", "status", "created_at"]),
+            models.Index(fields=["beneficiary_member", "created_at"]),
             models.Index(fields=["mpesa_receipt_number"]),
             models.Index(fields=["payer_phone", "created_at"]),
         ]
@@ -574,11 +652,14 @@ class MerryPayment(models.Model):
             raise ValidationError("Payment.merry must match beneficiary_member.merry")
 
     def __str__(self):
-        return f"Payment#{self.id} merry={self.merry_id} member={self.beneficiary_member_id} {self.status} amount={self.amount}"
+        return (
+            f"Payment#{self.id} merry={self.merry_id} "
+            f"member={self.beneficiary_member_id} {self.status} amount={self.amount}"
+        )
 
 
 # ----------------------------
-# ✅ Allocation: spreads payment across dues (slot-first)
+# Allocation
 # ----------------------------
 class MerryPaymentAllocation(models.Model):
     payment = models.ForeignKey(MerryPayment, on_delete=models.CASCADE, related_name="allocations")
@@ -590,7 +671,6 @@ class MerryPaymentAllocation(models.Model):
     class Meta:
         ordering = ["id"]
         constraints = [
-            # one row per payment+due (we update amount_allocated as we allocate more)
             models.UniqueConstraint(fields=["payment", "due"], name="uniq_allocation_per_payment_due"),
         ]
 
@@ -598,12 +678,15 @@ class MerryPaymentAllocation(models.Model):
         if self.amount_allocated is not None and self.amount_allocated <= 0:
             raise ValidationError("amount_allocated must be > 0")
 
+        if self.payment_id and self.due_id and self.payment.merry_id != self.due.merry_id:
+            raise ValidationError("Allocation payment and due must belong to the same merry.")
+
     def __str__(self):
         return f"Alloc#{self.id} pay={self.payment_id} due={self.due_id} amt={self.amount_allocated}"
 
 
 # ----------------------------
-# Payouts — pay a SEAT (since seats have independent turns)
+# Payouts (seat-based)
 # ----------------------------
 class MerryPayout(models.Model):
     STATUS_CHOICES = (
@@ -615,8 +698,6 @@ class MerryPayout(models.Model):
     )
 
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="payouts")
-
-    # ✅ seat-based payout (fair for multi-seat members)
     seat = models.ForeignKey(MerrySeat, on_delete=models.CASCADE, related_name="payouts")
 
     period_key = models.CharField(max_length=20, db_index=True)
@@ -633,14 +714,18 @@ class MerryPayout(models.Model):
     class Meta:
         ordering = ["-id"]
         constraints = [
-            # allow multiple payouts per period (slot-based)
-            models.UniqueConstraint(fields=["merry", "period_key", "slot_no"], name="uniq_payout_per_period_slot"),
-            # prevent paying same seat twice in the same period
-            models.UniqueConstraint(fields=["merry", "seat", "period_key"], name="uniq_seat_payout_per_period"),
+            models.UniqueConstraint(
+                fields=["merry", "period_key", "slot_no"],
+                name="uniq_payout_per_period_slot",
+            ),
+            models.UniqueConstraint(
+                fields=["merry", "seat", "period_key"],
+                name="uniq_seat_payout_per_period",
+            ),
         ]
         indexes = [
-            models.Index(fields=["period_key", "created_at"]),
-            models.Index(fields=["slot_no", "created_at"]),
+            models.Index(fields=["merry", "period_key", "slot_no"]),
+            models.Index(fields=["status", "created_at"]),
         ]
 
     def clean(self):
@@ -650,6 +735,8 @@ class MerryPayout(models.Model):
             raise ValidationError("slot_no must be >= 1")
         if self.merry and self.slot_no > (self.merry.payouts_per_period or 0):
             raise ValidationError("slot_no cannot exceed merry.payouts_per_period")
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError("amount must be > 0")
 
     def __str__(self):
         return (

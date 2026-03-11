@@ -139,6 +139,10 @@ def _svc(name: str):
 initiate_stk_push = _svc("initiate_stk_push")
 handle_stk_callback = _svc("handle_stk_callback")
 
+# NEW: C2B services
+handle_c2b_validation_callback = _svc("handle_c2b_validation_callback")
+handle_c2b_confirmation_callback = _svc("handle_c2b_confirmation_callback")
+
 approve_withdrawal_request = _svc("approve_withdrawal_request")
 initiate_b2c_payout_for_withdrawal = _svc("initiate_b2c_payout_for_withdrawal")
 
@@ -519,6 +523,59 @@ class MpesaStkCallbackView(APIView):
                 handle_stk_callback(callback_payload=request.data)
         except Exception as e:
             logger.exception("STK callback handling error: %s", str(e))
+        return _accepted_callback_response()
+
+
+class MpesaC2BValidationView(APIView):
+    """
+    C2B validation callback
+    POST /payments/mpesa/c2b/validation/?token=...
+    """
+    permission_classes = [permissions.AllowAny]
+
+    @transaction.atomic
+    def post(self, request):
+        try:
+            _require_callback_token(request)
+            _require_safaricom_ip(request)
+
+            if handle_c2b_validation_callback:
+                result = handle_c2b_validation_callback(callback_payload=request.data)
+                if isinstance(result, dict):
+                    return Response(result, status=status.HTTP_200_OK)
+
+        except Exception as e:
+            logger.exception("C2B validation handling error: %s", str(e))
+            return Response(
+                {"ResultCode": "C2B00011", "ResultDesc": "Rejected"},
+                status=status.HTTP_200_OK,
+            )
+
+        return Response(
+            {"ResultCode": "0", "ResultDesc": "Accepted"},
+            status=status.HTTP_200_OK,
+        )
+
+
+class MpesaC2BConfirmationView(APIView):
+    """
+    C2B confirmation callback
+    POST /payments/mpesa/c2b/confirmation/?token=...
+    """
+    permission_classes = [permissions.AllowAny]
+
+    @transaction.atomic
+    def post(self, request):
+        try:
+            _require_callback_token(request)
+            _require_safaricom_ip(request)
+
+            if handle_c2b_confirmation_callback:
+                handle_c2b_confirmation_callback(callback_payload=request.data)
+
+        except Exception as e:
+            logger.exception("C2B confirmation handling error: %s", str(e))
+
         return _accepted_callback_response()
 
 

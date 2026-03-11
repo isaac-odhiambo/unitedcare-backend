@@ -1,35 +1,34 @@
+from datetime import timedelta
+import random
+
 from django.contrib.auth.models import AbstractUser
 from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import timezone
-from datetime import timedelta
-import random
 
 
 # =========================
 # 🔐 VALIDATORS
 # =========================
-
 phone_validator = RegexValidator(
     regex=r"^(07|01)\d{8}$",
-    message="Phone number must be a valid Kenyan number (07XXXXXXXX or 01XXXXXXXX)"
+    message="Phone number must be a valid Kenyan number (07XXXXXXXX or 01XXXXXXXX)",
 )
 
 username_validator = RegexValidator(
     regex=r"^[A-Za-z\s'-]+$",
-    message="Name can contain letters, spaces, hyphens, and apostrophes only"
+    message="Name can contain letters, spaces, hyphens, and apostrophes only",
 )
 
 id_number_validator = RegexValidator(
     regex=r"^\d{1,9}$",
-    message="ID number must be numeric and not exceed 9 digits"
+    message="ID number must be numeric and not exceed 9 digits",
 )
 
 
 # =========================
 # 👤 USER MODEL
 # =========================
-
 class User(AbstractUser):
     ROLE_CHOICES = (
         ("admin", "Admin"),
@@ -47,14 +46,14 @@ class User(AbstractUser):
     username = models.CharField(
         max_length=150,
         unique=True,
-        validators=[username_validator]
+        validators=[username_validator],
     )
 
     phone = models.CharField(
         max_length=10,
         unique=True,
         db_index=True,
-        validators=[phone_validator]
+        validators=[phone_validator],
     )
 
     id_number = models.CharField(
@@ -62,21 +61,22 @@ class User(AbstractUser):
         unique=True,
         null=True,
         blank=True,
-        validators=[id_number_validator]
+        validators=[id_number_validator],
     )
 
     role = models.CharField(
         max_length=10,
         choices=ROLE_CHOICES,
-        default="member"
+        default="member",
     )
 
     status = models.CharField(
         max_length=10,
         choices=STATUS_CHOICES,
-        default="pending"
+        default="pending",
     )
 
+    # False until OTP is verified
     is_active = models.BooleanField(default=False)
 
     failed_login_attempts = models.PositiveIntegerField(default=0)
@@ -85,10 +85,12 @@ class User(AbstractUser):
     USERNAME_FIELD = "phone"
     REQUIRED_FIELDS = ["username"]
 
+    class Meta:
+        ordering = ["-id"]
+
     # =========================
     # 🔒 ACCOUNT LOCK SECURITY
     # =========================
-
     def is_locked(self) -> bool:
         return bool(self.locked_until and timezone.now() < self.locked_until)
 
@@ -103,9 +105,8 @@ class User(AbstractUser):
         self.save(update_fields=["failed_login_attempts", "locked_until"])
 
     # =========================
-    # ✅ HELPERS
+    # ✅ ACCESS HELPERS
     # =========================
-
     @property
     def is_admin(self) -> bool:
         return self.is_superuser or self.is_staff or self.role == "admin"
@@ -119,43 +120,61 @@ class User(AbstractUser):
         return self.status == "blocked"
 
     @property
+    def kyc_status(self) -> str:
+        return getattr(getattr(self, "kycprofile", None), "status", "not_submitted")
+
+    @property
     def is_kyc_approved(self) -> bool:
-        return hasattr(self, "kycprofile") and self.kycprofile.status == "approved"
+        return self.kyc_status == "approved"
+
+    @property
+    def has_limited_access(self) -> bool:
+        """
+        OTP verified user can log in and use limited parts of the app.
+        """
+        return self.is_active and not self.is_blocked
+
+    @property
+    def has_full_access(self) -> bool:
+        """
+        Full access only after:
+        - OTP verified (is_active=True)
+        - not blocked
+        - KYC approved
+        - admin/business approval done
+        """
+        return (
+            self.is_active
+            and not self.is_blocked
+            and self.status == "approved"
+            and self.is_kyc_approved
+        )
 
     def __str__(self):
-        return self.phone
+        return f"{self.username} ({self.phone})"
 
 
 # =========================
-# 🔢 OTP MODEL (UPDATED WITH ATTEMPT LIMITING)
+# 🔢 OTP MODEL
 # =========================
-
 class OTP(models.Model):
     phone = models.CharField(max_length=10, validators=[phone_validator])
     code = models.CharField(max_length=6)
 
     created_at = models.DateTimeField(auto_now_add=True)
     is_used = models.BooleanField(default=False)
-
-    # 🔐 NEW SECURITY FIELD
     attempts = models.PositiveIntegerField(default=0)
 
     class Meta:
+        ordering = ["-created_at"]
         indexes = [
             models.Index(fields=["phone", "created_at"]),
         ]
-
-    # =========================
-    # 🔒 OTP SECURITY METHODS
-    # =========================
 
     def is_expired(self):
         return timezone.now() > self.created_at + timedelta(minutes=5)
 
     def is_locked(self):
-        """
-        Locked if too many incorrect attempts
-        """
         return self.attempts >= 5
 
     def mark_used(self):
@@ -166,25 +185,15 @@ class OTP(models.Model):
         self.attempts += 1
         self.save(update_fields=["attempts"])
 
-    # =========================
-    # 🔐 GENERATION
-    # =========================
-
     @staticmethod
     def generate():
         return str(random.randint(100000, 999999))
 
     @staticmethod
     def can_request_new(phone):
-        """
-        Optional rate limiting:
-        Prevent OTP spam (1 per 60 seconds)
-        """
         last_otp = OTP.objects.filter(phone=phone).order_by("-created_at").first()
-
         if not last_otp:
             return True
-
         return timezone.now() > last_otp.created_at + timedelta(seconds=60)
 
     def __str__(self):
@@ -194,7 +203,6 @@ class OTP(models.Model):
 # =========================
 # 🧾 KYC MODEL
 # =========================
-
 class KYCProfile(models.Model):
     KYC_STATUS = (
         ("not_submitted", "Not Submitted"),
@@ -206,7 +214,7 @@ class KYCProfile(models.Model):
     user = models.OneToOneField(
         User,
         on_delete=models.CASCADE,
-        related_name="kycprofile"
+        related_name="kycprofile",
     )
 
     passport_photo = models.ImageField(upload_to="kyc/passport/")
@@ -216,10 +224,13 @@ class KYCProfile(models.Model):
     status = models.CharField(
         max_length=20,
         choices=KYC_STATUS,
-        default="not_submitted"
+        default="not_submitted",
     )
 
     submitted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-submitted_at"]
 
     def __str__(self):
         return f"KYC - {self.user.phone} ({self.status})"

@@ -10,6 +10,8 @@ from .views import (
     ApproveWithdrawalView,
     MpesaB2CResultView,
     MpesaB2CTimeoutView,
+    MpesaC2BConfirmationView,
+    MpesaC2BValidationView,
     MpesaStkCallbackView,
     MpesaStkPushView,
     MyLedgerHistoryView,
@@ -41,11 +43,15 @@ urlpatterns = [
     path("ledger/admin/", AdminLedgerHistoryView.as_view(), name="admin-ledger"),
 
     # =========================================================
-    # Mpesa / STK / B2C
+    # Mpesa / STK / C2B / B2C
     # =========================================================
     path("mpesa/admin/", AdminMpesaTransactionsView.as_view(), name="admin-mpesa-transactions"),
     path("mpesa/stk-push/", MpesaStkPushView.as_view(), name="mpesa-stk-push"),
     path("mpesa/stk/callback/", MpesaStkCallbackView.as_view(), name="mpesa-stk-callback"),
+
+    path("mpesa/c2b/validation/", MpesaC2BValidationView.as_view(), name="mpesa-c2b-validation"),
+    path("mpesa/c2b/confirmation/", MpesaC2BConfirmationView.as_view(), name="mpesa-c2b-confirmation"),
+
     path("mpesa/b2c/result/", MpesaB2CResultView.as_view(), name="mpesa-b2c-result"),
     path("mpesa/b2c/timeout/", MpesaB2CTimeoutView.as_view(), name="mpesa-b2c-timeout"),
 ]

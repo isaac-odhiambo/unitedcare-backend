@@ -71,6 +71,9 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
     total_pool_per_slot = serializers.SerializerMethodField()
     total_pool_per_period = serializers.SerializerMethodField()
 
+    # ✅ added
+    available_seats = serializers.SerializerMethodField()
+
     class Meta:
         model = MerryGoRound
         fields = [
@@ -82,6 +85,9 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
             "next_payout_date",
             "payout_frequency",
             "payouts_per_period",
+            "is_open",
+            "max_seats",
+            "available_seats",
             "created_by",
             "created_at",
             "members_count",
@@ -93,6 +99,7 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
             "id",
             "created_by",
             "created_at",
+            "available_seats",
             "members_count",
             "seats_count",
             "total_pool_per_slot",
@@ -106,7 +113,6 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
         return obj.seats.filter(is_active=True).count()
 
     def get_total_pool_per_slot(self, obj: MerryGoRound) -> str:
-        # requires method on model; if not present, compute as seats_count * contribution_amount
         if hasattr(obj, "total_pool_per_slot"):
             return str(obj.total_pool_per_slot())
         seats = obj.seats.filter(is_active=True).count()
@@ -117,6 +123,11 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
             return str(obj.total_pool_per_period())
         seats = obj.seats.filter(is_active=True).count()
         return str(Decimal(seats) * (obj.contribution_amount or Decimal("0")) * Decimal(obj.payouts_per_period or 1))
+
+    def get_available_seats(self, obj: MerryGoRound):
+        if hasattr(obj, "available_seats"):
+            return obj.available_seats()
+        return None
 
 
 class MerryMemberSerializer(serializers.ModelSerializer):
@@ -326,6 +337,10 @@ class MerryPayoutSerializer(serializers.ModelSerializer):
 # WRITE serializers (inputs)
 # -----------------------------
 class CreateMerrySerializer(serializers.ModelSerializer):
+    # ✅ added
+    is_open = serializers.BooleanField(required=False, default=True)
+    max_seats = serializers.IntegerField(required=False, min_value=0, default=0)
+
     class Meta:
         model = MerryGoRound
         fields = [
@@ -336,6 +351,8 @@ class CreateMerrySerializer(serializers.ModelSerializer):
             "next_payout_date",
             "payout_frequency",
             "payouts_per_period",
+            "is_open",
+            "max_seats",
         ]
 
     def validate_name(self, value: str):
@@ -373,6 +390,11 @@ class CreateMerrySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("payouts_per_period must be between 1 and 14.")
         return value
 
+    def validate_max_seats(self, value: int):
+        if value < 0:
+            raise serializers.ValidationError("max_seats cannot be negative.")
+        return value
+
     def create(self, validated_data):
         user = self.context["request"].user
         validated_data["created_by"] = user
@@ -389,6 +411,15 @@ class JoinRequestCreateSerializer(serializers.Serializer):
 
         if MerryMember.objects.filter(merry=merry, user=request.user, is_active=True).exists():
             raise serializers.ValidationError("You are already a member of this merry.")
+
+        requested_seats = int(attrs.get("requested_seats") or 1)
+
+        # ✅ added
+        if hasattr(merry, "can_accept_join_request"):
+            ok, reason = merry.can_accept_join_request(requested_seats)
+            if not ok:
+                raise serializers.ValidationError(reason)
+
         return attrs
 
     def create(self, validated_data):
@@ -452,6 +483,15 @@ class AdminApproveJoinRequestSerializer(serializers.Serializer):
         jr: MerryJoinRequest = self.context["join_request"]
         if jr.status != "PENDING":
             raise serializers.ValidationError("Only PENDING requests can be approved.")
+
+        # ✅ added
+        merry = jr.merry
+        requested_seats = int(jr.requested_seats or 1)
+        if hasattr(merry, "can_accept_join_request"):
+            ok, reason = merry.can_accept_join_request(requested_seats)
+            if not ok:
+                raise serializers.ValidationError(reason)
+
         return attrs
 
     def save(self, **kwargs):
@@ -567,7 +607,6 @@ class CreatePayoutSerializer(serializers.Serializer):
 
         compute_amount = parse_bool(attrs.get("compute_amount"))
         if compute_amount:
-            # service/view will compute
             pass
         else:
             if attrs.get("amount") is None:

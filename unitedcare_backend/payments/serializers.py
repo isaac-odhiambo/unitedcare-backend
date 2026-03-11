@@ -62,7 +62,7 @@ class TransactionFeeConfigSerializer(serializers.ModelSerializer):
 
 
 # =========================================================
-# Mpesa Transaction
+# Mpesa Transaction (STK / C2B / B2C)
 # =========================================================
 class MpesaTransactionSerializer(serializers.ModelSerializer):
     user_id = serializers.IntegerField(source="user.id", read_only=True)
