@@ -9,4 +9,4 @@ class IsAdmin(BasePermission):
             and user.is_active
             and user.status != "blocked"
             and user.is_admin
-        )s
+        )

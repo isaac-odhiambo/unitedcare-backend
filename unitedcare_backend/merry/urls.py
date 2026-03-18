@@ -1,38 +1,25 @@
-# merry/urls.py
 from django.urls import path
 
 from .views import (
-    # merry
+    AvailableMerriesView,
     MyMerriesView,
     CreateMerryView,
     MerryDetailView,
-
-    # members / seats
     MerryMembersView,
     MerrySeatsView,
-
-    # slots
     SlotConfigView,
-
-    # join requests
     RequestToJoinMerryView,
     CancelJoinRequestView,
     MyJoinRequestsView,
     AdminListJoinRequestsView,
     AdminApproveJoinRequestView,
     AdminRejectJoinRequestView,
-
-    # dues
     EnsureDuesForCurrentPeriodView,
     MyMerryDuesView,
     AdminDuesView,
-
-    # payments
     CreatePaymentIntentView,
     MyPaymentsView,
     AdminMarkPaymentConfirmedView,
-
-    # payouts
     MerryPayoutScheduleView,
     CreatePayoutView,
     MarkPayoutPaidView,
@@ -40,8 +27,9 @@ from .views import (
 
 urlpatterns = [
     # =========================
-    # My (created + memberships)
+    # Available / My
     # =========================
+    path("available/", AvailableMerriesView.as_view(), name="merry-available"),
     path("my/", MyMerriesView.as_view(), name="merry-my"),
 
     # =========================
@@ -51,13 +39,13 @@ urlpatterns = [
     path("<int:merry_id>/", MerryDetailView.as_view(), name="merry-detail"),
 
     # =========================
-    # Members / Seats (admin or member)
+    # Members / Seats
     # =========================
     path("<int:merry_id>/members/", MerryMembersView.as_view(), name="merry-members"),
     path("<int:merry_id>/seats/", MerrySeatsView.as_view(), name="merry-seats"),
 
     # =========================
-    # Slot config (GET for member/admin, POST admin)
+    # Slot config
     # =========================
     path("<int:merry_id>/slots/", SlotConfigView.as_view(), name="merry-slots"),
 
@@ -68,7 +56,7 @@ urlpatterns = [
     path("join/requests/my/", MyJoinRequestsView.as_view(), name="merry-join-requests-my"),
     path("join/requests/<int:request_id>/cancel/", CancelJoinRequestView.as_view(), name="merry-join-request-cancel"),
 
-    # Admin moderation
+    # Admin join moderation
     path("<int:merry_id>/join/requests/", AdminListJoinRequestsView.as_view(), name="merry-join-requests-admin"),
     path("join/requests/<int:request_id>/approve/", AdminApproveJoinRequestView.as_view(), name="merry-join-request-approve"),
     path("join/requests/<int:request_id>/reject/", AdminRejectJoinRequestView.as_view(), name="merry-join-request-reject"),

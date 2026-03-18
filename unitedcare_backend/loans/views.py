@@ -1,46 +1,35 @@
-# loans/views.py (COMPLETE + UPDATED)
-# ----------------------------------
-# ✅ Fixes your ImportError (no generate_schedule_for_loan import)
-# ✅ Matches your updated services.py:
-#    - LoanContext
-#    - validate_loan_eligibility
-#    - approve_loan_and_create_schedule
-#    - record_loan_payment
-#    - apply_payment_to_loan
-#
-# ✅ Works with your models:
-#    - Loan has FK: merry, group (exactly one)
-#    - LoanGuarantor has: loan, guarantor, accepted, accepted_at, reserved_amount
-#
-# Notes:
-# - You must enforce admin/superadmin permission for approval (I added a safe check).
-#   If you already have IsAdminOrSuperAdmin permission, plug it in.
-# - Serializer names are assumed as you listed. If yours differ, rename the imports.
-
 from decimal import Decimal
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from rest_framework import generics, permissions, status
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
-from rest_framework.exceptions import ValidationError, PermissionDenied
 from rest_framework.views import APIView
 
 from .models import Loan, LoanGuarantor
 from .serializers import (
-    LoanSerializer,
-    LoanCreateSerializer,
+    AddLoanGuarantorSerializer,
+    GuarantorCandidateSerializer,
+    LoanDetailSerializer,
+    LoanEligibilityPreviewSerializer,
     LoanGuarantorSerializer,
-    LoanPaymentSerializer,
+    LoanListSerializer,
+    LoanPaymentCreateSerializer,
+    LoanRequestSerializer,
 )
 from .services import (
-    LoanContext,
-    validate_loan_eligibility,
     approve_loan_and_create_schedule,
-    record_loan_payment,
     apply_payment_to_loan,
+    get_loan_eligibility_preview,
+    record_loan_payment,
+    request_global_loan,
 )
+
+User = get_user_model()
 
 
 # ==========================
@@ -48,102 +37,163 @@ from .services import (
 # ==========================
 class MyLoansView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
-    serializer_class = LoanSerializer
+    serializer_class = LoanListSerializer
 
     def get_queryset(self):
         return (
             Loan.objects.filter(borrower=self.request.user)
-            .select_related("product", "merry", "group")
+            .select_related("product", "borrower")
             .order_by("-id")
         )
 
 
 # ==========================
-# Loans: Create (Request)
+# Loans: Eligibility Preview
 # ==========================
-class RequestLoanView(generics.CreateAPIView):
+class LoanEligibilityPreviewView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        preview = get_loan_eligibility_preview(user=request.user)
+        data = LoanEligibilityPreviewSerializer(preview).data
+        return Response(data, status=status.HTTP_200_OK)
+
+
+# ==========================
+# Loans: Guarantor Candidates
+# ==========================
+class LoanGuarantorCandidatesView(generics.ListAPIView):
     """
-    Request a loan:
-    - runs eligibility checks
-    - creates Loan as PENDING
+    Platform-level guarantor list.
+    Excludes the current user.
+    Supports simple search.
     """
     permission_classes = [permissions.IsAuthenticated]
-    serializer_class = LoanCreateSerializer
+    serializer_class = GuarantorCandidateSerializer
+
+    def get_queryset(self):
+        qs = User.objects.exclude(id=self.request.user.id)
+
+        q = (self.request.query_params.get("q") or "").strip()
+        if q:
+            qs = qs.filter(
+                Q(first_name__icontains=q)
+                | Q(last_name__icontains=q)
+                | Q(username__icontains=q)
+            )
+
+        if hasattr(User, "is_active"):
+            qs = qs.filter(is_active=True)
+
+        return qs.order_by("id")[:50]
+
+
+# ==========================
+# Loans: Create (Request)
+# ==========================
+class RequestLoanView(APIView):
+    """
+    Member requests a global loan.
+
+    Member sends:
+    - principal
+    - term_weeks
+    - guarantor_ids
+    - optional member_note
+
+    Product is selected internally by backend.
+    """
+    permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        ser = self.get_serializer(data=request.data)
+    def post(self, request):
+        ser = LoanRequestSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
-        user = request.user
-        principal: Decimal = ser.validated_data["principal"]
-
-        merry = ser.validated_data.get("merry")
-        group = ser.validated_data.get("group")
-
-        ctx = LoanContext(
-            merry_id=merry.id if merry else None,
-            group_id=group.id if group else None,
+        loan = request_global_loan(
+            borrower=request.user,
+            principal=ser.validated_data["principal"],
+            term_weeks=ser.validated_data["term_weeks"],
+            guarantor_ids=ser.validated_data.get("guarantor_ids", []),
+            member_note=ser.validated_data.get("member_note", ""),
         )
 
-        validate_loan_eligibility(user=user, ctx=ctx, principal=principal)
+        loan = (
+            Loan.objects.select_related("product", "borrower")
+            .prefetch_related(
+                "guarantors",
+                "guarantors__guarantor",
+                "security_allocations",
+                "installments",
+                "payments",
+            )
+            .get(id=loan.id)
+        )
 
-        loan = ser.save(borrower=user, status="PENDING")
-
-        # Return full loan payload
         return Response(
-            {"message": "Loan request submitted.", "loan": LoanSerializer(loan).data},
+            {
+                "message": "Loan request submitted.",
+                "loan": LoanDetailSerializer(loan).data,
+            },
             status=status.HTTP_201_CREATED,
         )
 
 
 # ==========================
-# Loans: Detail (Borrower only)
+# Loans: Detail
 # ==========================
 class LoanDetailView(generics.RetrieveAPIView):
     permission_classes = [permissions.IsAuthenticated]
-    serializer_class = LoanSerializer
-    queryset = Loan.objects.select_related("product", "merry", "group", "borrower")
+    serializer_class = LoanDetailSerializer
+    queryset = (
+        Loan.objects.select_related("product", "borrower")
+        .prefetch_related(
+            "guarantors",
+            "guarantors__guarantor",
+            "security_allocations",
+            "installments",
+            "payments",
+        )
+    )
 
     def get_object(self):
         obj = super().get_object()
-        if obj.borrower_id != self.request.user.id:
-            raise PermissionDenied("You do not have permission to view this loan.")
-        return obj
+
+        if obj.borrower_id == self.request.user.id:
+            return obj
+
+        if LoanGuarantor.objects.filter(loan=obj, guarantor=self.request.user).exists():
+            return obj
+
+        if self.request.user.is_staff or self.request.user.is_superuser:
+            return obj
+
+        raise PermissionDenied("You do not have permission to view this loan.")
 
 
 # ==========================
-# Guarantors: Add guarantor (Borrower)
+# Guarantors: Add guarantor
 # ==========================
-class AddGuarantorView(generics.CreateAPIView):
-    """
-    Borrower adds guarantor(s) to their loan.
-    """
+class AddGuarantorView(APIView):
     permission_classes = [permissions.IsAuthenticated]
-    serializer_class = LoanGuarantorSerializer
 
     @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        ser = self.get_serializer(data=request.data)
+    def post(self, request):
+        ser = AddLoanGuarantorSerializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
+        guarantor = ser.save()
 
-        loan: Loan = ser.validated_data["loan"]
-
-        if loan.borrower_id != request.user.id:
-            raise PermissionDenied("Only the borrower can add guarantors for this loan.")
-
-        if loan.status not in ("PENDING", "UNDER_REVIEW"):
-            raise ValidationError("You can only add guarantors to a pending/review loan.")
-
-        g = ser.save()
         return Response(
-            {"message": "Guarantor added. Waiting for acceptance.", "guarantor": LoanGuarantorSerializer(g).data},
+            {
+                "message": "Guarantor added. Waiting for acceptance.",
+                "guarantor": LoanGuarantorSerializer(guarantor).data,
+            },
             status=status.HTTP_201_CREATED,
         )
 
 
 # ==========================
-# Guarantors: My pending guarantee requests (Guarantor)
+# Guarantors: My pending guarantee requests
 # ==========================
 class MyGuaranteeRequestsView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -152,7 +202,7 @@ class MyGuaranteeRequestsView(generics.ListAPIView):
     def get_queryset(self):
         return (
             LoanGuarantor.objects.filter(guarantor=self.request.user, accepted=False)
-            .select_related("loan", "loan__merry", "loan__group", "loan__borrower")
+            .select_related("loan", "loan__borrower", "loan__product", "guarantor")
             .order_by("-id")
         )
 
@@ -166,29 +216,33 @@ class AcceptGuaranteeView(APIView):
     @transaction.atomic
     def patch(self, request, guarantor_id: int):
         try:
-            g = LoanGuarantor.objects.select_for_update().select_related("loan").get(id=guarantor_id)
+            guarantor_link = (
+                LoanGuarantor.objects.select_for_update()
+                .select_related("loan", "guarantor")
+                .get(id=guarantor_id)
+            )
         except LoanGuarantor.DoesNotExist:
             raise ValidationError("Guarantee request not found.")
 
-        if g.guarantor_id != request.user.id:
+        if guarantor_link.guarantor_id != request.user.id:
             raise PermissionDenied("This guarantee request is not yours.")
 
-        if g.accepted:
+        if guarantor_link.accepted:
             return Response({"message": "Already accepted."}, status=status.HTTP_200_OK)
 
-        if g.loan.status not in ("PENDING", "UNDER_REVIEW"):
+        if guarantor_link.loan.status not in ("PENDING", "UNDER_REVIEW"):
             raise ValidationError("You can only accept guarantee for pending/review loans.")
 
-        g.accepted = True
-        g.accepted_at = timezone.now()
-        g.full_clean()  # enforces guarantor rules in model.clean()
-        g.save(update_fields=["accepted", "accepted_at"])
+        guarantor_link.accepted = True
+        guarantor_link.accepted_at = timezone.now()
+        guarantor_link.full_clean()
+        guarantor_link.save(update_fields=["accepted", "accepted_at"])
 
         return Response({"message": "Guarantee accepted."}, status=status.HTTP_200_OK)
 
 
 # ==========================
-# Guarantors: Reject (delete request)
+# Guarantors: Reject
 # ==========================
 class RejectGuaranteeView(APIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -196,40 +250,43 @@ class RejectGuaranteeView(APIView):
     @transaction.atomic
     def patch(self, request, guarantor_id: int):
         try:
-            g = LoanGuarantor.objects.select_for_update().select_related("loan").get(id=guarantor_id)
+            guarantor_link = (
+                LoanGuarantor.objects.select_for_update()
+                .select_related("loan", "guarantor")
+                .get(id=guarantor_id)
+            )
         except LoanGuarantor.DoesNotExist:
             raise ValidationError("Guarantee request not found.")
 
-        if g.guarantor_id != request.user.id:
+        if guarantor_link.guarantor_id != request.user.id:
             raise PermissionDenied("This guarantee request is not yours.")
 
-        if g.accepted:
+        if guarantor_link.accepted:
             raise ValidationError("Cannot reject: already accepted.")
 
-        g.delete()
+        guarantor_link.delete()
         return Response({"message": "Guarantee rejected."}, status=status.HTTP_200_OK)
 
 
 # ==========================
-# Admin/Approver: Approve loan
+# Admin: Approve loan
 # ==========================
 class ApproveLoanView(APIView):
     """
-    Approver marks loan as APPROVED, reserves security, and generates schedule.
+    Admin marks loan as APPROVED, reserves security, and generates schedule.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def patch(self, request, loan_id: int):
-        # ✅ Simple safe permission gate:
-        # Replace with your custom IsAdminOrSuperAdmin if you have it.
         if not (request.user.is_staff or request.user.is_superuser):
             raise PermissionDenied("Only admin can approve loans.")
 
         try:
             loan = (
                 Loan.objects.select_for_update()
-                .select_related("product", "borrower", "merry", "group")
+                .select_related("product", "borrower")
+                .prefetch_related("guarantors", "guarantors__guarantor")
                 .get(id=loan_id)
             )
         except Loan.DoesNotExist:
@@ -237,8 +294,23 @@ class ApproveLoanView(APIView):
 
         loan = approve_loan_and_create_schedule(loan)
 
+        loan = (
+            Loan.objects.select_related("product", "borrower")
+            .prefetch_related(
+                "guarantors",
+                "guarantors__guarantor",
+                "security_allocations",
+                "installments",
+                "payments",
+            )
+            .get(id=loan.id)
+        )
+
         return Response(
-            {"message": "Loan approved and schedule generated.", "loan": LoanSerializer(loan).data},
+            {
+                "message": "Loan approved and schedule generated.",
+                "loan": LoanDetailSerializer(loan).data,
+            },
             status=status.HTTP_200_OK,
         )
 
@@ -254,7 +326,7 @@ class PayLoanView(APIView):
 
     @transaction.atomic
     def post(self, request, loan_id: int):
-        ser = LoanPaymentSerializer(data=request.data)
+        ser = LoanPaymentCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
         amount = Decimal(ser.validated_data["amount"])

@@ -1,4 +1,3 @@
-# payments/models.py
 from decimal import Decimal
 
 from django.conf import settings
@@ -94,6 +93,14 @@ class MpesaTransaction(models.Model):
       * B2C: actual payout sent to customer
     - base_amount = business/base amount before fee
     - transaction_fee = fee portion applied by backend
+
+    For manual paybill, simple references such as:
+      - mus12
+      - saving23
+      - loan35
+      - grp9
+    should be stored in `reference`.
+    Parsing and allocation should happen in service logic, not in this model.
     """
 
     DIRECTION_CHOICES = (("IN", "Money In"), ("OUT", "Money Out"))
@@ -118,6 +125,14 @@ class MpesaTransaction(models.Model):
         ("WITHDRAWAL", "Withdrawal"),
         ("LOAN_DISBURSEMENT", "Loan Disbursement"),
         ("OTHER", "Other"),
+    )
+    ALLOCATION_STATUS_CHOICES = (
+        ("UNALLOCATED", "Unallocated"),
+        ("AUTO_ALLOCATED", "Auto Allocated"),
+        ("PARTIALLY_ALLOCATED", "Partially Allocated"),
+        ("MANUAL_REVIEW", "Manual Review"),
+        ("MANUALLY_ALLOCATED", "Manually Allocated"),
+        ("INVALID_REFERENCE", "Invalid Reference"),
     )
 
     user = models.ForeignKey(
@@ -165,7 +180,8 @@ class MpesaTransaction(models.Model):
         db_index=True,
     )
 
-    # Business/internal reference (optional)
+    # Business/internal reference from STK or manual paybill callback.
+    # Examples: mus12, saving23, loan35, grp9
     reference = models.CharField(max_length=120, blank=True, default="", db_index=True)
 
     # --- STK identifiers ---
@@ -205,7 +221,9 @@ class MpesaTransaction(models.Model):
     request_payload = models.JSONField(null=True, blank=True)
     callback_payload = models.JSONField(null=True, blank=True)
 
-    # Link to "what this payment was for" (any model)
+    # Optional generic link to one dominant target object.
+    # For cross-allocation cases, this may remain blank and allocation can
+    # instead be tracked in the business/domain services.
     target_content_type = models.ForeignKey(
         ContentType,
         on_delete=models.SET_NULL,
@@ -218,6 +236,23 @@ class MpesaTransaction(models.Model):
     # Idempotency for posting ledger
     ledger_posted = models.BooleanField(default=False, db_index=True)
 
+    # Allocation/admin review workflow for manual paybill and other inbound flows
+    allocation_status = models.CharField(
+        max_length=25,
+        choices=ALLOCATION_STATUS_CHOICES,
+        default="UNALLOCATED",
+        db_index=True,
+    )
+    allocation_notes = models.CharField(max_length=255, blank=True, default="")
+    allocated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="allocated_mpesa_transactions",
+    )
+    allocated_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -227,6 +262,8 @@ class MpesaTransaction(models.Model):
             models.Index(fields=["status", "channel", "direction"]),
             models.Index(fields=["phone", "created_at"]),
             models.Index(fields=["purpose", "created_at"]),
+            models.Index(fields=["allocation_status", "created_at"]),
+            models.Index(fields=["reference", "channel", "status"]),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -249,7 +286,8 @@ class MpesaTransaction(models.Model):
     def __str__(self):
         return (
             f"MpesaTx#{self.id} {self.channel} {self.direction} "
-            f"amount={self.amount} base={self.base_amount} fee={self.transaction_fee} {self.status}"
+            f"amount={self.amount} base={self.base_amount} "
+            f"fee={self.transaction_fee} {self.status}"
         )
 
 

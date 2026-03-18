@@ -1,12 +1,14 @@
 # merry/services.py
 # FULLY UPDATED — Seat/Shares + Slot-based dues + Payments + Allocations + Seat-based payouts
 # + safer parsing/validation + better locking + duplicate receipt protection
+# + NEW: cross-merry user-reference allocation for simple references like mus12
 
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
+from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.db.models import Max, Sum
 from django.utils import timezone
@@ -22,6 +24,8 @@ from .models import (
     MerryPaymentAllocation,
     MerryPayout,
 )
+
+User = get_user_model()
 
 
 # -----------------------------
@@ -158,6 +162,32 @@ def get_next_available_slot(merry: MerryGoRound, period_key: str) -> int:
     raise Conflict(f"Payout slots are full for period {period_key}. Max slots: {limit}.")
 
 
+# ✅ global seat helper
+def get_next_available_seat_numbers(merry: MerryGoRound, count: int) -> List[int]:
+    count = parse_int(count, "count", min_value=1)
+
+    if hasattr(merry, "next_available_seat_numbers"):
+        return merry.next_available_seat_numbers(count)
+
+    if merry.max_seats and merry.max_seats > 0:
+        taken = set(
+            MerrySeat.objects.filter(merry=merry, is_active=True).values_list("seat_no", flat=True)
+        )
+        available = [n for n in range(1, merry.max_seats + 1) if n not in taken]
+        if len(available) < count:
+            raise BadState("Not enough available seat numbers.")
+        return available[:count]
+
+    existing = set(MerrySeat.objects.filter(merry=merry, is_active=True).values_list("seat_no", flat=True))
+    picked: List[int] = []
+    n = 1
+    while len(picked) < count:
+        if n not in existing:
+            picked.append(n)
+        n += 1
+    return picked
+
+
 # ---------- period stepping for carry-forward ----------
 def _next_week_period_key(period_key: str) -> str:
     try:
@@ -191,6 +221,290 @@ def _next_period_key(merry: MerryGoRound, period_key: str) -> str:
     if (merry.payout_frequency or "WEEKLY").upper() == "MONTHLY":
         return _next_month_period_key(period_key)
     return _next_week_period_key(period_key)
+
+
+# -----------------------------
+# NEW cross-merry allocation helpers
+# -----------------------------
+def _active_members_for_user(user_id: int) -> List[MerryMember]:
+    members = list(
+        MerryMember.objects.select_related("merry", "user")
+        .filter(user_id=user_id, is_active=True, merry__isnull=False)
+        .order_by("merry_id", "id")
+    )
+    return members
+
+
+def _ensure_current_dues_for_user_memberships(user_id: int) -> List[MerryMember]:
+    members = _active_members_for_user(user_id)
+    for member in members:
+        ensure_dues_for_member_period(member.merry, member, get_current_period_key(member.merry))
+    return members
+
+
+def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -> List[MerryContributionDue]:
+    return list(
+        MerryContributionDue.objects.select_for_update()
+        .filter(
+            merry=member.merry,
+            seat__member=member,
+            seat__is_active=True,
+            period_key=period_key,
+            status__in=["PENDING", "PARTIAL"],
+        )
+        .select_related("seat", "merry", "seat__member", "seat__member__user")
+        .order_by("slot_no", "seat__seat_no", "id")
+    )
+
+
+def _create_confirmed_payment_shell(
+    *,
+    member: MerryMember,
+    total_amount: Decimal,
+    payer_phone: str,
+    period_key: str,
+    initiated_by=None,
+    mpesa_receipt_number: Optional[str] = None,
+    paid_at=None,
+) -> MerryPayment:
+    payment = MerryPayment.objects.create(
+        merry=member.merry,
+        beneficiary_member=member,
+        initiated_by=initiated_by,
+        payer_phone=(payer_phone or "").strip(),
+        period_key=period_key,
+        amount=q2(total_amount),
+        status="CONFIRMED",
+        paid_at=paid_at or timezone.now(),
+        mpesa_receipt_number=(mpesa_receipt_number or "").strip()[:64] or None,
+    )
+    return payment
+
+
+@transaction.atomic
+def apply_mpesa_contribution_by_user_reference(
+    *,
+    user_id: int,
+    amount: Decimal,
+    mpesa_tx=None,
+    reference: str = "",
+):
+    """
+    NEW:
+    Allocate a single incoming M-Pesa merry contribution across ALL active merry memberships
+    of the given user.
+
+    Rules:
+    - current dues first across all active merries
+    - if surplus remains, allocate to future dues
+    - one CONFIRMED MerryPayment record is created per merry touched
+    - allocations are created against the exact dues
+    """
+    uid = parse_int(user_id, "user_id", min_value=1)
+    total_amount = parse_decimal(amount, "amount")
+    if total_amount <= 0:
+        raise BadState("amount must be > 0.")
+
+    user = User.objects.filter(id=uid).first()
+    if not user:
+        raise NotFound("User not found.")
+
+    members = _ensure_current_dues_for_user_memberships(uid)
+    if not members:
+        raise NotFound("User has no active merry memberships.")
+
+    payer_phone = ""
+    mpesa_receipt = None
+    paid_at = timezone.now()
+
+    if mpesa_tx is not None:
+        payer_phone = getattr(mpesa_tx, "phone", "") or ""
+        mpesa_receipt = getattr(mpesa_tx, "mpesa_receipt_number", None)
+        tx_date = getattr(mpesa_tx, "transaction_date", None)
+        if tx_date:
+            paid_at = tx_date
+
+    remaining = q2(total_amount)
+    if remaining <= 0:
+        raise BadState("amount must be > 0.")
+
+    # We first build a plan, then persist it.
+    plan: List[Tuple[MerryMember, MerryContributionDue, Decimal]] = []
+
+    # -----------------------------------------
+    # Phase 1: current dues first across merries
+    # -----------------------------------------
+    current_due_rows: List[Tuple[MerryMember, MerryContributionDue]] = []
+    for member in members:
+        current_pk = get_current_period_key(member.merry)
+        dues = _collect_open_dues_for_member_period(member, current_pk)
+        for due in dues:
+            current_due_rows.append((member, due))
+
+    current_due_rows.sort(
+        key=lambda x: (
+            x[1].period_key,
+            x[1].slot_no,
+            x[0].merry_id,
+            x[1].seat.seat_no,
+            x[1].id,
+        )
+    )
+
+    for member, due in current_due_rows:
+        if remaining <= 0:
+            break
+
+        need = q2((due.due_amount or Decimal("0")) - (due.paid_amount or Decimal("0")))
+        if need <= 0:
+            continue
+
+        alloc = remaining if remaining < need else need
+        if alloc <= 0:
+            continue
+
+        plan.append((member, due, alloc))
+        remaining = q2(remaining - alloc)
+
+    # -----------------------------------------
+    # Phase 2: future dues if surplus remains
+    # -----------------------------------------
+    if remaining > 0:
+        future_period_map: Dict[int, str] = {}
+        for member in members:
+            current_pk = get_current_period_key(member.merry)
+            future_period_map[member.id] = _next_period_key(member.merry, current_pk)
+
+        safety = 0
+        while remaining > 0:
+            safety += 1
+            if safety > 240:
+                raise BadState("Future allocation safety limit reached.")
+
+            any_future_due_found = False
+
+            for member in members:
+                if remaining <= 0:
+                    break
+
+                period_key = future_period_map[member.id]
+                ensure_dues_for_member_period(member.merry, member, period_key)
+
+                dues = _collect_open_dues_for_member_period(member, period_key)
+                if dues:
+                    any_future_due_found = True
+
+                for due in dues:
+                    if remaining <= 0:
+                        break
+
+                    need = q2((due.due_amount or Decimal("0")) - (due.paid_amount or Decimal("0")))
+                    if need <= 0:
+                        continue
+
+                    alloc = remaining if remaining < need else need
+                    if alloc <= 0:
+                        continue
+
+                    plan.append((member, due, alloc))
+                    remaining = q2(remaining - alloc)
+
+                future_period_map[member.id] = _next_period_key(member.merry, period_key)
+
+            if not any_future_due_found and remaining > 0:
+                break
+
+    if not plan:
+        raise BadState("No allocatable merry dues were found for this user.")
+
+    # -----------------------------------------
+    # Persist payments + allocations
+    # -----------------------------------------
+    grouped: Dict[Tuple[int, str], Dict[str, object]] = {}
+    for member, due, alloc in plan:
+        key = (member.id, due.period_key)
+        if key not in grouped:
+            grouped[key] = {
+                "member": member,
+                "period_key": due.period_key,
+                "amount": Decimal("0"),
+                "items": [],
+            }
+        grouped[key]["amount"] = q2(grouped[key]["amount"] + alloc)
+        grouped[key]["items"].append((due, alloc))
+
+    created_payments: List[MerryPayment] = []
+
+    for _, bundle in grouped.items():
+        member = bundle["member"]
+        period_key = bundle["period_key"]
+        pay_amount = q2(bundle["amount"])
+        items = bundle["items"]
+
+        payment = _create_confirmed_payment_shell(
+            member=member,
+            total_amount=pay_amount,
+            payer_phone=payer_phone,
+            period_key=period_key,
+            initiated_by=user,
+            mpesa_receipt_number=mpesa_receipt,
+            paid_at=paid_at,
+        )
+
+        for due, alloc in items:
+            MerryPaymentAllocation.objects.create(
+                payment=payment,
+                due=due,
+                amount_allocated=q2(alloc),
+            )
+
+            due.paid_amount = q2((due.paid_amount or Decimal("0")) + alloc)
+            due.recalc_status()
+            due.save(update_fields=["paid_amount", "status", "updated_at"])
+
+        created_payments.append(payment)
+
+    return created_payments
+
+
+def apply_mpesa_contribution_by_user(
+    *,
+    user_id: int,
+    amount: Decimal,
+    mpesa_tx=None,
+    reference: str = "",
+):
+    """
+    Wrapper kept for compatibility with payments/services.py.
+    """
+    return apply_mpesa_contribution_by_user_reference(
+        user_id=user_id,
+        amount=amount,
+        mpesa_tx=mpesa_tx,
+        reference=reference,
+    )
+
+
+def apply_mpesa_contribution(
+    *,
+    user,
+    amount: Decimal,
+    mpesa_tx=None,
+    reference: str = "",
+):
+    """
+    Backward-compatible entry point.
+    If user is available, allocate across all active merry memberships for that user.
+    """
+    if not user or not getattr(user, "id", None):
+        raise BadState("Valid user is required for merry contribution allocation.")
+
+    return apply_mpesa_contribution_by_user_reference(
+        user_id=user.id,
+        amount=amount,
+        mpesa_tx=mpesa_tx,
+        reference=reference,
+    )
 
 
 # -----------------------------
@@ -410,7 +724,12 @@ def cancel_join_request(*, user, request_id: int) -> MerryJoinRequest:
 
 
 @transaction.atomic
-def admin_approve_join_request(*, admin_user, request_id: int) -> Tuple[MerryMember, List[MerrySeat]]:
+def admin_approve_join_request(
+    *,
+    admin_user,
+    request_id: int,
+    assigned_seat_numbers: Optional[List[int]] = None,
+) -> Tuple[MerryMember, List[MerrySeat]]:
     if not is_admin(admin_user):
         raise NotAllowed("Admin only.")
 
@@ -451,12 +770,43 @@ def admin_approve_join_request(*, admin_user, request_id: int) -> Tuple[MerryMem
         else:
             member.save(update_fields=["is_active"])
 
-    existing_max_seat_no = member.seats.aggregate(m=Max("seat_no")).get("m") or 0
-    seat_no_start = int(existing_max_seat_no) + 1
+    if assigned_seat_numbers is None:
+        seat_numbers = get_next_available_seat_numbers(merry, seats_requested)
+    else:
+        if not isinstance(assigned_seat_numbers, list):
+            raise BadState("assigned_seat_numbers must be a list of integers.")
+
+        seat_numbers = [
+            parse_int(v, "assigned_seat_numbers item", min_value=1)
+            for v in assigned_seat_numbers
+        ]
+
+        if len(seat_numbers) != seats_requested:
+            raise BadState(f"Exactly {seats_requested} seat number(s) must be assigned.")
+
+        if len(set(seat_numbers)) != len(seat_numbers):
+            raise BadState("Assigned seat numbers must be unique.")
+
+        if merry.max_seats and merry.max_seats > 0:
+            invalid = [s for s in seat_numbers if s > merry.max_seats]
+            if invalid:
+                raise BadState(
+                    f"These seat number(s) exceed max_seats ({merry.max_seats}): {invalid}"
+                )
+
+        taken = list(
+            MerrySeat.objects.filter(
+                merry=merry,
+                seat_no__in=seat_numbers,
+                is_active=True,
+            ).values_list("seat_no", flat=True)
+        )
+        if taken:
+            raise Conflict(f"These seat number(s) are already taken: {sorted(taken)}")
 
     seats_created: List[MerrySeat] = []
     try:
-        for i in range(seats_requested):
+        for seat_no in seat_numbers:
             payout_position: Optional[int] = None
             if merry.payout_order_type == "manual":
                 payout_position = next_payout_position_for_seat(merry)
@@ -464,14 +814,14 @@ def admin_approve_join_request(*, admin_user, request_id: int) -> Tuple[MerryMem
             seat = MerrySeat.objects.create(
                 merry=merry,
                 member=member,
-                seat_no=seat_no_start + i,
+                seat_no=seat_no,
                 payout_position=payout_position,
                 is_active=True,
                 created_at=timezone.now(),
             )
             seats_created.append(seat)
     except IntegrityError:
-        raise Conflict("Failed to create seats (duplicate payout_position). Try again.")
+        raise Conflict("Failed to create seats (duplicate seat_no or payout_position). Try again.")
 
     jr.status = "APPROVED"
     jr.reviewed_by = admin_user

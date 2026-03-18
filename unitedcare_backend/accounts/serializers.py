@@ -27,7 +27,7 @@ class RegisterSerializer(serializers.ModelSerializer):
         ]
 
     def validate_username(self, value):
-        value = " ".join(value.strip().split())
+        value = " ".join(str(value).strip().split())
         if not re.match(r"^[A-Za-z\s'-]+$", value):
             raise serializers.ValidationError(
                 "Name can contain letters, spaces, hyphens, and apostrophes only"
@@ -35,6 +35,7 @@ class RegisterSerializer(serializers.ModelSerializer):
         return value
 
     def validate_phone(self, value):
+        value = str(value).strip()
         if not re.match(r"^(07|01)\d{8}$", value):
             raise serializers.ValidationError(
                 "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)"
@@ -42,7 +43,11 @@ class RegisterSerializer(serializers.ModelSerializer):
         return value
 
     def validate_id_number(self, value):
-        if value and not re.match(r"^\d{1,9}$", value):
+        if value in [None, ""]:
+            return None
+
+        value = str(value).strip()
+        if not re.match(r"^\d{1,9}$", value):
             raise serializers.ValidationError(
                 "ID number must be numeric and not exceed 9 digits"
             )
@@ -71,6 +76,14 @@ class RegisterSerializer(serializers.ModelSerializer):
 class LoginSerializer(serializers.Serializer):
     phone = serializers.CharField()
     password = serializers.CharField(write_only=True)
+
+    def validate_phone(self, value):
+        value = str(value).strip()
+        if not re.match(r"^(07|01)\d{8}$", value):
+            raise serializers.ValidationError(
+                "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)"
+            )
+        return value
 
     def validate(self, data):
         phone = data["phone"]
@@ -102,7 +115,7 @@ class LoginSerializer(serializers.Serializer):
         auth_user = authenticate(
             request=self.context.get("request"),
             username=phone,
-            password=password
+            password=password,
         )
 
         if not auth_user:
@@ -132,8 +145,12 @@ class ForgotPasswordSerializer(serializers.Serializer):
     phone = serializers.CharField()
 
     def validate_phone(self, value):
+        value = str(value).strip()
+
         if not re.match(r"^(07|01)\d{8}$", value):
-            raise serializers.ValidationError("Enter a valid Kenyan phone number")
+            raise serializers.ValidationError(
+                "Enter a valid Kenyan phone number"
+            )
 
         if not User.objects.filter(phone=value).exists():
             raise serializers.ValidationError(
@@ -151,6 +168,21 @@ class ResetPasswordSerializer(serializers.Serializer):
     otp = serializers.CharField()
     new_password = serializers.CharField(write_only=True)
 
+    def validate_phone(self, value):
+        value = str(value).strip()
+
+        if not re.match(r"^(07|01)\d{8}$", value):
+            raise serializers.ValidationError(
+                "Enter a valid Kenyan phone number"
+            )
+        return value
+
+    def validate_otp(self, value):
+        value = str(value).strip()
+        if not re.match(r"^\d{4,6}$", value):
+            raise serializers.ValidationError("Enter a valid OTP code")
+        return value
+
     def validate(self, data):
         phone = data["phone"]
         otp_code = data["otp"]
@@ -164,13 +196,11 @@ class ResetPasswordSerializer(serializers.Serializer):
         except OTP.DoesNotExist:
             raise serializers.ValidationError("Invalid or expired OTP")
 
-        # 🔒 Expiration check
         if otp.is_expired():
             otp.is_used = True
             otp.save(update_fields=["is_used"])
             raise serializers.ValidationError("OTP has expired")
 
-        # 🔐 Attempt limit check
         if otp.attempts >= MAX_OTP_ATTEMPTS:
             otp.is_used = True
             otp.save(update_fields=["is_used"])
@@ -178,7 +208,6 @@ class ResetPasswordSerializer(serializers.Serializer):
                 "Too many incorrect attempts. Request a new OTP."
             )
 
-        # ❌ Wrong OTP
         if otp.code != otp_code:
             otp.attempts += 1
             otp.save(update_fields=["attempts"])
@@ -196,7 +225,6 @@ class ResetPasswordSerializer(serializers.Serializer):
                 f"Incorrect OTP. {remaining} attempts remaining."
             )
 
-        # ✅ Correct OTP
         validate_password(password)
 
         data["otp_obj"] = otp
@@ -224,6 +252,8 @@ class ResendOTPSerializer(serializers.Serializer):
     phone = serializers.CharField()
 
     def validate_phone(self, value):
+        value = str(value).strip()
+
         if not re.match(r"^(07|01)\d{8}$", value):
             raise serializers.ValidationError(
                 "Enter a valid Kenyan phone number"
@@ -254,9 +284,44 @@ class ResendOTPSerializer(serializers.Serializer):
 # 👤 CURRENT USER
 # =========================================================
 class MeSerializer(serializers.ModelSerializer):
+    is_admin = serializers.SerializerMethodField()
+    kyc_status = serializers.SerializerMethodField()
+    is_kyc_approved = serializers.SerializerMethodField()
+    has_limited_access = serializers.SerializerMethodField()
+    has_full_access = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ["username", "phone", "email", "role", "status", "is_active"]
+        fields = [
+            "id",
+            "username",
+            "phone",
+            "email",
+            "id_number",
+            "role",
+            "status",
+            "is_active",
+            "is_admin",
+            "kyc_status",
+            "is_kyc_approved",
+            "has_limited_access",
+            "has_full_access",
+        ]
+
+    def get_is_admin(self, obj):
+        return obj.is_admin
+
+    def get_kyc_status(self, obj):
+        return obj.kyc_status
+
+    def get_is_kyc_approved(self, obj):
+        return obj.is_kyc_approved
+
+    def get_has_limited_access(self, obj):
+        return obj.has_limited_access
+
+    def get_has_full_access(self, obj):
+        return obj.has_full_access
 
 
 class UpdateMeSerializer(serializers.ModelSerializer):
@@ -265,11 +330,17 @@ class UpdateMeSerializer(serializers.ModelSerializer):
         fields = ["username", "email"]
 
     def validate_username(self, value):
+        value = " ".join(str(value).strip().split())
         if not re.match(r"^[A-Za-z\s'-]+$", value):
             raise serializers.ValidationError(
                 "Name can contain letters, spaces, hyphens, and apostrophes only"
             )
         return value
+
+    def validate_email(self, value):
+        if value in [None, ""]:
+            return None
+        return str(value).strip().lower()
 
 
 # =========================================================

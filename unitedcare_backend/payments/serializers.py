@@ -1,4 +1,3 @@
-# payments/serializers.py
 from decimal import Decimal
 
 from django.core.validators import RegexValidator
@@ -66,6 +65,7 @@ class TransactionFeeConfigSerializer(serializers.ModelSerializer):
 # =========================================================
 class MpesaTransactionSerializer(serializers.ModelSerializer):
     user_id = serializers.IntegerField(source="user.id", read_only=True)
+    allocated_by_id = serializers.IntegerField(source="allocated_by.id", read_only=True)
 
     class Meta:
         model = MpesaTransaction
@@ -92,6 +92,10 @@ class MpesaTransactionSerializer(serializers.ModelSerializer):
             "request_payload",
             "callback_payload",
             "ledger_posted",
+            "allocation_status",
+            "allocation_notes",
+            "allocated_by_id",
+            "allocated_at",
             "created_at",
             "updated_at",
         ]
@@ -112,6 +116,10 @@ class MpesaTransactionSerializer(serializers.ModelSerializer):
             "request_payload",
             "callback_payload",
             "ledger_posted",
+            "allocation_status",
+            "allocation_notes",
+            "allocated_by_id",
+            "allocated_at",
             "created_at",
             "updated_at",
         ]

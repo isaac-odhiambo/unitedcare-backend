@@ -1,14 +1,14 @@
-# payments/daraja.py
 from __future__ import annotations
 
 import base64
-import requests
 from dataclasses import dataclass
-from decimal import Decimal
 from datetime import datetime
-from typing import Dict, Any
+from decimal import Decimal
+from typing import Any, Dict
 
+import requests
 from django.conf import settings
+from django.core.cache import cache
 
 
 # ============================================================
@@ -45,7 +45,7 @@ class DarajaClient:
     """
     Supports:
       - STK Push
-      - STK Query (IMPORTANT for security)
+      - STK Query
       - B2C payout
 
     Required settings:
@@ -62,16 +62,18 @@ class DarajaClient:
       B2C_COMMAND_ID
     """
 
+    TOKEN_CACHE_KEY = "daraja_access_token"
+
     def __init__(self):
-        env = getattr(settings, "DARAJA_ENV", "sandbox").lower().strip()
+        env = str(getattr(settings, "DARAJA_ENV", "sandbox") or "sandbox").lower().strip()
 
         if env == "production":
             self.base_url = "https://api.safaricom.co.ke"
         else:
             self.base_url = "https://sandbox.safaricom.co.ke"
 
-        self.consumer_key = getattr(settings, "DARAJA_CONSUMER_KEY", "")
-        self.consumer_secret = getattr(settings, "DARAJA_CONSUMER_SECRET", "")
+        self.consumer_key = str(getattr(settings, "DARAJA_CONSUMER_KEY", "") or "").strip()
+        self.consumer_secret = str(getattr(settings, "DARAJA_CONSUMER_SECRET", "") or "").strip()
 
         if not self.consumer_key or not self.consumer_secret:
             raise DarajaError("Missing DARAJA_CONSUMER_KEY or DARAJA_CONSUMER_SECRET")
@@ -81,30 +83,63 @@ class DarajaClient:
     # ============================================================
 
     def _get_access_token(self) -> str:
+        cached_token = cache.get(self.TOKEN_CACHE_KEY)
+        if cached_token:
+            return str(cached_token).strip()
+
         url = f"{self.base_url}/oauth/v1/generate?grant_type=client_credentials"
 
-        r = requests.get(
-            url,
-            auth=(self.consumer_key, self.consumer_secret),
-            timeout=30,
-        )
+        auth_string = f"{self.consumer_key}:{self.consumer_secret}"
+        encoded_auth = base64.b64encode(auth_string.encode("utf-8")).decode("utf-8")
+
+        headers = {
+            "Authorization": f"Basic {encoded_auth}",
+            "Accept": "application/json",
+        }
+
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+        except requests.RequestException as e:
+            raise DarajaError(f"Access token request error: {e}")
 
         if r.status_code != 200:
-            raise DarajaError(f"Access token failed: {r.status_code} {r.text}")
+            raise DarajaError(
+                f"Access token failed: {r.status_code} | response={r.text!r} | "
+                f"env={getattr(settings, 'DARAJA_ENV', '')!r} | "
+                f"base_url={self.base_url!r}"
+            )
 
-        data = r.json()
-        token = data.get("access_token")
+        try:
+            data = r.json()
+        except ValueError:
+            raise DarajaError(f"Access token response was not valid JSON: {r.text!r}")
+
+        token = str(data.get("access_token", "") or "").strip()
+        expires_in_raw = data.get("expires_in", 3599)
 
         if not token:
-            raise DarajaError("Access token missing in response")
+            raise DarajaError(f"Access token missing in response: {data}")
+
+        try:
+            expires_in = int(expires_in_raw)
+        except (TypeError, ValueError):
+            expires_in = 3599
+
+        # Cache slightly shorter than actual expiry to avoid edge expiry failures
+        cache_timeout = max(expires_in - 60, 60)
+        cache.set(self.TOKEN_CACHE_KEY, token, timeout=cache_timeout)
 
         return token
 
     def _headers(self) -> Dict[str, str]:
-        token = self._get_access_token()
+        token = self._get_access_token().strip()
+        if not token:
+            raise DarajaError("Bearer token is empty")
+
         return {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
         }
 
     # ============================================================
@@ -113,15 +148,53 @@ class DarajaClient:
 
     @staticmethod
     def _normalize_msisdn(phone: str) -> str:
-        p = (phone or "").strip()
+        p = str(phone or "").strip()
 
         if p.startswith("+"):
             p = p[1:]
 
-        if p.startswith("0"):
+        if p.startswith("0") and len(p) == 10:
             p = "254" + p[1:]
+        elif p.startswith("7") and len(p) == 9:
+            p = "254" + p
+
+        if not (p.isdigit() and len(p) == 12 and p.startswith("254")):
+            raise DarajaError(f"Invalid Kenyan phone format for MPesa: {phone!r}")
 
         return p
+
+    # ============================================================
+    # Helpers
+    # ============================================================
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now().strftime("%Y%m%d%H%M%S")
+
+    @staticmethod
+    def _amount_to_int(amount: Decimal) -> int:
+        try:
+            amt = Decimal(amount)
+        except Exception:
+            raise DarajaError(f"Invalid amount: {amount!r}")
+
+        if amt <= 0:
+            raise DarajaError("Amount must be greater than zero")
+
+        return int(amt)
+
+    def _stk_password(self) -> tuple[str, str, str]:
+        shortcode = str(getattr(settings, "STK_SHORTCODE", "") or "").strip()
+        passkey = str(getattr(settings, "STK_PASSKEY", "") or "").strip()
+
+        if not shortcode or not passkey:
+            raise DarajaError("Missing STK_SHORTCODE or STK_PASSKEY")
+
+        timestamp = self._timestamp()
+        password_raw = f"{shortcode}{passkey}{timestamp}"
+        password = base64.b64encode(password_raw.encode("utf-8")).decode("utf-8")
+
+        return shortcode, timestamp, password
 
     # ============================================================
     # STK PUSH
@@ -137,70 +210,61 @@ class DarajaClient:
         callback_url: str,
     ) -> STKPushResult:
 
-        shortcode = str(getattr(settings, "STK_SHORTCODE", "")).strip()
-        passkey = str(getattr(settings, "STK_PASSKEY", "")).strip()
-
-        if not shortcode or not passkey:
-            raise DarajaError("Missing STK_SHORTCODE or STK_PASSKEY")
-
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-
-        password_raw = f"{shortcode}{passkey}{timestamp}"
-        password = base64.b64encode(password_raw.encode()).decode()
-
+        shortcode, timestamp, password = self._stk_password()
         msisdn = self._normalize_msisdn(phone)
+
+        callback_url = str(callback_url or "").strip()
+        if not callback_url:
+            raise DarajaError("Callback URL is required")
 
         payload: Dict[str, Any] = {
             "BusinessShortCode": shortcode,
             "Password": password,
             "Timestamp": timestamp,
             "TransactionType": "CustomerPayBillOnline",
-            "Amount": int(Decimal(amount)),
+            "Amount": self._amount_to_int(Decimal(amount)),
             "PartyA": msisdn,
             "PartyB": shortcode,
             "PhoneNumber": msisdn,
             "CallBackURL": callback_url,
-            "AccountReference": account_reference[:32],
-            "TransactionDesc": transaction_desc[:32],
+            "AccountReference": str(account_reference or "")[:32],
+            "TransactionDesc": str(transaction_desc or "")[:32],
         }
 
         url = f"{self.base_url}/mpesa/stkpush/v1/processrequest"
 
-        r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+        try:
+            r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+        except requests.RequestException as e:
+            raise DarajaError(f"STK push request error: {e}")
 
         if r.status_code != 200:
             raise DarajaError(f"STK push failed: {r.status_code} {r.text}")
 
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            raise DarajaError(f"STK push response was not valid JSON: {r.text!r}")
 
         if data.get("ResponseCode") != "0":
             raise DarajaError(f"STK push rejected: {data}")
 
         return STKPushResult(
-            merchant_request_id=data.get("MerchantRequestID", ""),
-            checkout_request_id=data.get("CheckoutRequestID", ""),
-            customer_message=data.get("CustomerMessage", "") or "",
+            merchant_request_id=str(data.get("MerchantRequestID", "") or ""),
+            checkout_request_id=str(data.get("CheckoutRequestID", "") or ""),
+            customer_message=str(data.get("CustomerMessage", "") or ""),
         )
 
     # ============================================================
-    # 🔐 STK QUERY (SECURITY CRITICAL)
+    # STK QUERY
     # ============================================================
 
     def stk_query(self, *, checkout_request_id: str) -> Dict[str, Any]:
-        """
-        Verifies STK transaction status directly with Safaricom.
-        Used to prevent fake callback crediting.
-        """
+        shortcode, timestamp, password = self._stk_password()
 
-        shortcode = str(getattr(settings, "STK_SHORTCODE", "")).strip()
-        passkey = str(getattr(settings, "STK_PASSKEY", "")).strip()
-
-        if not shortcode or not passkey:
-            raise DarajaError("Missing STK_SHORTCODE or STK_PASSKEY")
-
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        password_raw = f"{shortcode}{passkey}{timestamp}"
-        password = base64.b64encode(password_raw.encode()).decode()
+        checkout_request_id = str(checkout_request_id or "").strip()
+        if not checkout_request_id:
+            raise DarajaError("CheckoutRequestID is required")
 
         payload = {
             "BusinessShortCode": shortcode,
@@ -211,20 +275,18 @@ class DarajaClient:
 
         url = f"{self.base_url}/mpesa/stkpushquery/v1/query"
 
-        r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+        try:
+            r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+        except requests.RequestException as e:
+            raise DarajaError(f"STK query request error: {e}")
 
         if r.status_code != 200:
             raise DarajaError(f"STK query failed: {r.status_code} {r.text}")
 
-        data = r.json()
-
-        # Expected response:
-        # {
-        #   "ResponseCode": "0",
-        #   "ResultCode": "0",
-        #   "ResultDesc": "The service request is processed successfully.",
-        #   ...
-        # }
+        try:
+            data = r.json()
+        except ValueError:
+            raise DarajaError(f"STK query response was not valid JSON: {r.text!r}")
 
         return data
 
@@ -243,13 +305,18 @@ class DarajaClient:
         timeout_url: str,
     ) -> B2CResult:
 
-        shortcode = str(getattr(settings, "B2C_SHORTCODE", "")).strip()
-        initiator = str(getattr(settings, "B2C_INITIATOR_NAME", "")).strip()
-        security_credential = str(getattr(settings, "B2C_SECURITY_CREDENTIAL", "")).strip()
-        command_id = str(getattr(settings, "B2C_COMMAND_ID", "BusinessPayment")).strip()
+        shortcode = str(getattr(settings, "B2C_SHORTCODE", "") or "").strip()
+        initiator = str(getattr(settings, "B2C_INITIATOR_NAME", "") or "").strip()
+        security_credential = str(getattr(settings, "B2C_SECURITY_CREDENTIAL", "") or "").strip()
+        command_id = str(getattr(settings, "B2C_COMMAND_ID", "BusinessPayment") or "BusinessPayment").strip()
 
         if not shortcode or not security_credential or not initiator:
             raise DarajaError("Missing B2C configuration")
+
+        result_url = str(result_url or "").strip()
+        timeout_url = str(timeout_url or "").strip()
+        if not result_url or not timeout_url:
+            raise DarajaError("Both result_url and timeout_url are required for B2C")
 
         msisdn = self._normalize_msisdn(phone)
 
@@ -257,26 +324,32 @@ class DarajaClient:
             "InitiatorName": initiator,
             "SecurityCredential": security_credential,
             "CommandID": command_id,
-            "Amount": int(Decimal(amount)),
+            "Amount": self._amount_to_int(Decimal(amount)),
             "PartyA": shortcode,
             "PartyB": msisdn,
-            "Remarks": remarks[:100],
+            "Remarks": str(remarks or "")[:100],
             "QueueTimeOutURL": timeout_url,
             "ResultURL": result_url,
-            "Occasion": occasion[:100],
+            "Occasion": str(occasion or "")[:100],
         }
 
         url = f"{self.base_url}/mpesa/b2c/v1/paymentrequest"
 
-        r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+        try:
+            r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+        except requests.RequestException as e:
+            raise DarajaError(f"B2C request error: {e}")
 
         if r.status_code != 200:
             raise DarajaError(f"B2C failed: {r.status_code} {r.text}")
 
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            raise DarajaError(f"B2C response was not valid JSON: {r.text!r}")
 
         return B2CResult(
-            conversation_id=data.get("ConversationID", ""),
-            originator_conversation_id=data.get("OriginatorConversationID", ""),
-            response_description=data.get("ResponseDescription", ""),
+            conversation_id=str(data.get("ConversationID", "") or ""),
+            originator_conversation_id=str(data.get("OriginatorConversationID", "") or ""),
+            response_description=str(data.get("ResponseDescription", "") or ""),
         )

@@ -63,7 +63,8 @@ def is_stale_unverified_user(user) -> bool:
     return (
         not user.is_active
         and user.status == "pending"
-        and user.date_joined <= timezone.now() - timedelta(minutes=STALE_UNVERIFIED_ACCOUNT_MINUTES)
+        and user.date_joined
+        <= timezone.now() - timedelta(minutes=STALE_UNVERIFIED_ACCOUNT_MINUTES)
     )
 
 
@@ -86,6 +87,14 @@ def user_has_full_access(user) -> bool:
         and user.status == "approved"
         and get_user_kyc_status(user) == "approved"
     )
+
+
+def build_user_payload(user) -> dict:
+    """
+    Single source of truth for frontend-safe user snapshot.
+    Must match MeSerializer / frontend session shape.
+    """
+    return MeSerializer(user).data
 
 
 # =========================
@@ -203,9 +212,7 @@ class VerifyOTPView(APIView):
         return Response(
             {
                 "detail": "Account verified successfully.",
-                "status": user.status,
-                "kyc_status": get_user_kyc_status(user),
-                "has_full_access": user_has_full_access(user),
+                "user": build_user_payload(user),
             },
             status=status.HTTP_200_OK,
         )
@@ -222,7 +229,7 @@ class LoginView(APIView):
         data = request.data.copy()
         data["phone"] = normalize_local_kenyan_phone(data.get("phone", ""))
 
-        serializer = LoginSerializer(data=data)
+        serializer = LoginSerializer(data=data, context={"request": request})
         serializer.is_valid(raise_exception=True)
 
         user = serializer.validated_data["user"]
@@ -248,17 +255,12 @@ class LoginView(APIView):
         user.reset_failed_attempts()
 
         refresh = RefreshToken.for_user(user)
-        kyc_status = get_user_kyc_status(user)
 
         return Response(
             {
                 "access": str(refresh.access_token),
                 "refresh": str(refresh),
-                "role": user.role,
-                "status": user.status,
-                "is_admin": user.is_admin,
-                "kyc_status": kyc_status,
-                "has_full_access": user_has_full_access(user),
+                "user": build_user_payload(user),
             },
             status=status.HTTP_200_OK,
         )
@@ -382,11 +384,7 @@ class ResetPasswordView(APIView):
                 "detail": "Password reset successful.",
                 "access": str(refresh.access_token),
                 "refresh": str(refresh),
-                "role": user.role,
-                "status": user.status,
-                "is_admin": user.is_admin,
-                "kyc_status": get_user_kyc_status(user),
-                "has_full_access": user_has_full_access(user),
+                "user": build_user_payload(user),
             },
             status=status.HTTP_200_OK,
         )
@@ -468,12 +466,7 @@ class MeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user = request.user
-        data = MeSerializer(user).data
-        data["is_admin"] = user.is_admin
-        data["kyc_status"] = get_user_kyc_status(user)
-        data["has_full_access"] = user_has_full_access(user)
-
+        data = MeSerializer(request.user).data
         return Response(data, status=status.HTTP_200_OK)
 
     def patch(self, request):
@@ -483,10 +476,6 @@ class MeView(APIView):
         serializer.save()
 
         data = MeSerializer(user).data
-        data["is_admin"] = user.is_admin
-        data["kyc_status"] = get_user_kyc_status(user)
-        data["has_full_access"] = user_has_full_access(user)
-
         return Response(data, status=status.HTTP_200_OK)
 
 
@@ -515,11 +504,15 @@ class KYCSubmitView(APIView):
             kyc_obj.status = "submitted"
             kyc_obj.save(update_fields=["status"])
 
+        # refresh relation-safe payload after save
+        user.refresh_from_db()
+
         return Response(
             {
                 "detail": "KYC submitted successfully.",
                 "kyc_status": kyc_obj.status,
                 "has_full_access": user_has_full_access(user),
+                "user": build_user_payload(user),
             },
             status=status.HTTP_200_OK,
         )

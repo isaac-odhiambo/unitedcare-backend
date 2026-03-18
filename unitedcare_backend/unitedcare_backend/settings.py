@@ -250,20 +250,30 @@ MPESA_STRICT_AMOUNT_MATCH = os.getenv(
 # =========================
 # DARAJA SETTINGS
 # =========================
-DARAJA_ENV = os.getenv("DARAJA_ENV", "sandbox")  # sandbox | production
-DARAJA_CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY", "")
-DARAJA_CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET", "")
+# DARAJA_ENV = os.getenv("DARAJA_ENV", "sandbox")  # sandbox | production
+# DARAJA_CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY", "")
+# DARAJA_CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET", "")
 
-# STK
-STK_SHORTCODE = os.getenv("STK_SHORTCODE", "")
-STK_PASSKEY = os.getenv("STK_PASSKEY", "")
+# # STK
+# STK_SHORTCODE = os.getenv("STK_SHORTCODE", "")
+# STK_PASSKEY = os.getenv("STK_PASSKEY", "")
 
-# B2C
-B2C_SHORTCODE = os.getenv("B2C_SHORTCODE", "")
-B2C_INITIATOR_NAME = os.getenv("B2C_INITIATOR_NAME", "")
-B2C_SECURITY_CREDENTIAL = os.getenv("B2C_SECURITY_CREDENTIAL", "")
-B2C_COMMAND_ID = os.getenv("B2C_COMMAND_ID", "BusinessPayment")
+# # B2C
+# B2C_SHORTCODE = os.getenv("B2C_SHORTCODE", "")
+# B2C_INITIATOR_NAME = os.getenv("B2C_INITIATOR_NAME", "")
+# B2C_SECURITY_CREDENTIAL = os.getenv("B2C_SECURITY_CREDENTIAL", "")
+# B2C_COMMAND_ID = os.getenv("B2C_COMMAND_ID", "BusinessPayment")
+DARAJA_ENV = os.getenv("DARAJA_ENV", "sandbox").strip().lower()
+DARAJA_CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY", "").strip()
+DARAJA_CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET", "").strip()
 
+STK_SHORTCODE = os.getenv("STK_SHORTCODE", "").strip()
+STK_PASSKEY = os.getenv("STK_PASSKEY", "").strip()
+
+B2C_SHORTCODE = os.getenv("B2C_SHORTCODE", "").strip()
+B2C_INITIATOR_NAME = os.getenv("B2C_INITIATOR_NAME", "").strip()
+B2C_SECURITY_CREDENTIAL = os.getenv("B2C_SECURITY_CREDENTIAL", "").strip()
+B2C_COMMAND_ID = os.getenv("B2C_COMMAND_ID", "BusinessPayment").strip()
 # =========================
 # CACHE
 # =========================

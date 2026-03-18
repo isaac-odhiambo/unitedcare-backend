@@ -5,12 +5,12 @@ from .models import (
     MemberCreditProfile,
     LoanProduct,
     Loan,
-    MerryCreditHold,
     LoanGuarantor,
+    LoanSecurityAllocation,
     LoanInstallment,
     LoanPayment,
 )
-from .services import approve_loan_and_create_schedule
+from .services import approve_loan_and_create_schedule, release_reserved_security_for_loan
 
 
 # =========================================================
@@ -59,7 +59,10 @@ def approve_loans(modeladmin, request, queryset):
 
 @admin.action(description="Reject selected loans")
 def reject_loans(modeladmin, request, queryset):
-    updated = queryset.filter(status__in=("PENDING", "UNDER_REVIEW")).update(status="REJECTED")
+    updated = queryset.filter(status__in=("PENDING", "UNDER_REVIEW")).update(
+        status="REJECTED",
+        rejected_at=timezone.now(),
+    )
     modeladmin.message_user(
         request,
         f"{updated} loan(s) rejected.",
@@ -77,7 +80,8 @@ def complete_loans(modeladmin, request, queryset):
         loan.recompute_balances()
         loan.status = "COMPLETED"
         loan.outstanding_balance = 0
-        loan.save(update_fields=["status", "outstanding_balance"])
+        loan.completed_at = timezone.now()
+        loan.save(update_fields=["status", "outstanding_balance", "completed_at"])
         count += 1
 
     modeladmin.message_user(
@@ -89,7 +93,7 @@ def complete_loans(modeladmin, request, queryset):
 
 @admin.action(description="Mark selected loans as defaulted")
 def default_loans(modeladmin, request, queryset):
-    updated = queryset.exclude(status__in=("COMPLETED", "REJECTED")).update(
+    updated = queryset.exclude(status__in=("COMPLETED", "REJECTED", "CANCELLED")).update(
         status="DEFAULTED",
         is_defaulter=True,
     )
@@ -105,7 +109,7 @@ def recompute_selected_loan_balances(modeladmin, request, queryset):
     count = 0
     for loan in queryset:
         loan.recompute_balances()
-        loan.save(update_fields=["outstanding_balance", "status"])
+        loan.save(update_fields=["outstanding_balance", "status", "completed_at"])
         count += 1
 
     modeladmin.message_user(
@@ -113,6 +117,37 @@ def recompute_selected_loan_balances(modeladmin, request, queryset):
         f"Balances recomputed for {count} loan(s).",
         level=messages.SUCCESS,
     )
+
+
+@admin.action(description="Release reserved security for selected loans")
+def release_selected_loan_security(modeladmin, request, queryset):
+    count = 0
+    failed = 0
+
+    for loan in queryset:
+        try:
+            release_reserved_security_for_loan(loan)
+            count += 1
+        except Exception as e:
+            failed += 1
+            modeladmin.message_user(
+                request,
+                f"Loan #{loan.id} security release failed: {e}",
+                level=messages.ERROR,
+            )
+
+    if count:
+        modeladmin.message_user(
+            request,
+            f"Released security for {count} loan(s).",
+            level=messages.SUCCESS,
+        )
+    if failed:
+        modeladmin.message_user(
+            request,
+            f"{failed} loan(s) could not release security.",
+            level=messages.WARNING,
+        )
 
 
 # =========================================================
@@ -170,18 +205,18 @@ def mark_installments_unpaid(modeladmin, request, queryset):
 
 
 # =========================================================
-# MERRY HOLD ACTIONS
+# SECURITY ALLOCATION ACTIONS
 # =========================================================
-@admin.action(description="Release selected merry credit holds")
-def release_merry_holds(modeladmin, request, queryset):
+@admin.action(description="Release selected security allocations")
+def release_security_allocations(modeladmin, request, queryset):
     count = 0
-    for hold in queryset.filter(is_active=True):
-        hold.release()
+    for allocation in queryset.filter(is_active=True):
+        allocation.release()
         count += 1
 
     modeladmin.message_user(
         request,
-        f"{count} merry credit hold(s) released.",
+        f"{count} security allocation(s) released.",
         level=messages.SUCCESS,
     )
 
@@ -197,6 +232,31 @@ class LoanGuarantorInline(admin.TabularInline):
         "accepted",
         "accepted_at",
         "reserved_amount",
+        "request_note",
+        "admin_note",
+        "created_at",
+    )
+    readonly_fields = ("created_at",)
+
+
+class LoanSecurityAllocationInline(admin.TabularInline):
+    model = LoanSecurityAllocation
+    extra = 0
+    fields = (
+        "source_type",
+        "owner_user",
+        "guarantor_link",
+        "savings_account",
+        "merry",
+        "group",
+        "amount",
+        "is_active",
+        "created_at",
+        "released_at",
+    )
+    readonly_fields = (
+        "created_at",
+        "released_at",
     )
 
 
@@ -228,24 +288,6 @@ class LoanPaymentInline(admin.TabularInline):
     readonly_fields = ("paid_at",)
 
 
-class MerryCreditHoldInline(admin.StackedInline):
-    model = MerryCreditHold
-    extra = 0
-    can_delete = False
-    fields = (
-        "merry",
-        "user",
-        "amount",
-        "is_active",
-        "created_at",
-        "released_at",
-    )
-    readonly_fields = (
-        "created_at",
-        "released_at",
-    )
-
-
 # =========================================================
 # MEMBER CREDIT PROFILE ADMIN
 # =========================================================
@@ -254,7 +296,6 @@ class MemberCreditProfileAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "user",
-        "context_display",
         "score",
         "total_loans",
         "loans_completed",
@@ -262,28 +303,15 @@ class MemberCreditProfileAdmin(admin.ModelAdmin):
         "late_payments",
         "updated_at",
     )
-    list_filter = (
-        "updated_at",
-        "merry",
-        "group",
-    )
+    list_filter = ("updated_at",)
     search_fields = (
         "user__username",
         "user__phone",
-        "merry__name",
-        "group__name",
+        "user__first_name",
+        "user__last_name",
     )
     ordering = ("-id",)
     readonly_fields = ("updated_at",)
-
-    def context_display(self, obj):
-        if obj.merry_id:
-            return f"Merry: {obj.merry}"
-        if obj.group_id:
-            return f"Group: {obj.group}"
-        return "-"
-
-    context_display.short_description = "Context"
 
 
 # =========================================================
@@ -301,11 +329,13 @@ class LoanProductAdmin(admin.ModelAdmin):
         "max_weeks",
         "late_fee_rate_weekly",
         "is_active",
+        "is_default",
     )
     list_filter = (
         "interest_type",
         "repayment_frequency",
         "is_active",
+        "is_default",
     )
     search_fields = ("name",)
     ordering = ("name",)
@@ -319,7 +349,6 @@ class LoanAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "borrower",
-        "context_display",
         "product",
         "principal",
         "term_weeks",
@@ -329,6 +358,7 @@ class LoanAdmin(admin.ModelAdmin):
         "total_paid",
         "outstanding_balance",
         "security_target",
+        "security_reserved_total",
         "approved_at",
         "created_at",
     )
@@ -338,26 +368,27 @@ class LoanAdmin(admin.ModelAdmin):
         "is_defaulter",
         "product",
         "approved_at",
+        "rejected_at",
+        "completed_at",
         "created_at",
-        "merry",
-        "group",
     )
 
     search_fields = (
         "borrower__username",
         "borrower__phone",
+        "borrower__first_name",
+        "borrower__last_name",
         "product__name",
-        "merry__name",
-        "group__name",
     )
 
     ordering = ("-id",)
 
     readonly_fields = (
         "approved_at",
+        "rejected_at",
+        "completed_at",
         "created_at",
         "is_active_display",
-        "context_display",
     )
 
     actions = [
@@ -367,23 +398,21 @@ class LoanAdmin(admin.ModelAdmin):
         complete_loans,
         default_loans,
         recompute_selected_loan_balances,
+        release_selected_loan_security,
     ]
 
     inlines = [
         LoanGuarantorInline,
+        LoanSecurityAllocationInline,
         LoanInstallmentInline,
         LoanPaymentInline,
-        MerryCreditHoldInline,
     ]
 
     fieldsets = (
-        ("Context", {
+        ("Borrower / Product", {
             "fields": (
                 "borrower",
                 "product",
-                "merry",
-                "group",
-                "context_display",
             )
         }),
         ("Loan Terms", {
@@ -393,6 +422,8 @@ class LoanAdmin(admin.ModelAdmin):
                 "status",
                 "is_defaulter",
                 "approved_at",
+                "rejected_at",
+                "completed_at",
                 "created_at",
                 "is_active_display",
             )
@@ -404,23 +435,19 @@ class LoanAdmin(admin.ModelAdmin):
                 "outstanding_balance",
             )
         }),
-        ("Security / Reserves", {
+        ("Security", {
             "fields": (
-                "borrower_reserved_savings",
-                "borrower_reserved_merry_credit",
                 "security_target",
+                "security_reserved_total",
+            )
+        }),
+        ("Notes", {
+            "fields": (
+                "member_note",
+                "admin_note",
             )
         }),
     )
-
-    def context_display(self, obj):
-        if obj.merry_id:
-            return f"Merry: {obj.merry}"
-        if obj.group_id:
-            return f"Group: {obj.group}"
-        return "-"
-
-    context_display.short_description = "Context"
 
     def is_active_display(self, obj):
         return obj.is_active
@@ -431,34 +458,41 @@ class LoanAdmin(admin.ModelAdmin):
     def save_model(self, request, obj, form, change):
         if obj.status == "APPROVED" and not obj.approved_at:
             obj.approved_at = timezone.now()
+        if obj.status == "REJECTED" and not obj.rejected_at:
+            obj.rejected_at = timezone.now()
+        if obj.status == "COMPLETED" and not obj.completed_at:
+            obj.completed_at = timezone.now()
         super().save_model(request, obj, form, change)
 
 
 # =========================================================
-# MERRY CREDIT HOLD ADMIN
+# LOAN SECURITY ALLOCATION ADMIN
 # =========================================================
-@admin.register(MerryCreditHold)
-class MerryCreditHoldAdmin(admin.ModelAdmin):
+@admin.register(LoanSecurityAllocation)
+class LoanSecurityAllocationAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "loan",
-        "merry",
-        "user",
+        "source_type",
+        "owner_user",
         "amount",
         "is_active",
         "created_at",
         "released_at",
     )
     list_filter = (
+        "source_type",
         "is_active",
         "created_at",
         "released_at",
         "merry",
+        "group",
     )
     search_fields = (
-        "user__username",
-        "user__phone",
-        "merry__name",
+        "owner_user__username",
+        "owner_user__phone",
+        "owner_user__first_name",
+        "owner_user__last_name",
         "loan__id",
     )
     ordering = ("-id",)
@@ -466,7 +500,7 @@ class MerryCreditHoldAdmin(admin.ModelAdmin):
         "created_at",
         "released_at",
     )
-    actions = [release_merry_holds]
+    actions = [release_security_allocations]
 
 
 # =========================================================
@@ -482,18 +516,19 @@ class LoanGuarantorAdmin(admin.ModelAdmin):
         "accepted_at",
         "reserved_amount",
         "loan_status_display",
-        "context_display",
+        "created_at",
     )
     list_filter = (
         "accepted",
         "accepted_at",
+        "created_at",
         "loan__status",
-        "loan__merry",
-        "loan__group",
     )
     search_fields = (
         "guarantor__username",
         "guarantor__phone",
+        "guarantor__first_name",
+        "guarantor__last_name",
         "loan__borrower__username",
         "loan__borrower__phone",
     )
@@ -504,15 +539,6 @@ class LoanGuarantorAdmin(admin.ModelAdmin):
         return obj.loan.status
 
     loan_status_display.short_description = "Loan Status"
-
-    def context_display(self, obj):
-        if obj.loan.merry_id:
-            return f"Merry: {obj.loan.merry}"
-        if obj.loan.group_id:
-            return f"Group: {obj.loan.group}"
-        return "-"
-
-    context_display.short_description = "Context"
 
 
 # =========================================================
@@ -574,6 +600,8 @@ class LoanPaymentAdmin(admin.ModelAdmin):
     search_fields = (
         "loan__borrower__username",
         "loan__borrower__phone",
+        "loan__borrower__first_name",
+        "loan__borrower__last_name",
         "reference",
         "loan__id",
     )

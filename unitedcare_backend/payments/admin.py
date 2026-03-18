@@ -158,6 +158,45 @@ def mark_mpesa_cancelled(modeladmin, request, queryset):
     )
 
 
+@admin.action(description="Mark selected Mpesa transactions for manual review")
+def mark_mpesa_manual_review(modeladmin, request, queryset):
+    updated = queryset.update(
+        allocation_status="MANUAL_REVIEW",
+        allocation_notes="Marked for manual review by admin",
+    )
+    modeladmin.message_user(
+        request,
+        f"{updated} Mpesa transaction(s) marked for MANUAL REVIEW.",
+        level=messages.WARNING,
+    )
+
+
+@admin.action(description="Mark selected Mpesa transactions as manually allocated")
+def mark_mpesa_manually_allocated(modeladmin, request, queryset):
+    count = 0
+    for tx in queryset:
+        tx.allocation_status = "MANUALLY_ALLOCATED"
+        tx.allocated_by = request.user
+        tx.allocated_at = timezone.now()
+        if not tx.allocation_notes:
+            tx.allocation_notes = "Manually allocated by admin"
+        tx.save(
+            update_fields=[
+                "allocation_status",
+                "allocated_by",
+                "allocated_at",
+                "allocation_notes",
+            ]
+        )
+        count += 1
+
+    modeladmin.message_user(
+        request,
+        f"{count} Mpesa transaction(s) marked as MANUALLY ALLOCATED.",
+        level=messages.SUCCESS,
+    )
+
+
 # =========================================================
 # INLINE: LEDGER ON MPESA TX
 # =========================================================
@@ -228,10 +267,11 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         "channel",
         "direction",
         "purpose",
+        "reference",
         "amount",
-        "base_amount",
-        "transaction_fee",
         "status",
+        "allocation_status",
+        "allocated_by",
         "mpesa_receipt_number",
         "ledger_posted",
         "created_at",
@@ -239,11 +279,14 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
 
     list_filter = (
         "status",
+        "allocation_status",
         "channel",
         "direction",
         "purpose",
         "ledger_posted",
         "created_at",
+        "allocated_at",
+        "allocated_by",
     )
 
     search_fields = (
@@ -255,8 +298,10 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         "originator_conversation_id",
         "mpesa_receipt_number",
         "result_desc",
+        "allocation_notes",
         "user__phone",
         "user__username",
+        "allocated_by__username",
     )
 
     ordering = ("-id",)
@@ -264,6 +309,7 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
     readonly_fields = (
         "created_at",
         "updated_at",
+        "allocated_at",
     )
 
     actions = [
@@ -271,6 +317,8 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         mark_mpesa_success,
         mark_mpesa_failed,
         mark_mpesa_cancelled,
+        mark_mpesa_manual_review,
+        mark_mpesa_manually_allocated,
     ]
 
     inlines = [PaymentLedgerInline]
@@ -297,6 +345,14 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
             "fields": (
                 "reference",
                 "ledger_posted",
+            )
+        }),
+        ("Allocation Workflow", {
+            "fields": (
+                "allocation_status",
+                "allocation_notes",
+                "allocated_by",
+                "allocated_at",
             )
         }),
         ("STK Identifiers", {
@@ -338,6 +394,13 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
             )
         }),
     )
+
+    def save_model(self, request, obj, form, change):
+        if getattr(obj, "allocation_status", "") == "MANUALLY_ALLOCATED" and not obj.allocated_by:
+            obj.allocated_by = request.user
+        if getattr(obj, "allocation_status", "") in ("AUTO_ALLOCATED", "MANUALLY_ALLOCATED", "PARTIALLY_ALLOCATED") and not obj.allocated_at:
+            obj.allocated_at = timezone.now()
+        super().save_model(request, obj, form, change)
 
 
 # =========================================================

@@ -1,7 +1,8 @@
 # merry/views.py
 # FULLY UPDATED — Admin-approval join flow + seats/shares + slot-based dues
 # + payments + allocations + seat-based payouts
-# + safer parsing/validation + better locking + duplicate receipt protection
+# + uses merry/services.py for core domain logic
+# + keeps allocate_payment() for backward compatibility with payments app
 
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from .models import (
     MerryPaymentAllocation,
     MerryPayout,
 )
+from . import services as merry_services
 
 
 # ==========================================
@@ -128,8 +130,12 @@ def user_can_view_merry(user, merry: MerryGoRound) -> bool:
     return MerryMember.objects.filter(merry=merry, user=user, is_active=True).exists()
 
 
+def _service_error(e: Exception) -> ValidationError:
+    return ValidationError(str(e))
+
+
 # ==========================================
-# Allocation engine (slot-first, seat-aware)
+# Allocation engine (backward-compatible wrapper)
 # ==========================================
 def _next_week_period_key(period_key: str) -> str:
     try:
@@ -168,121 +174,25 @@ def _next_period_key(merry: MerryGoRound, period_key: str) -> str:
 @transaction.atomic
 def _ensure_dues_for_member_period(merry: MerryGoRound, member: MerryMember, period_key: str) -> None:
     """
-    Ensures dues exist for ALL active seats of the member for a given period for all slots.
+    Backward-compatible helper.
+    Delegates to merry services.
     """
-    due_amt = merry.contribution_amount or Decimal("0")
-    active_seats = list(
-        MerrySeat.objects.select_for_update()
-        .filter(merry=merry, member=member, is_active=True)
-        .order_by("seat_no", "id")
-    )
-
-    for seat in active_seats:
-        for slot_no in range(1, payouts_per_period(merry) + 1):
-            MerryContributionDue.objects.get_or_create(
-                merry=merry,
-                seat=seat,
-                period_key=period_key,
-                slot_no=slot_no,
-                defaults={
-                    "due_amount": due_amt,
-                    "paid_amount": Decimal("0"),
-                    "status": "PENDING",
-                    "due_date": None,
-                },
-            )
+    try:
+        merry_services.ensure_dues_for_member_period(merry, member, period_key)
+    except Exception as e:
+        raise ValidationError(str(e))
 
 
 @transaction.atomic
 def allocate_payment(payment_id: int) -> MerryPayment:
     """
-    Allocates CONFIRMED payment amount across dues:
-    Order: earliest period -> slot 1..N -> seat_no 1..N (stable)
-    Supports partial dues and carry-forward to next slots/periods.
+    Backward-compatible helper used by payments app legacy flow.
+    Delegates to merry/services.py
     """
-    payment = (
-        MerryPayment.objects.select_for_update()
-        .select_related("merry", "beneficiary_member", "beneficiary_member__user")
-        .get(id=payment_id)
-    )
-
-    if payment.status != "CONFIRMED":
-        raise ValidationError("Payment must be CONFIRMED before allocation.")
-
-    merry = payment.merry
-    member = payment.beneficiary_member
-
-    if member.merry_id != merry.id:
-        raise ValidationError("Payment beneficiary does not belong to this merry.")
-
-    if not member.is_active:
-        raise ValidationError("Cannot allocate payment for an inactive member.")
-
-    remaining = payment.amount or Decimal("0")
-    if remaining <= 0:
-        raise ValidationError("Payment amount must be > 0.")
-
-    period_key = payment.period_key
-    safety = 0
-
-    while remaining > 0:
-        safety += 1
-        if safety > 2000:
-            raise ValidationError("Allocation safety limit reached (period loop).")
-
-        _ensure_dues_for_member_period(merry, member, period_key)
-
-        dues = list(
-            MerryContributionDue.objects.select_for_update()
-            .filter(
-                merry=merry,
-                seat__member=member,
-                period_key=period_key,
-                seat__is_active=True,
-                status__in=["PENDING", "PARTIAL"],
-            )
-            .select_related("seat")
-            .order_by("slot_no", "seat__seat_no", "id")
-        )
-
-        any_needed = False
-
-        for due in dues:
-            need = (due.due_amount or Decimal("0")) - (due.paid_amount or Decimal("0"))
-            if need <= 0:
-                continue
-
-            any_needed = True
-            alloc = remaining if remaining < need else need
-            if alloc <= 0:
-                continue
-
-            allocation, _ = MerryPaymentAllocation.objects.get_or_create(
-                payment=payment,
-                due=due,
-                defaults={"amount_allocated": Decimal("0")},
-            )
-            allocation.amount_allocated = (allocation.amount_allocated or Decimal("0")) + alloc
-            allocation.full_clean()
-            allocation.save(update_fields=["amount_allocated"])
-
-            due.paid_amount = (due.paid_amount or Decimal("0")) + alloc
-            due.recalc_status()
-            due.save(update_fields=["paid_amount", "status", "updated_at"])
-
-            remaining -= alloc
-            if remaining <= 0:
-                break
-
-        if remaining <= 0:
-            break
-
-        period_key = _next_period_key(merry, period_key)
-
-        if not any_needed:
-            continue
-
-    return payment
+    try:
+        return merry_services.allocate_payment(payment_id=payment_id)
+    except Exception as e:
+        raise ValidationError(str(e))
 
 
 # ==========================================
@@ -292,6 +202,8 @@ class AvailableMerriesView(APIView):
     """
     GET /api/merry/available/
     Shows merries user has not yet joined, including join/open info.
+    Excludes merries where the user is already an active member.
+    Includes latest join-request status and seat availability info.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -310,6 +222,11 @@ class AvailableMerriesView(APIView):
         data = []
         for m in qs:
             jr = latest_join_requests.get(m.id)
+            available_seats = m.available_seats() if hasattr(m, "available_seats") else None
+            available_seat_numbers = (
+                m.available_seat_numbers() if hasattr(m, "available_seat_numbers") else None
+            )
+
             data.append(
                 {
                     "id": m.id,
@@ -322,9 +239,13 @@ class AvailableMerriesView(APIView):
                     "payouts_per_period": m.payouts_per_period,
                     "is_open": getattr(m, "is_open", True),
                     "max_seats": getattr(m, "max_seats", 0),
-                    "available_seats": m.available_seats() if hasattr(m, "available_seats") else None,
+                    "available_seats": available_seats,
+                    "available_seat_numbers": available_seat_numbers,
                     "members_count": m.members.filter(is_active=True).count(),
                     "seats_count": m.seats.filter(is_active=True).count(),
+                    "can_request_join": bool(
+                        getattr(m, "is_open", True) and (available_seats is None or available_seats > 0)
+                    ),
                     "my_join_request": (
                         {
                             "id": jr.id,
@@ -410,51 +331,21 @@ class CreateMerryView(APIView):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        name = (request.data.get("name") or "").strip()
-        if not name:
-            raise ValidationError("name is required.")
-
-        amount = parse_decimal(request.data.get("contribution_amount"), "contribution_amount")
-        if amount <= 0:
-            raise ValidationError("contribution_amount must be > 0.")
-
-        cycle_duration_weeks = parse_int(
-            request.data.get("cycle_duration_weeks", 1),
-            "cycle_duration_weeks",
-            min_value=1,
-        )
-
-        payout_order_type = (request.data.get("payout_order_type") or "manual").strip().lower()
-        if payout_order_type not in ("manual", "random"):
-            raise ValidationError("payout_order_type must be 'manual' or 'random'.")
-
-        payout_frequency = (request.data.get("payout_frequency") or "WEEKLY").strip().upper()
-        if payout_frequency not in ("WEEKLY", "MONTHLY"):
-            raise ValidationError("payout_frequency must be 'WEEKLY' or 'MONTHLY'.")
-
-        payouts_pp = parse_int(
-            request.data.get("payouts_per_period", 1),
-            "payouts_per_period",
-            min_value=1,
-            max_value=14,
-        )
-
-        is_open = parse_bool(request.data.get("is_open"), default=True)
-        max_seats = parse_int(request.data.get("max_seats", 0), "max_seats", min_value=0)
-        next_payout_date = request.data.get("next_payout_date") or None
-
-        merry = MerryGoRound.objects.create(
-            name=name,
-            contribution_amount=amount,
-            cycle_duration_weeks=cycle_duration_weeks,
-            payout_order_type=payout_order_type,
-            next_payout_date=next_payout_date,
-            created_by=request.user,
-            payout_frequency=payout_frequency,
-            payouts_per_period=payouts_pp,
-            is_open=is_open,
-            max_seats=max_seats,
-        )
+        try:
+            merry = merry_services.create_merry(
+                creator=request.user,
+                name=(request.data.get("name") or "").strip(),
+                contribution_amount=request.data.get("contribution_amount"),
+                cycle_duration_weeks=request.data.get("cycle_duration_weeks", 1),
+                payout_order_type=request.data.get("payout_order_type", "manual"),
+                next_payout_date=request.data.get("next_payout_date") or None,
+                payout_frequency=request.data.get("payout_frequency", "WEEKLY"),
+                payouts_per_period=request.data.get("payouts_per_period", 1),
+                is_open=request.data.get("is_open"),
+                max_seats=request.data.get("max_seats", 0),
+            )
+        except Exception as e:
+            raise _service_error(e)
 
         return Response(
             {
@@ -607,36 +498,30 @@ class SlotConfigView(APIView):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        merry = get_merry_or_404(merry_id)
         items = request.data
-
-        if not isinstance(items, list) or not items:
-            raise ValidationError("Body must be a non-empty list of {slot_no, weekday} objects.")
-
-        seen = set()
-        for it in items:
-            slot_no = parse_int(it.get("slot_no"), "slot_no", min_value=1)
-            weekday = parse_int(it.get("weekday"), "weekday", min_value=0, max_value=6)
-            validate_slot(merry, slot_no)
-
-            if slot_no in seen:
-                raise ValidationError("Duplicate slot_no in payload.")
-            seen.add(slot_no)
-
-        for it in items:
-            slot_no = int(it["slot_no"])
-            weekday = int(it["weekday"])
-            obj, _ = MerrySlotConfig.objects.get_or_create(
-                merry=merry,
-                slot_no=slot_no,
-                defaults={"weekday": weekday},
+        try:
+            out = merry_services.set_slot_config_bulk(
+                admin_user=request.user,
+                merry_id=merry_id,
+                items=items,
             )
-            if obj.weekday != weekday:
-                obj.weekday = weekday
-                obj.full_clean()
-                obj.save(update_fields=["weekday"])
+        except Exception as e:
+            raise _service_error(e)
 
-        return Response({"message": "Slot config saved."}, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "message": "Slot config saved.",
+                "rows": [
+                    {
+                        "slot_no": r.slot_no,
+                        "weekday": r.weekday,
+                        "weekday_name": r.get_weekday_display(),
+                    }
+                    for r in out
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ==========================================
@@ -651,88 +536,17 @@ class RequestToJoinMerryView(APIView):
 
     @transaction.atomic
     def post(self, request, merry_id: int):
-        merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
-        if not merry:
-            raise ValidationError("Merry not found.")
-
-        if MerryMember.objects.filter(merry=merry, user=request.user, is_active=True).exists():
-            raise ValidationError("You are already a member of this merry.")
-
-        note = (request.data.get("note") or "").strip()[:255]
-        requested_seats = parse_int(
-            request.data.get("requested_seats", 1),
-            "requested_seats",
-            min_value=1,
-            max_value=50,
-        )
-
-        if hasattr(merry, "can_accept_join_request"):
-            ok, reason = merry.can_accept_join_request(requested_seats)
-            if not ok:
-                raise ValidationError(reason)
-
-        existing_pending = (
-            MerryJoinRequest.objects.select_for_update()
-            .filter(merry=merry, user=request.user, status="PENDING")
-            .first()
-        )
-        if existing_pending:
-            return Response(
-                {
-                    "message": "Join request already pending.",
-                    "request_id": existing_pending.id,
-                    "status": existing_pending.status,
-                    "requested_seats": existing_pending.requested_seats,
-                },
-                status=status.HTTP_200_OK,
+        try:
+            jr = merry_services.request_to_join_merry(
+                user=request.user,
+                merry_id=merry_id,
+                note=(request.data.get("note") or "").strip(),
+                requested_seats=request.data.get("requested_seats", 1),
             )
+        except Exception as e:
+            raise _service_error(e)
 
-        existing_latest = (
-            MerryJoinRequest.objects.select_for_update()
-            .filter(merry=merry, user=request.user)
-            .order_by("-created_at", "-id")
-            .first()
-        )
-
-        if existing_latest:
-            existing_latest.status = "PENDING"
-            existing_latest.note = note
-            existing_latest.requested_seats = requested_seats
-            existing_latest.reviewed_by = None
-            existing_latest.reviewed_at = None
-            existing_latest.created_at = timezone.now()
-            existing_latest.full_clean()
-            existing_latest.save(
-                update_fields=[
-                    "status",
-                    "note",
-                    "requested_seats",
-                    "reviewed_by",
-                    "reviewed_at",
-                    "created_at",
-                ]
-            )
-
-            return Response(
-                {
-                    "message": "Join request re-submitted.",
-                    "request_id": existing_latest.id,
-                    "status": existing_latest.status,
-                    "requested_seats": existing_latest.requested_seats,
-                },
-                status=status.HTTP_201_CREATED,
-            )
-
-        jr = MerryJoinRequest(
-            merry=merry,
-            user=request.user,
-            status="PENDING",
-            note=note,
-            requested_seats=requested_seats,
-        )
-        jr.full_clean()
-        jr.save()
-
+        status_code = status.HTTP_201_CREATED if jr.status == "PENDING" else status.HTTP_200_OK
         return Response(
             {
                 "message": "Join request submitted.",
@@ -740,18 +554,19 @@ class RequestToJoinMerryView(APIView):
                 "status": jr.status,
                 "requested_seats": jr.requested_seats,
             },
-            status=status.HTTP_201_CREATED,
+            status=status_code,
         )
 
 
 class CancelJoinRequestView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, request_id: int):
-        jr = MerryJoinRequest.objects.filter(id=request_id, user=request.user).first()
-        if not jr:
-            raise ValidationError("Join request not found.")
-        jr.cancel(request.user)
+        try:
+            merry_services.cancel_join_request(user=request.user, request_id=request_id)
+        except Exception as e:
+            raise _service_error(e)
         return Response({"message": "Join request cancelled."}, status=status.HTTP_200_OK)
 
 
@@ -814,18 +629,25 @@ class AdminApproveJoinRequestView(APIView):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        jr = (
-            MerryJoinRequest.objects.select_for_update()
-            .select_related("merry", "user")
-            .filter(id=request_id)
-            .first()
-        )
-        if not jr:
-            raise ValidationError("Join request not found.")
+        assigned_seat_numbers = request.data.get("assigned_seat_numbers", None)
 
-        MerryGoRound.objects.select_for_update().filter(id=jr.merry_id).first()
+        if assigned_seat_numbers is not None:
+            if not isinstance(assigned_seat_numbers, list):
+                raise ValidationError("assigned_seat_numbers must be a list of integers.")
+            parsed_assigned_seat_numbers = [
+                parse_int(v, "assigned_seat_numbers item", min_value=1) for v in assigned_seat_numbers
+            ]
+        else:
+            parsed_assigned_seat_numbers = None
 
-        member, seats = jr.approve(request.user)
+        try:
+            member, seats = merry_services.admin_approve_join_request(
+                admin_user=request.user,
+                request_id=request_id,
+                assigned_seat_numbers=parsed_assigned_seat_numbers,
+            )
+        except Exception as e:
+            raise _service_error(e)
 
         return Response(
             {
@@ -845,21 +667,26 @@ class AdminApproveJoinRequestView(APIView):
 class AdminRejectJoinRequestView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, request_id: int):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        jr = MerryJoinRequest.objects.select_related("merry", "user").filter(id=request_id).first()
-        if not jr:
-            raise ValidationError("Join request not found.")
-
         note = (request.data.get("note") or "").strip()
-        jr.reject(request.user, note=note)
+        try:
+            merry_services.admin_reject_join_request(
+                admin_user=request.user,
+                request_id=request_id,
+                note=note,
+            )
+        except Exception as e:
+            raise _service_error(e)
+
         return Response({"message": "Join request rejected."}, status=status.HTTP_200_OK)
 
 
 # ==========================================
-# Dues & Payments (replaces old MerryContribution)
+# Dues & Payments
 # ==========================================
 class EnsureDuesForCurrentPeriodView(APIView):
     """
@@ -869,16 +696,25 @@ class EnsureDuesForCurrentPeriodView(APIView):
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, merry_id: int):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
-        merry = get_merry_or_404(merry_id)
 
-        period_key = (request.data.get("period_key") or "").strip() or current_period_key(merry)
-        created = merry.ensure_dues_for_period(period_key=period_key)
+        period_key = (request.data.get("period_key") or "").strip() or ""
+        try:
+            created = merry_services.ensure_dues_for_period(
+                admin_user=request.user,
+                merry_id=merry_id,
+                period_key=period_key or None,
+            )
+            merry = get_merry_or_404(merry_id)
+            actual_period_key = period_key or current_period_key(merry)
+        except Exception as e:
+            raise _service_error(e)
 
         return Response(
-            {"message": "Dues ensured.", "period_key": period_key, "created": created},
+            {"message": "Dues ensured.", "period_key": actual_period_key, "created": created},
             status=status.HTTP_200_OK,
         )
 
@@ -891,11 +727,16 @@ class MyMerryDuesView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, merry_id: int):
+        merry = get_merry_or_404(merry_id)
         member = get_member_or_404(merry_id, request.user)
-        merry = member.merry
 
         period_key = (request.query_params.get("period_key") or "").strip() or current_period_key(merry)
-        merry.ensure_dues_for_period(period_key=period_key)
+
+        with transaction.atomic():
+            try:
+                merry_services.ensure_dues_for_member_period(merry, member, period_key)
+            except Exception as e:
+                raise _service_error(e)
 
         dues = (
             MerryContributionDue.objects.filter(
@@ -950,7 +791,10 @@ class AdminDuesView(APIView):
         period_key = (request.query_params.get("period_key") or "").strip() or current_period_key(merry)
         slot_no = request.query_params.get("slot_no")
 
-        merry.ensure_dues_for_period(period_key=period_key)
+        try:
+            merry.ensure_dues_for_period(period_key=period_key)
+        except Exception as e:
+            raise _service_error(e)
 
         qs = MerryContributionDue.objects.filter(merry=merry, period_key=period_key).select_related(
             "seat", "seat__member", "seat__member__user"
@@ -1012,37 +856,26 @@ class CreatePaymentIntentView(APIView):
     """
     permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, merry_id: int):
-        member = get_member_or_404(merry_id, request.user)
-        merry = member.merry
-
-        amount = parse_decimal(request.data.get("amount"), "amount")
-        if amount <= 0:
-            raise ValidationError("amount must be > 0.")
-
         payer_phone = (request.data.get("payer_phone") or getattr(request.user, "phone", "") or "").strip()
-        if not payer_phone:
-            raise ValidationError("payer_phone is required (or user must have a phone).")
 
-        period_key = current_period_key(merry)
-        merry.ensure_dues_for_period(period_key=period_key)
-
-        pay = MerryPayment.objects.create(
-            merry=merry,
-            beneficiary_member=member,
-            initiated_by=request.user,
-            payer_phone=payer_phone,
-            period_key=period_key,
-            amount=amount,
-            status="PENDING",
-        )
+        try:
+            pay = merry_services.create_payment_intent(
+                user=request.user,
+                merry_id=merry_id,
+                amount=request.data.get("amount"),
+                payer_phone=payer_phone,
+            )
+        except Exception as e:
+            raise _service_error(e)
 
         return Response(
             {
                 "message": "Payment intent created.",
                 "payment_id": pay.id,
-                "merry_id": merry.id,
-                "beneficiary_member_id": member.id,
+                "merry_id": pay.merry_id,
+                "beneficiary_member_id": pay.beneficiary_member_id,
                 "amount": str(pay.amount),
                 "payer_phone": pay.payer_phone,
                 "period_key": pay.period_key,
@@ -1060,11 +893,7 @@ class MyPaymentsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        qs = (
-            MerryPayment.objects.filter(beneficiary_member__user=request.user)
-            .select_related("merry", "beneficiary_member", "beneficiary_member__user")
-            .order_by("-created_at")[:200]
-        )
+        qs = merry_services.list_my_payments(user=request.user, limit=200)
 
         data = [
             {
@@ -1099,39 +928,16 @@ class AdminMarkPaymentConfirmedView(APIView):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        receipt = (request.data.get("mpesa_receipt_number") or "").strip()[:64]
+        receipt = (request.data.get("mpesa_receipt_number") or "").strip()[:64] or None
 
-        p = (
-            MerryPayment.objects.select_for_update()
-            .select_related("merry", "beneficiary_member")
-            .filter(id=payment_id)
-            .first()
-        )
-        if not p:
-            raise ValidationError("Payment not found.")
-
-        if receipt:
-            exists_elsewhere = MerryPayment.objects.exclude(id=p.id).filter(mpesa_receipt_number=receipt).exists()
-            if exists_elsewhere:
-                raise ValidationError("This M-Pesa receipt number is already used.")
-
-        if p.status == "CONFIRMED":
-            return Response({"message": "Already CONFIRMED."}, status=status.HTTP_200_OK)
-
-        if p.status in ("FAILED", "CANCELLED"):
-            raise ValidationError(f"Cannot confirm a {p.status} payment.")
-
-        p.status = "CONFIRMED"
-        p.paid_at = timezone.now()
-        if receipt:
-            p.mpesa_receipt_number = receipt
-            p.full_clean()
-            p.save(update_fields=["status", "paid_at", "mpesa_receipt_number"])
-        else:
-            p.full_clean()
-            p.save(update_fields=["status", "paid_at"])
-
-        allocate_payment(p.id)
+        try:
+            merry_services.confirm_payment_and_allocate(
+                payment_id=payment_id,
+                mpesa_receipt_number=receipt,
+                paid_at=timezone.now(),
+            )
+        except Exception as e:
+            raise _service_error(e)
 
         return Response({"message": "Payment confirmed and allocated."}, status=status.HTTP_200_OK)
 
@@ -1222,77 +1028,63 @@ class CreatePayoutView(APIView):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
-        if not merry:
-            raise ValidationError("Merry not found.")
-
-        seat_id = request.data.get("seat_id")
-        if not seat_id:
-            raise ValidationError("seat_id is required.")
-
-        seat = (
-            MerrySeat.objects.select_for_update()
-            .select_related("member", "member__user")
-            .filter(id=seat_id, merry=merry, is_active=True)
-            .first()
-        )
-        if not seat:
-            raise ValidationError("Seat not found in this merry.")
-
-        period_key = (request.data.get("period_key") or "").strip() or current_period_key(merry)
-
-        slot_no_raw = request.data.get("slot_no")
-        if slot_no_raw is None or str(slot_no_raw).strip() == "":
-            slot_no = next_available_slot(merry, period_key)
-        else:
-            slot_no = parse_int(slot_no_raw, "slot_no", min_value=1)
-            validate_slot(merry, slot_no)
-
-        if MerryPayout.objects.filter(merry=merry, period_key=period_key, slot_no=slot_no).exists():
-            raise ValidationError(f"A payout already exists for period {period_key} slot {slot_no}.")
-
-        if MerryPayout.objects.filter(merry=merry, seat=seat, period_key=period_key).exists():
-            raise ValidationError("This seat already has a payout in this period.")
-
         compute_amount = parse_bool(request.data.get("compute_amount"), default=False)
+        period_key = (request.data.get("period_key") or "").strip() or None
+        slot_no_raw = request.data.get("slot_no")
         notes = (request.data.get("notes") or "")[:255]
 
-        if compute_amount:
-            merry.ensure_dues_for_period(period_key=period_key)
+        merry = get_merry_or_404(merry_id)
 
-            total_paid_for_slot = (
-                MerryContributionDue.objects.filter(merry=merry, period_key=period_key, slot_no=slot_no)
-                .aggregate(s=Sum("paid_amount"))
-                .get("s")
-                or Decimal("0")
-            )
-            amount = q2(total_paid_for_slot)
+        if not request.data.get("seat_id"):
+            raise ValidationError("seat_id is required.")
+        seat_id = parse_int(request.data.get("seat_id"), "seat_id", min_value=1)
+
+        if slot_no_raw is not None and str(slot_no_raw).strip() != "":
+            slot_no = parse_int(slot_no_raw, "slot_no", min_value=1)
+        else:
+            slot_no = None
+
+        if compute_amount:
+            target_period = period_key or current_period_key(merry)
+            if slot_no is None:
+                slot_no = next_available_slot(merry, target_period)
+
+            try:
+                amount = merry_services.compute_payout_amount_for_slot(
+                    merry_id=merry_id,
+                    period_key=target_period,
+                    slot_no=slot_no,
+                )
+            except Exception as e:
+                raise _service_error(e)
+
             if amount <= 0:
                 raise ValidationError("No funds allocated for this slot yet. Cannot compute payout amount.")
         else:
             amount = parse_decimal(request.data.get("amount"), "amount")
-            if amount <= 0:
-                raise ValidationError("amount must be > 0.")
 
-        payout = MerryPayout.objects.create(
-            merry=merry,
-            seat=seat,
-            period_key=period_key,
-            slot_no=slot_no,
-            amount=amount,
-            status="SCHEDULED",
-            notes=notes,
-        )
+        try:
+            payout = merry_services.create_payout_record(
+                admin_user=request.user,
+                merry_id=merry_id,
+                seat_id=seat_id,
+                amount=amount,
+                period_key=period_key,
+                slot_no=slot_no,
+                notes=notes,
+            )
+        except Exception as e:
+            raise _service_error(e)
 
         return Response(
             {
                 "message": "Payout record created.",
                 "payout_id": payout.id,
                 "status": payout.status,
-                "merry_id": merry.id,
-                "seat_id": seat.id,
-                "member_id": seat.member_id,
-                "user_id": seat.member.user_id,
+                "merry_id": payout.merry_id,
+                "seat_id": payout.seat_id,
+                "member_id": payout.seat.member_id,
+                "user_id": payout.seat.member.user_id,
                 "amount": str(payout.amount),
                 "period_key": payout.period_key,
                 "slot_no": payout.slot_no,
@@ -1304,22 +1096,17 @@ class CreatePayoutView(APIView):
 class MarkPayoutPaidView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
+    @transaction.atomic
     def post(self, request, payout_id: int):
         if not is_admin(request.user):
             raise PermissionDenied("Admin only.")
 
-        p = MerryPayout.objects.select_related("merry", "seat", "seat__member").filter(id=payout_id).first()
-        if not p:
-            raise ValidationError("Payout not found.")
-
-        if p.status == "PAID":
-            return Response({"message": "Already PAID."}, status=status.HTTP_200_OK)
-
-        if p.status in ("FAILED", "CANCELLED"):
-            raise ValidationError(f"Cannot mark a {p.status} payout as PAID.")
-
-        p.status = "PAID"
-        p.paid_at = timezone.now()
-        p.save(update_fields=["status", "paid_at"])
+        try:
+            merry_services.mark_payout_paid(
+                payout_id=payout_id,
+                paid_at=timezone.now(),
+            )
+        except Exception as e:
+            raise _service_error(e)
 
         return Response({"message": "Payout marked PAID."}, status=status.HTTP_200_OK)

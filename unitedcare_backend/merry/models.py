@@ -9,6 +9,8 @@
 # ✅ Join requests support merry open/closed state
 # ✅ Optional seat capacity limit
 # ✅ Less strict join-request history (only one active pending request at a time)
+# ✅ Seat numbers are now GLOBAL per merry (e.g. seat 2, 5, 19)
+# ✅ Admin can manually assign seat numbers on approval
 
 from __future__ import annotations
 
@@ -151,6 +153,44 @@ class MerryGoRound(models.Model):
     def next_payout_position(self) -> int:
         mx = self.seats.filter(is_active=True).aggregate(m=Max("payout_position")).get("m") or 0
         return int(mx) + 1
+
+    # ✅ NEW: global seat-number helpers
+    def available_seat_numbers(self) -> Optional[List[int]]:
+        """
+        Returns available global seat numbers for this merry if max_seats is capped.
+        If unlimited (max_seats=0), returns None because the seat range is open-ended.
+        """
+        if not self.max_seats or self.max_seats <= 0:
+            return None
+
+        taken = set(
+            self.seats.filter(is_active=True).values_list("seat_no", flat=True)
+        )
+        return [n for n in range(1, self.max_seats + 1) if n not in taken]
+
+    def next_available_seat_numbers(self, count: int) -> List[int]:
+        """
+        Auto-picks the next available global seat numbers.
+        For capped merries, chooses from 1..max_seats.
+        For unlimited merries, continues from the highest seat_no.
+        """
+        if count < 1:
+            raise ValidationError("count must be at least 1.")
+
+        if self.max_seats and self.max_seats > 0:
+            available = self.available_seat_numbers() or []
+            if len(available) < count:
+                raise ValidationError("Not enough available seat numbers.")
+            return available[:count]
+
+        existing = set(self.seats.filter(is_active=True).values_list("seat_no", flat=True))
+        picked: List[int] = []
+        n = 1
+        while len(picked) < count:
+            if n not in existing:
+                picked.append(n)
+            n += 1
+        return picked
 
     # -------- admin schedule generation --------
     @transaction.atomic
@@ -336,20 +376,26 @@ class MerrySeat(models.Model):
     Each seat behaves like a separate participation unit:
       - owes contribution_amount per slot
       - gets its own payout turn
+
+    seat_no is now GLOBAL inside the merry.
+    Example:
+      Member A may own seat 2, 5, 19
+      Member B may own seat 1, 7
     """
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="seats")
     member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="seats")
 
-    seat_no = models.PositiveIntegerField()  # 1..N within member
+    seat_no = models.PositiveIntegerField()  # ✅ global within merry
     payout_position = models.PositiveIntegerField(null=True, blank=True)
 
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
-        ordering = ["payout_position", "id"]
+        ordering = ["seat_no", "id"]
         constraints = [
-            models.UniqueConstraint(fields=["member", "seat_no"], name="uniq_seat_no_per_member"),
+            # ✅ CHANGED: seat_no must be unique per merry, not per member
+            models.UniqueConstraint(fields=["merry", "seat_no"], name="uniq_seat_no_per_merry"),
             models.UniqueConstraint(
                 fields=["merry", "payout_position"],
                 condition=Q(payout_position__isnull=False),
@@ -359,6 +405,7 @@ class MerrySeat(models.Model):
         indexes = [
             models.Index(fields=["merry", "is_active"]),
             models.Index(fields=["member", "is_active"]),
+            models.Index(fields=["merry", "seat_no"]),
         ]
 
     def clean(self):
@@ -366,6 +413,11 @@ class MerrySeat(models.Model):
             raise ValidationError("seat_no must be >= 1")
         if self.member_id and self.merry_id and self.member.merry_id != self.merry_id:
             raise ValidationError("Seat merry must match member.merry")
+        if self.merry_id and self.merry.max_seats and self.merry.max_seats > 0:
+            if self.seat_no > self.merry.max_seats:
+                raise ValidationError(
+                    f"seat_no cannot exceed max_seats ({self.merry.max_seats}) for this merry."
+                )
 
     def __str__(self):
         return f"Seat#{self.id} merry={self.merry_id} user={self.member.user_id} seat_no={self.seat_no}"
@@ -450,7 +502,11 @@ class MerryJoinRequest(models.Model):
                 raise ValidationError("You already have a pending join request for this merry.")
 
     @transaction.atomic
-    def approve(self, admin_user) -> Tuple[MerryMember, List["MerrySeat"]]:
+    def approve(
+        self,
+        admin_user,
+        assigned_seat_numbers: Optional[List[int]] = None,
+    ) -> Tuple[MerryMember, List["MerrySeat"]]:
         if self.status != "PENDING":
             raise ValidationError("Only PENDING requests can be approved.")
 
@@ -475,12 +531,44 @@ class MerryJoinRequest(models.Model):
             member.joined_at = member.joined_at or timezone.now()
             member.save(update_fields=["is_active", "joined_at"])
 
+        # ✅ NEW: allow admin to assign exact global seat numbers,
+        # otherwise auto-pick available ones.
+        if assigned_seat_numbers is None:
+            seat_numbers = jr.merry.next_available_seat_numbers(jr.requested_seats)
+        else:
+            seat_numbers = [int(s) for s in assigned_seat_numbers]
+
+            if len(seat_numbers) != jr.requested_seats:
+                raise ValidationError(
+                    f"Exactly {jr.requested_seats} seat number(s) must be assigned."
+                )
+
+            if any(s < 1 for s in seat_numbers):
+                raise ValidationError("All assigned seat numbers must be >= 1.")
+
+            if len(set(seat_numbers)) != len(seat_numbers):
+                raise ValidationError("Assigned seat numbers must be unique.")
+
+            if jr.merry.max_seats and jr.merry.max_seats > 0:
+                invalid = [s for s in seat_numbers if s > jr.merry.max_seats]
+                if invalid:
+                    raise ValidationError(
+                        f"These seat number(s) exceed max_seats ({jr.merry.max_seats}): {invalid}"
+                    )
+
+            taken = list(
+                MerrySeat.objects.filter(
+                    merry=jr.merry,
+                    seat_no__in=seat_numbers,
+                    is_active=True,
+                ).values_list("seat_no", flat=True)
+            )
+            if taken:
+                raise ValidationError(f"These seat number(s) are already taken: {sorted(taken)}")
+
         seats_created: List[MerrySeat] = []
 
-        existing_max_seat_no = member.seats.aggregate(m=Max("seat_no")).get("m") or 0
-        seat_no_start = int(existing_max_seat_no) + 1
-
-        for i in range(jr.requested_seats):
+        for seat_no in seat_numbers:
             payout_position: Optional[int] = None
             if jr.merry.payout_order_type == "manual":
                 payout_position = jr.merry.next_payout_position()
@@ -488,7 +576,7 @@ class MerryJoinRequest(models.Model):
             seat = MerrySeat.objects.create(
                 merry=jr.merry,
                 member=member,
-                seat_no=seat_no_start + i,
+                seat_no=seat_no,
                 payout_position=payout_position,
                 is_active=True,
                 created_at=timezone.now(),

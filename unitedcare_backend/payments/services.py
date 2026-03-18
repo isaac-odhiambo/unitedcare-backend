@@ -1,6 +1,6 @@
-# payments/services.py
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional, Tuple
@@ -72,12 +72,169 @@ def _withdrawal_source_to_category(source: str) -> str:
     return mapping.get(s, "SAVINGS")
 
 
+def _normalize_reference_token(reference: str) -> str:
+    """
+    Normalized version for parsing:
+    - strip spaces
+    - remove hyphens/underscores
+    - uppercase
+    """
+    ref = (reference or "").strip().upper()
+    ref = ref.replace(" ", "").replace("-", "").replace("_", "")
+    return ref
+
+
+@dataclass
+class ParsedReference:
+    raw: str
+    normalized: str
+    kind: str
+    entity_id: Optional[int]
+    purpose: str
+    valid: bool
+
+
+def _parse_reference(reference: str) -> ParsedReference:
+    """
+    Supports simple user-friendly references:
+      - mus12
+      - saving23
+      - loan35
+      - grp9
+
+    And keeps backward compatibility with:
+      - MERRY-PAYMENT-99
+      - LOAN-12
+      - GROUP-7
+    """
+    raw = (reference or "").strip()
+    norm = _normalize_reference_token(raw)
+
+    if not raw:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="EMPTY",
+            entity_id=None,
+            purpose="SAVINGS_DEPOSIT",
+            valid=False,
+        )
+
+    m = re.match(r"^MUS(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="MERRY_USER",
+            entity_id=int(m.group(1)),
+            purpose="MERRY_CONTRIBUTION",
+            valid=True,
+        )
+
+    m = re.match(r"^SAVING(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="SAVINGS_ACCOUNT",
+            entity_id=int(m.group(1)),
+            purpose="SAVINGS_DEPOSIT",
+            valid=True,
+        )
+
+    m = re.match(r"^SAV(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="SAVINGS_ACCOUNT",
+            entity_id=int(m.group(1)),
+            purpose="SAVINGS_DEPOSIT",
+            valid=True,
+        )
+
+    m = re.match(r"^LOAN(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="LOAN",
+            entity_id=int(m.group(1)),
+            purpose="LOAN_REPAYMENT",
+            valid=True,
+        )
+
+    m = re.match(r"^GRP(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="GROUP",
+            entity_id=int(m.group(1)),
+            purpose="GROUP_CONTRIBUTION",
+            valid=True,
+        )
+
+    m = re.match(r"^GROUP(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="GROUP",
+            entity_id=int(m.group(1)),
+            purpose="GROUP_CONTRIBUTION",
+            valid=True,
+        )
+
+    # -------------------------
+    # Legacy references
+    # -------------------------
+    m = re.match(r"^MERRYPAYMENT(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="MERRY_PAYMENT",
+            entity_id=int(m.group(1)),
+            purpose="MERRY_CONTRIBUTION",
+            valid=True,
+        )
+
+    m = re.match(r"^LOAN(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="LOAN",
+            entity_id=int(m.group(1)),
+            purpose="LOAN_REPAYMENT",
+            valid=True,
+        )
+
+    m = re.match(r"^GROUP(\d+)$", norm)
+    if m:
+        return ParsedReference(
+            raw=raw,
+            normalized=norm,
+            kind="GROUP",
+            entity_id=int(m.group(1)),
+            purpose="GROUP_CONTRIBUTION",
+            valid=True,
+        )
+
+    return ParsedReference(
+        raw=raw,
+        normalized=norm,
+        kind="UNKNOWN",
+        entity_id=None,
+        purpose="OTHER",
+        valid=False,
+    )
+
+
 def _extract_id(reference: str, prefix: str) -> Optional[int]:
     """
-    Extract integer id from a reference like:
-      "LOAN-12"  with prefix "LOAN-"
-      "MERRY-PAYMENT-99" with prefix "MERRY-PAYMENT-"
-      "GROUP-7" with prefix "GROUP-"
+    Backward helper kept for legacy compatibility.
     """
     ref = (reference or "").strip()
     if not ref.startswith(prefix):
@@ -91,12 +248,42 @@ def _extract_id(reference: str, prefix: str) -> Optional[int]:
 def _create_mpesa_tx(**kwargs) -> MpesaTransaction:
     """
     Backward-safe create:
-    if your MpesaTransaction model already has base_amount / transaction_fee,
-    they will be stored; if not, they will be ignored without crashing.
+    if your MpesaTransaction model already has base_amount / transaction_fee /
+    allocation fields, they will be stored; if not, they will be ignored.
     """
     model_fields = {f.name for f in MpesaTransaction._meta.get_fields()}
     clean = {k: v for k, v in kwargs.items() if k in model_fields}
     return MpesaTransaction.objects.create(**clean)
+
+
+def _update_tx_allocation(
+    tx: MpesaTransaction,
+    *,
+    status: str,
+    notes: str = "",
+    allocated_by: Optional[AbstractBaseUser] = None,
+) -> None:
+    updates = {}
+
+    if hasattr(tx, "allocation_status"):
+        tx.allocation_status = status
+        updates["allocation_status"] = status
+
+    if hasattr(tx, "allocation_notes"):
+        tx.allocation_notes = (notes or "")[:255]
+        updates["allocation_notes"] = tx.allocation_notes
+
+    if hasattr(tx, "allocated_at"):
+        if status in ("AUTO_ALLOCATED", "MANUALLY_ALLOCATED", "PARTIALLY_ALLOCATED"):
+            tx.allocated_at = timezone.now()
+            updates["allocated_at"] = tx.allocated_at
+
+    if hasattr(tx, "allocated_by") and allocated_by is not None:
+        tx.allocated_by = allocated_by
+        updates["allocated_by"] = allocated_by
+
+    if updates:
+        tx.save(update_fields=list(updates.keys()))
 
 
 # ============================================================
@@ -278,21 +465,116 @@ def _verify_stk_with_query(client: DarajaClient, tx: MpesaTransaction) -> Dict[s
 # ============================================================
 @transaction.atomic
 def _apply_merry_contribution(tx: MpesaTransaction) -> None:
+    parsed = _parse_reference(tx.reference or "")
+
+    # --------------------------------------------
+    # New simple reference style: mus12
+    # --------------------------------------------
+    if parsed.valid and parsed.kind == "MERRY_USER":
+        try:
+            from merry import services as merry_services
+        except Exception:
+            _update_tx_allocation(
+                tx,
+                status="MANUAL_REVIEW",
+                notes="Merry services unavailable for mus reference allocation.",
+            )
+            return
+
+        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+        base_amount = _money(payload.get("base_amount", tx.amount))
+
+        candidate_names = (
+            "apply_mpesa_contribution_by_user_reference",
+            "apply_mpesa_contribution_by_user",
+            "apply_mpesa_contribution",
+        )
+
+        for fn_name in candidate_names:
+            fn = getattr(merry_services, fn_name, None)
+            if callable(fn):
+                try:
+                    if fn_name == "apply_mpesa_contribution_by_user_reference":
+                        fn(
+                            user_id=parsed.entity_id,
+                            amount=base_amount,
+                            mpesa_tx=tx,
+                            reference=tx.reference or "",
+                        )
+                    elif fn_name == "apply_mpesa_contribution_by_user":
+                        fn(
+                            user_id=parsed.entity_id,
+                            amount=base_amount,
+                            mpesa_tx=tx,
+                            reference=tx.reference or "",
+                        )
+                    else:
+                        fn(
+                            user=tx.user,
+                            amount=base_amount,
+                            mpesa_tx=tx,
+                            reference=tx.reference or "",
+                        )
+
+                    _update_tx_allocation(
+                        tx,
+                        status="AUTO_ALLOCATED",
+                        notes="Merry contribution auto-allocated from simple reference.",
+                    )
+                    return
+                except Exception as e:
+                    _update_tx_allocation(
+                        tx,
+                        status="MANUAL_REVIEW",
+                        notes=f"Merry allocation error: {str(e)}"[:255],
+                    )
+                    return
+
+        _update_tx_allocation(
+            tx,
+            status="MANUAL_REVIEW",
+            notes="No supported merry allocation function found.",
+        )
+        return
+
+    # --------------------------------------------
+    # Legacy style: MERRY-PAYMENT-99
+    # --------------------------------------------
     payment_id = _extract_id(tx.reference or "", "MERRY-PAYMENT-")
     if not payment_id:
+        _update_tx_allocation(
+            tx,
+            status="MANUAL_REVIEW",
+            notes="Merry reference not mapped automatically.",
+        )
         return
 
     try:
         from merry.models import MerryPayment
         from merry.views import allocate_payment
     except Exception:
+        _update_tx_allocation(
+            tx,
+            status="MANUAL_REVIEW",
+            notes="Legacy merry payment allocation service unavailable.",
+        )
         return
 
     pay = MerryPayment.objects.select_for_update().filter(id=payment_id).first()
     if not pay:
+        _update_tx_allocation(
+            tx,
+            status="MANUAL_REVIEW",
+            notes="Legacy merry payment record not found.",
+        )
         return
 
     if pay.status == "CONFIRMED":
+        _update_tx_allocation(
+            tx,
+            status="AUTO_ALLOCATED",
+            notes="Legacy merry payment already confirmed.",
+        )
         return
 
     pay.status = "CONFIRMED"
@@ -302,17 +584,25 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
     pay.save(update_fields=["status", "paid_at", "mpesa_receipt_number"])
 
     allocate_payment(pay.id)
+    _update_tx_allocation(
+        tx,
+        status="AUTO_ALLOCATED",
+        notes="Legacy merry payment confirmed and allocated.",
+    )
 
 
 @transaction.atomic
 def _apply_loan_repayment(tx: MpesaTransaction) -> None:
-    loan_id = _extract_id(tx.reference or "", "LOAN-")
+    parsed = _parse_reference(tx.reference or "")
+    loan_id = parsed.entity_id if parsed.valid and parsed.kind == "LOAN" else _extract_id(tx.reference or "", "LOAN-")
     if not loan_id:
+        _update_tx_allocation(tx, status="INVALID_REFERENCE", notes="Invalid loan reference.")
         return
 
     try:
         from loans import services as loan_services
     except Exception:
+        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Loan services unavailable.")
         return
 
     fn = getattr(loan_services, "apply_mpesa_repayment", None)
@@ -320,6 +610,9 @@ def _apply_loan_repayment(tx: MpesaTransaction) -> None:
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
         base_amount = _money(payload.get("base_amount", tx.amount))
         fn(loan_id=loan_id, amount=base_amount, mpesa_tx=tx)
+        _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Loan repayment auto-applied.")
+    else:
+        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Loan repayment function not found.")
 
 
 @transaction.atomic
@@ -327,6 +620,7 @@ def _apply_savings_deposit(tx: MpesaTransaction) -> None:
     try:
         from savings import services as savings_services
     except Exception:
+        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Savings services unavailable.")
         return
 
     fn = getattr(savings_services, "apply_mpesa_deposit", None)
@@ -334,6 +628,9 @@ def _apply_savings_deposit(tx: MpesaTransaction) -> None:
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
         base_amount = _money(payload.get("base_amount", tx.amount))
         fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
+        _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Savings deposit auto-applied.")
+    else:
+        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Savings deposit function not found.")
 
 
 @transaction.atomic
@@ -341,6 +638,7 @@ def _apply_group_contribution(tx: MpesaTransaction) -> None:
     try:
         from groups import services as group_services
     except Exception:
+        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Group services unavailable.")
         return
 
     fn = getattr(group_services, "apply_mpesa_contribution", None)
@@ -348,6 +646,9 @@ def _apply_group_contribution(tx: MpesaTransaction) -> None:
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
         base_amount = _money(payload.get("base_amount", tx.amount))
         fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
+        _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Group contribution auto-applied.")
+    else:
+        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Group contribution function not found.")
 
 
 def _route_success_tx(tx: MpesaTransaction) -> None:
@@ -432,7 +733,13 @@ def handle_c2b_validation_callback(*, callback_payload: Dict[str, Any]) -> Dict[
     Basic C2B validation.
     Safaricom sends payment details before final confirmation.
 
-    We only reject clearly invalid references here.
+    Accepts simple references like:
+      - mus12
+      - saving23
+      - loan35
+      - grp9
+
+    Also supports legacy references.
     """
     reference = (
         callback_payload.get("BillRefNumber")
@@ -449,17 +756,9 @@ def handle_c2b_validation_callback(*, callback_payload: Dict[str, Any]) -> Dict[
     if not reference:
         return {"ResultCode": "C2B00012", "ResultDesc": "Missing account reference"}
 
-    if reference.startswith("MERRY-PAYMENT-"):
-        if _extract_id(reference, "MERRY-PAYMENT-") is None:
-            return {"ResultCode": "C2B00012", "ResultDesc": "Invalid merry reference"}
-
-    elif reference.startswith("LOAN-"):
-        if _extract_id(reference, "LOAN-") is None:
-            return {"ResultCode": "C2B00012", "ResultDesc": "Invalid loan reference"}
-
-    elif reference.startswith("GROUP-"):
-        if _extract_id(reference, "GROUP-") is None:
-            return {"ResultCode": "C2B00012", "ResultDesc": "Invalid group reference"}
+    parsed = _parse_reference(reference)
+    if not parsed.valid:
+        return {"ResultCode": "C2B00012", "ResultDesc": "Invalid account reference"}
 
     return {"ResultCode": "0", "ResultDesc": "Accepted"}
 
@@ -469,11 +768,13 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     """
     Handles manual Paybill C2B confirmation callback.
 
-    Expected routing by reference:
-      - MERRY-PAYMENT-<payment_id> -> MERRY_CONTRIBUTION
-      - LOAN-<loan_id>             -> LOAN_REPAYMENT
-      - GROUP-<group_id>           -> GROUP_CONTRIBUTION
-      - anything else              -> SAVINGS_DEPOSIT
+    Supported references:
+      - mus12
+      - saving23
+      - loan35
+      - grp9
+
+    Legacy references are still supported too.
     """
     receipt = (
         callback_payload.get("TransID")
@@ -515,23 +816,16 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
         or ""
     ).strip()
 
-    if reference.startswith("MERRY-PAYMENT-"):
-        purpose = "MERRY_CONTRIBUTION"
-    elif reference.startswith("LOAN-"):
-        purpose = "LOAN_REPAYMENT"
-    elif reference.startswith("GROUP-"):
-        purpose = "GROUP_CONTRIBUTION"
-    else:
-        purpose = "SAVINGS_DEPOSIT"
+    parsed = _parse_reference(reference)
+
+    purpose = parsed.purpose if parsed.valid else "OTHER"
 
     user = None
     if phone:
         user = UserModel.objects.filter(phone=phone).first()
 
-    if purpose == "GROUP_CONTRIBUTION" and user:
-        group_id = _extract_id(reference, "GROUP-")
-        if group_id:
-            _require_active_group_membership(user=user, group_id=group_id)
+    if parsed.valid and parsed.kind == "GROUP" and user and parsed.entity_id:
+        _require_active_group_membership(user=user, group_id=parsed.entity_id)
 
     fee = Decimal("0.00")
     base_amount = amount
@@ -551,14 +845,25 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
         result_code="0",
         result_desc="C2B confirmed",
         transaction_date=timezone.now(),
+        allocation_status="UNALLOCATED" if parsed.valid else "INVALID_REFERENCE",
+        allocation_notes="" if parsed.valid else "Invalid or unsupported account reference.",
         request_payload={
             "base_amount": str(base_amount),
             "fee": str(fee),
             "total_amount": str(amount),
             "source": "C2B",
+            "parsed_reference": {
+                "kind": parsed.kind,
+                "entity_id": parsed.entity_id,
+                "purpose": parsed.purpose,
+                "valid": parsed.valid,
+            },
         },
         callback_payload=callback_payload,
     )
+
+    if not parsed.valid:
+        return tx
 
     return _finalize_successful_incoming_tx(tx, channel_label="C2B")
 
@@ -590,11 +895,17 @@ def initiate_stk_push(
         raise ValueError("Amount must be greater than 0")
 
     purpose_u = (purpose or "OTHER").upper()
+    parsed = _parse_reference(reference or "")
 
     if purpose_u == "GROUP_CONTRIBUTION":
-        group_id = _extract_id(reference or "", "GROUP-")
+        group_id = None
+        if parsed.valid and parsed.kind == "GROUP":
+            group_id = parsed.entity_id
+        else:
+            group_id = _extract_id(reference or "", "GROUP-")
+
         if not group_id:
-            raise ValidationError("GROUP_CONTRIBUTION requires reference='GROUP-<group_id>'")
+            raise ValidationError("GROUP_CONTRIBUTION requires reference like 'grp9' or 'GROUP-9'")
         _require_active_group_membership(user=user, group_id=group_id)
 
     fee = calculate_transaction_fee(purpose=purpose_u, base_amount=base_amount)
@@ -630,6 +941,7 @@ def initiate_stk_push(
         purpose=purpose_u,
         status="INITIATED",
         reference=reference or "",
+        allocation_status="UNALLOCATED",
         request_payload={
             "base_amount": str(base_amount),
             "fee": str(fee),

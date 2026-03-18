@@ -73,4 +73,4 @@ def apply_late_fees_and_tag_defaulters():
     return {
         "late_fee_installments_updated": updated_installments_count,
         "loans_tagged_defaulted": loans_to_default.count(),
-    }
+    }   

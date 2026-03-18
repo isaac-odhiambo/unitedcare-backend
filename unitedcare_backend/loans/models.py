@@ -1,31 +1,28 @@
-# loans/models.py (COMPLETE UPDATED VERSION)
-# ----------------------------------------
-# This version supports:
-# ✅ Loan context = exactly one (Merry OR Group)
-# ✅ Multiple guarantors
-# ✅ Coverage-based security reserve (borrower savings + merry credit + guarantors)
-# ✅ Accurate release using stored reserved_amount fields
-# ✅ Merry credit holds using your Merry Contribution/Payout tables
-
 from decimal import Decimal
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import Sum
 from django.utils import timezone
 
 
 # ==========================================================
-# Credit Profile (per context)
+# Global Credit Profile (per borrower, not per context)
 # ==========================================================
 class MemberCreditProfile(models.Model):
     """
-    Credit score tracked per context:
-    - Either within a Merry, OR within a Group.
-    """
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    Global credit profile for a borrower across the platform.
 
-    merry = models.ForeignKey("merry.MerryGoRound", null=True, blank=True, on_delete=models.CASCADE)
-    group = models.ForeignKey("groups.Group", null=True, blank=True, on_delete=models.CASCADE)
+    Context is no longer the identity of the loan.
+    Merry / Group are treated as optional sources of support/security,
+    not as the loan's parent.
+    """
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="credit_profile",
+    )
 
     score = models.IntegerField(default=100)
     total_loans = models.IntegerField(default=0)
@@ -35,30 +32,8 @@ class MemberCreditProfile(models.Model):
 
     updated_at = models.DateTimeField(auto_now=True)
 
-    class Meta:
-        constraints = [
-            models.CheckConstraint(
-                check=(
-                    (models.Q(merry__isnull=False) & models.Q(group__isnull=True))
-                    | (models.Q(merry__isnull=True) & models.Q(group__isnull=False))
-                ),
-                name="credit_profile_exactly_one_context",
-            ),
-            models.UniqueConstraint(
-                fields=["user", "merry"],
-                condition=models.Q(merry__isnull=False),
-                name="uniq_credit_profile_user_merry_when_set",
-            ),
-            models.UniqueConstraint(
-                fields=["user", "group"],
-                condition=models.Q(group__isnull=False),
-                name="uniq_credit_profile_user_group_when_set",
-            ),
-        ]
-
     def __str__(self):
-        ctx = f"Merry:{self.merry_id}" if self.merry_id else f"Group:{self.group_id}"
-        return f"{self.user} {ctx} score={self.score}"
+        return f"{self.user} score={self.score}"
 
 
 # ==========================================================
@@ -67,8 +42,10 @@ class MemberCreditProfile(models.Model):
 class LoanProduct(models.Model):
     """
     Loan product configuration.
-    We default to WEEKLY repayment (every Monday).
+    Admin may assign/select this internally.
+    Member does not need to see product details at request stage.
     """
+
     INTEREST_TYPE = (
         ("FLAT", "Flat"),
         ("REDUCING", "Reducing Balance"),
@@ -80,10 +57,18 @@ class LoanProduct(models.Model):
     )
 
     name = models.CharField(max_length=100)
-    interest_type = models.CharField(max_length=20, choices=INTEREST_TYPE, default="FLAT")
+    interest_type = models.CharField(
+        max_length=20,
+        choices=INTEREST_TYPE,
+        default="FLAT",
+    )
     annual_interest_rate = models.DecimalField(max_digits=6, decimal_places=2)
 
-    repayment_frequency = models.CharField(max_length=10, choices=REPAYMENT_FREQUENCY, default="WEEKLY")
+    repayment_frequency = models.CharField(
+        max_length=10,
+        choices=REPAYMENT_FREQUENCY,
+        default="WEEKLY",
+    )
     repayment_weekday = models.IntegerField(default=0)  # Monday=0 .. Sunday=6
 
     max_weeks = models.PositiveIntegerField(default=12)
@@ -92,10 +77,20 @@ class LoanProduct(models.Model):
         max_digits=6,
         decimal_places=2,
         default=Decimal("2.00"),
-        help_text="Percentage charged weekly on overdue installment total_due (e.g., 2.00 = 2%)",
+        help_text="Percentage charged weekly on overdue installment total_due (e.g. 2.00 = 2%)",
     )
 
     is_active = models.BooleanField(default=True)
+    is_default = models.BooleanField(
+        default=False,
+        help_text="Used when member requests a loan without choosing a product.",
+    )
+
+    def clean(self):
+        if self.is_default:
+            qs = LoanProduct.objects.filter(is_default=True).exclude(pk=self.pk)
+            if qs.exists():
+                raise ValidationError("Only one loan product can be marked as default.")
 
     def __str__(self):
         return f"{self.name} ({self.interest_type}, {self.repayment_frequency})"
@@ -106,8 +101,12 @@ class LoanProduct(models.Model):
 # ==========================================================
 class Loan(models.Model):
     """
-    Loan belongs to exactly one context: Merry OR Group.
-    Borrower is a User; membership/eligibility is enforced in services/views.
+    Global member loan.
+
+    Important:
+    - Loan is NOT owned by a Merry or Group.
+    - Security may come from multiple sources.
+    - Contexts are only used as security sources / relationship sources.
     """
 
     STATUS = (
@@ -117,17 +116,19 @@ class Loan(models.Model):
         ("REJECTED", "Rejected"),
         ("COMPLETED", "Completed"),
         ("DEFAULTED", "Defaulted"),
+        ("CANCELLED", "Cancelled"),
     )
 
-    merry = models.ForeignKey(
-        "merry.MerryGoRound", null=True, blank=True, on_delete=models.CASCADE, related_name="loans"
+    borrower = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="loans",
     )
-    group = models.ForeignKey(
-        "groups.Group", null=True, blank=True, on_delete=models.CASCADE, related_name="loans"
+    product = models.ForeignKey(
+        LoanProduct,
+        on_delete=models.PROTECT,
+        related_name="loans",
     )
-
-    borrower = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="loans")
-    product = models.ForeignKey(LoanProduct, on_delete=models.PROTECT)
 
     principal = models.DecimalField(max_digits=12, decimal_places=2)
     term_weeks = models.PositiveIntegerField(default=12)
@@ -136,86 +137,65 @@ class Loan(models.Model):
     is_defaulter = models.BooleanField(default=False)
 
     approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     total_payable = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     total_paid = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     outstanding_balance = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
-    # -----------------------------
-    # ✅ NEW SECURITY FIELDS
-    # -----------------------------
-    borrower_reserved_savings = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    borrower_reserved_merry_credit = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    # Security summary values
     security_target = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    security_reserved_total = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    # Audit / review notes
+    member_note = models.TextField(blank=True, default="")
+    admin_note = models.TextField(blank=True, default="")
 
     class Meta:
-        constraints = [
-            models.CheckConstraint(
-                check=(
-                    (models.Q(merry__isnull=False) & models.Q(group__isnull=True))
-                    | (models.Q(merry__isnull=True) & models.Q(group__isnull=False))
-                ),
-                name="loan_exactly_one_context",
-            ),
-        ]
+        ordering = ["-id"]
 
     def clean(self):
-        if bool(self.merry) == bool(self.group):
-            raise ValidationError("Loan must belong to either a Merry OR a Group (not both).")
-
-        if self.product and self.product.repayment_frequency != "WEEKLY":
-            raise ValidationError("This system currently supports WEEKLY repayment only.")
+        if self.principal is None or Decimal(self.principal) <= 0:
+            raise ValidationError("Principal must be greater than 0.")
 
         if self.term_weeks <= 0:
             raise ValidationError("term_weeks must be greater than 0.")
+
+        if self.product and self.product.repayment_frequency != "WEEKLY":
+            raise ValidationError("This system currently supports WEEKLY repayment only.")
 
         if self.product and self.term_weeks > self.product.max_weeks:
             raise ValidationError("Loan term exceeds product max weeks.")
 
     def __str__(self):
-        ctx = f"Merry:{self.merry_id}" if self.merry_id else f"Group:{self.group_id}"
-        return f"Loan#{self.id} {ctx} {self.borrower} {self.status}"
+        return f"Loan#{self.id} borrower={self.borrower_id} status={self.status}"
 
     @property
     def is_active(self):
         return self.status in ("PENDING", "UNDER_REVIEW", "APPROVED")
 
     def recompute_balances(self):
-        self.outstanding_balance = (self.total_payable - self.total_paid)
-        if self.outstanding_balance <= Decimal("0.00") and self.status == "APPROVED":
-            self.status = "COMPLETED"
+        self.outstanding_balance = Decimal(self.total_payable or Decimal("0.00")) - Decimal(
+            self.total_paid or Decimal("0.00")
+        )
+
+        if self.outstanding_balance <= Decimal("0.00"):
             self.outstanding_balance = Decimal("0.00")
+            if self.status == "APPROVED":
+                self.status = "COMPLETED"
+                self.completed_at = timezone.now()
 
-
-# ==========================================================
-# ✅ Merry Credit Hold (NEW)
-# ==========================================================
-class MerryCreditHold(models.Model):
-    """
-    Holds 'unpaid-out' merry credit as loan collateral.
-
-    When a borrower uses merry credit as security:
-      - we create a hold record linked to the loan
-      - payout confirmation in merry should check active holds and block payout
-    """
-    loan = models.OneToOneField(Loan, on_delete=models.CASCADE, related_name="merry_hold")
-    merry = models.ForeignKey("merry.MerryGoRound", on_delete=models.CASCADE)
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-
-    amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    is_active = models.BooleanField(default=True)
-
-    created_at = models.DateTimeField(auto_now_add=True)
-    released_at = models.DateTimeField(null=True, blank=True)
-
-    def release(self):
-        self.is_active = False
-        self.released_at = timezone.now()
-        self.save(update_fields=["is_active", "released_at"])
-
-    def __str__(self):
-        return f"MerryHold loan={self.loan_id} user={self.user_id} merry={self.merry_id} amt={self.amount} active={self.is_active}"
+    def recompute_reserved_security_total(self):
+        total = (
+            self.security_allocations.filter(is_active=True)
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+        self.security_reserved_total = total
+        return total
 
 
 # ==========================================================
@@ -223,64 +203,178 @@ class MerryCreditHold(models.Model):
 # ==========================================================
 class LoanGuarantor(models.Model):
     """
-    Guarantor rules:
-    - Must be a member of the same context (same Merry or same Group)
-    - Must accept to become guarantor
-    - One guarantor can guarantee ONLY ONE active loan at a time per context
+    Platform-level guarantor.
 
-    ✅ NEW:
-    - reserved_amount: exactly how much was locked from this guarantor savings
+    Global approach:
+    - Guarantor is no longer restricted to the same Merry or Group.
+    - Validation of whether this guarantor is acceptable is done in services.
+    - Model still blocks obviously invalid cases (like self-guarantee).
     """
-    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name="guarantors")
-    guarantor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="guarantees")
+
+    loan = models.ForeignKey(
+        Loan,
+        on_delete=models.CASCADE,
+        related_name="guarantors",
+    )
+    guarantor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="guarantees",
+    )
 
     accepted = models.BooleanField(default=False)
     accepted_at = models.DateTimeField(null=True, blank=True)
 
-    # -----------------------------
-    # ✅ NEW SECURITY FIELD
-    # -----------------------------
+    # How much of this guarantor's support/security is currently reserved
     reserved_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    # Optional audit fields
+    request_note = models.CharField(max_length=255, blank=True, default="")
+    admin_note = models.CharField(max_length=255, blank=True, default="")
+
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = ("loan", "guarantor")
+        ordering = ["id"]
 
     def clean(self):
-        if self.loan_id is None:
-            return
-
-        if self.loan.borrower_id == self.guarantor_id:
+        if self.loan_id and self.loan.borrower_id == self.guarantor_id:
             raise ValidationError("Borrower cannot guarantee their own loan.")
 
-        from merry.models import Member as MerryMember
-        from groups.models import GroupMembership
+    def __str__(self):
+        return (
+            f"Loan#{self.loan_id} guarantor={self.guarantor_id} "
+            f"accepted={self.accepted} reserved={self.reserved_amount}"
+        )
 
-        if self.loan.merry_id:
-            if not MerryMember.objects.filter(merry_id=self.loan.merry_id, user_id=self.guarantor_id).exists():
-                raise ValidationError("Guarantor must be a member of this Merry.")
-        else:
-            if not GroupMembership.objects.filter(
-                group_id=self.loan.group_id, user_id=self.guarantor_id, is_active=True
-            ).exists():
-                raise ValidationError("Guarantor must be an active member of this Group.")
 
-        active = LoanGuarantor.objects.filter(
-            guarantor_id=self.guarantor_id,
-            accepted=True,
-            loan__status="APPROVED",
-            loan__outstanding_balance__gt=0,
-        ).exclude(loan_id=self.loan_id)
+# ==========================================================
+# Loan Security Allocation
+# ==========================================================
+class LoanSecurityAllocation(models.Model):
+    """
+    Flexible security/collateral registry for a global loan.
 
-        if self.loan.merry_id:
-            active = active.filter(loan__merry_id=self.loan.merry_id)
-        else:
-            active = active.filter(loan__group_id=self.loan.group_id)
+    This replaces hardcoded loan-level fields like:
+    - borrower_reserved_savings
+    - borrower_reserved_merry_credit
+    and also replaces context-bound holding logic.
 
-        if active.exists():
-            raise ValidationError("Guarantor can only guarantee one active loan at a time in this context.")
+    Examples:
+    - BORROWER_SAVINGS
+    - BORROWER_GROUP_SHARE
+    - BORROWER_MERRY_CREDIT
+    - GUARANTOR_SAVINGS
+    - GUARANTOR_GROUP_SHARE
+    - GUARANTOR_MERRY_CREDIT
+    """
+
+    SOURCE_TYPE = (
+        ("BORROWER_SAVINGS", "Borrower Savings"),
+        ("BORROWER_GROUP_SHARE", "Borrower Group Share"),
+        ("BORROWER_MERRY_CREDIT", "Borrower Merry Credit"),
+        ("GUARANTOR_SAVINGS", "Guarantor Savings"),
+        ("GUARANTOR_GROUP_SHARE", "Guarantor Group Share"),
+        ("GUARANTOR_MERRY_CREDIT", "Guarantor Merry Credit"),
+    )
+
+    loan = models.ForeignKey(
+        Loan,
+        on_delete=models.CASCADE,
+        related_name="security_allocations",
+    )
+
+    source_type = models.CharField(max_length=40, choices=SOURCE_TYPE)
+
+    # Whose resource is this?
+    owner_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="loan_security_allocations",
+    )
+
+    # Optional references for traceability
+    guarantor_link = models.ForeignKey(
+        LoanGuarantor,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="security_allocations",
+        help_text="Set when this allocation is tied to a guarantor on this loan.",
+    )
+
+    savings_account = models.ForeignKey(
+        "savings.SavingsAccount",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="loan_security_allocations",
+    )
+
+    merry = models.ForeignKey(
+        "merry.MerryGoRound",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="loan_security_allocations",
+    )
+
+    group = models.ForeignKey(
+        "groups.Group",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="loan_security_allocations",
+    )
+
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["id"]
+
+    def clean(self):
+        if Decimal(self.amount or Decimal("0.00")) <= 0:
+            raise ValidationError("Security allocation amount must be greater than 0.")
+
+        if self.guarantor_link_id:
+            if self.guarantor_link.loan_id != self.loan_id:
+                raise ValidationError("guarantor_link must belong to the same loan.")
+
+            if self.owner_user_id != self.guarantor_link.guarantor_id:
+                raise ValidationError("owner_user must match the guarantor linked to this allocation.")
+
+        if self.source_type.startswith("BORROWER_"):
+            if self.owner_user_id != self.loan.borrower_id:
+                raise ValidationError("Borrower allocation must belong to the borrower.")
+
+        if self.source_type.startswith("GUARANTOR_"):
+            if not self.guarantor_link_id:
+                raise ValidationError("Guarantor allocation must be linked to a LoanGuarantor record.")
+
+        if self.source_type.endswith("SAVINGS") and not self.savings_account_id:
+            raise ValidationError("Savings-based security allocation requires a savings account reference.")
+
+        if self.source_type.endswith("MERRY_CREDIT") and not self.merry_id:
+            raise ValidationError("Merry-credit security allocation requires a merry reference.")
+
+        if self.source_type.endswith("GROUP_SHARE") and not self.group_id:
+            raise ValidationError("Group-share security allocation requires a group reference.")
+
+    def release(self):
+        self.is_active = False
+        self.released_at = timezone.now()
+        self.save(update_fields=["is_active", "released_at"])
 
     def __str__(self):
-        return f"Loan#{self.loan_id} guarantor={self.guarantor} accepted={self.accepted} reserved={self.reserved_amount}"
+        return (
+            f"Loan#{self.loan_id} {self.source_type} "
+            f"owner={self.owner_user_id} amt={self.amount} active={self.is_active}"
+        )
 
 
 # ==========================================================
@@ -289,9 +383,14 @@ class LoanGuarantor(models.Model):
 class LoanInstallment(models.Model):
     """
     Weekly repayment schedule.
-    Due dates generated in services.py.
+    Due dates are generated in services.py.
     """
-    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name="installments")
+
+    loan = models.ForeignKey(
+        Loan,
+        on_delete=models.CASCADE,
+        related_name="installments",
+    )
 
     installment_no = models.PositiveIntegerField()
     due_date = models.DateField()
@@ -320,12 +419,21 @@ class LoanPayment(models.Model):
     Partial repayment supported.
     Allocation to installments is handled in services.py.
     """
-    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name="payments")
+
+    loan = models.ForeignKey(
+        Loan,
+        on_delete=models.CASCADE,
+        related_name="payments",
+    )
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     paid_at = models.DateTimeField(auto_now_add=True)
 
     method = models.CharField(max_length=50, default="MANUAL")
     reference = models.CharField(max_length=120, null=True, blank=True)
+
+    def clean(self):
+        if Decimal(self.amount or Decimal("0.00")) <= 0:
+            raise ValidationError("Payment amount must be greater than 0.")
 
     def __str__(self):
         return f"Loan#{self.loan_id} paid {self.amount} ({self.method})"

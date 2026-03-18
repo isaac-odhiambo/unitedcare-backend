@@ -1,6 +1,6 @@
-# payments/views.py
 from decimal import Decimal
 import logging
+import re
 
 from django.conf import settings
 from django.db import transaction
@@ -45,34 +45,196 @@ def _extract_id(reference: str, prefix: str):
         return None
 
 
+def _normalize_reference_token(reference: str) -> str:
+    ref = (reference or "").strip().upper()
+    ref = ref.replace(" ", "").replace("-", "").replace("_", "")
+    return ref
+
+
+def _parse_reference(reference: str):
+    """
+    Supports simple references:
+      - mus12
+      - saving23 / sav23
+      - loan35
+      - grp9 / group9
+
+    Also supports legacy references:
+      - MERRY-PAYMENT-99
+      - LOAN-12
+      - GROUP-7
+    """
+    raw = (reference or "").strip()
+    norm = _normalize_reference_token(raw)
+
+    if not raw:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "EMPTY",
+            "entity_id": None,
+            "purpose": "SAVINGS_DEPOSIT",
+            "valid": False,
+        }
+
+    m = re.match(r"^MUS(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "MERRY_USER",
+            "entity_id": int(m.group(1)),
+            "purpose": "MERRY_CONTRIBUTION",
+            "valid": True,
+        }
+
+    m = re.match(r"^SAVING(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "SAVINGS_ACCOUNT",
+            "entity_id": int(m.group(1)),
+            "purpose": "SAVINGS_DEPOSIT",
+            "valid": True,
+        }
+
+    m = re.match(r"^SAV(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "SAVINGS_ACCOUNT",
+            "entity_id": int(m.group(1)),
+            "purpose": "SAVINGS_DEPOSIT",
+            "valid": True,
+        }
+
+    m = re.match(r"^LOAN(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "LOAN",
+            "entity_id": int(m.group(1)),
+            "purpose": "LOAN_REPAYMENT",
+            "valid": True,
+        }
+
+    m = re.match(r"^GRP(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "GROUP",
+            "entity_id": int(m.group(1)),
+            "purpose": "GROUP_CONTRIBUTION",
+            "valid": True,
+        }
+
+    m = re.match(r"^GROUP(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "GROUP",
+            "entity_id": int(m.group(1)),
+            "purpose": "GROUP_CONTRIBUTION",
+            "valid": True,
+        }
+
+    # Legacy
+    m = re.match(r"^MERRYPAYMENT(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "MERRY_PAYMENT",
+            "entity_id": int(m.group(1)),
+            "purpose": "MERRY_CONTRIBUTION",
+            "valid": True,
+        }
+
+    m = re.match(r"^LOAN(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "LOAN",
+            "entity_id": int(m.group(1)),
+            "purpose": "LOAN_REPAYMENT",
+            "valid": True,
+        }
+
+    m = re.match(r"^GROUP(\d+)$", norm)
+    if m:
+        return {
+            "raw": raw,
+            "normalized": norm,
+            "kind": "GROUP",
+            "entity_id": int(m.group(1)),
+            "purpose": "GROUP_CONTRIBUTION",
+            "valid": True,
+        }
+
+    return {
+        "raw": raw,
+        "normalized": norm,
+        "kind": "UNKNOWN",
+        "entity_id": None,
+        "purpose": "OTHER",
+        "valid": False,
+    }
+
+
 def _require_reference_format(purpose: str, reference: str) -> None:
     """
     Validate reference format early before calling services.
 
-    Conventions:
-      - MERRY_CONTRIBUTION => "MERRY-PAYMENT-<payment_id>"
-      - LOAN_REPAYMENT     => "LOAN-<loan_id>"
-      - GROUP_CONTRIBUTION => "GROUP-<group_id>"
+    Allowed now:
+      - MERRY_CONTRIBUTION => mus12 OR MERRY-PAYMENT-99
+      - LOAN_REPAYMENT     => loan35 OR LOAN-35
+      - GROUP_CONTRIBUTION => grp9 OR GROUP-9
+      - SAVINGS_DEPOSIT    => optional; can be blank, saving23, sav23
     """
     p = (purpose or "").upper()
     ref = (reference or "").strip()
 
+    if p == "SAVINGS_DEPOSIT":
+        if not ref:
+            return
+        parsed = _parse_reference(ref)
+        if not parsed["valid"] or parsed["purpose"] != "SAVINGS_DEPOSIT":
+            raise ValidationError(
+                {"reference": "For SAVINGS_DEPOSIT, reference can be blank or like 'saving23' / 'sav23'."}
+            )
+        return
+
     if p == "MERRY_CONTRIBUTION":
+        parsed = _parse_reference(ref)
+        if parsed["valid"] and parsed["purpose"] == "MERRY_CONTRIBUTION":
+            return
         if _extract_id(ref, "MERRY-PAYMENT-") is None:
             raise ValidationError(
-                {"reference": "For MERRY_CONTRIBUTION, reference must be 'MERRY-PAYMENT-<payment_id>'."}
+                {"reference": "For MERRY_CONTRIBUTION, use reference like 'mus12'."}
             )
 
     if p == "LOAN_REPAYMENT":
+        parsed = _parse_reference(ref)
+        if parsed["valid"] and parsed["purpose"] == "LOAN_REPAYMENT":
+            return
         if _extract_id(ref, "LOAN-") is None:
             raise ValidationError(
-                {"reference": "For LOAN_REPAYMENT, reference must be 'LOAN-<loan_id>'."}
+                {"reference": "For LOAN_REPAYMENT, use reference like 'loan35'."}
             )
 
     if p == "GROUP_CONTRIBUTION":
+        parsed = _parse_reference(ref)
+        if parsed["valid"] and parsed["purpose"] == "GROUP_CONTRIBUTION":
+            return
         if _extract_id(ref, "GROUP-") is None:
             raise ValidationError(
-                {"reference": "For GROUP_CONTRIBUTION, reference must be 'GROUP-<group_id>'."}
+                {"reference": "For GROUP_CONTRIBUTION, use reference like 'grp9'."}
             )
 
 
@@ -139,7 +301,7 @@ def _svc(name: str):
 initiate_stk_push = _svc("initiate_stk_push")
 handle_stk_callback = _svc("handle_stk_callback")
 
-# NEW: C2B services
+# C2B services
 handle_c2b_validation_callback = _svc("handle_c2b_validation_callback")
 handle_c2b_confirmation_callback = _svc("handle_c2b_confirmation_callback")
 
@@ -212,7 +374,7 @@ class RequestWithdrawalView(generics.CreateAPIView):
         ser = self.get_serializer(data=request.data, context={"request": request})
         ser.is_valid(raise_exception=True)
 
-        withdrawal = ser.save()  # serializer should set user
+        withdrawal = ser.save()
 
         return Response(
             {
@@ -287,7 +449,6 @@ class ApproveWithdrawalView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        # Fallback (dev only)
         w.status = "APPROVED"
         w.approved_by = request.user
         w.approved_at = timezone.now()
@@ -411,6 +572,14 @@ class AdminMpesaTransactionsView(generics.ListAPIView):
         if purpose:
             qs = qs.filter(purpose=purpose.upper())
 
+        allocation_status = self.request.query_params.get("allocation_status")
+        if allocation_status and hasattr(MpesaTransaction, "allocation_status"):
+            qs = qs.filter(allocation_status=allocation_status.upper())
+
+        channel = self.request.query_params.get("channel")
+        if channel:
+            qs = qs.filter(channel=channel.upper())
+
         return qs
 
 
@@ -469,7 +638,7 @@ class MpesaStkPushView(APIView):
             tx = initiate_stk_push(
                 user=request.user,
                 phone=phone,
-                amount=amt,  # base amount; services should calculate fee + total
+                amount=amt,
                 purpose=purpose,
                 reference=reference,
                 narration=narration,
@@ -483,12 +652,11 @@ class MpesaStkPushView(APIView):
                 status=status.HTTP_200_OK,
             )
 
-        # Fallback (dev only)
         tx = MpesaTransaction.objects.create(
             user=request.user,
             phone=phone,
-            amount=amt,          # total in fallback/dev mode
-            base_amount=amt,     # base amount
+            amount=amt,
+            base_amount=amt,
             transaction_fee=Decimal("0.00"),
             direction="IN",
             channel="STK",
