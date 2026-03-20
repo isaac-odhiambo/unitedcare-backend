@@ -13,6 +13,7 @@ from .views import (
     AcceptGuaranteeView,
     RejectGuaranteeView,
     ApproveLoanView,
+    RejectLoanView,  # ✅ ADDED
     PayLoanView,
 )
 
@@ -76,6 +77,13 @@ urlpatterns = [
         "loan/<int:loan_id>/approve/",
         ApproveLoanView.as_view(),
         name="approve-loan",
+    ),
+
+    # ✅ Reject loan (with reason)
+    path(
+        "loan/<int:loan_id>/reject/",
+        RejectLoanView.as_view(),
+        name="reject-loan",
     ),
 
 

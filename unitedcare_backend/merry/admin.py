@@ -1,6 +1,8 @@
+from django import forms
 from django.contrib import admin, messages
 from django.db import transaction
 from django.utils import timezone
+from django.utils.html import format_html
 
 from .models import (
     MerryGoRound,
@@ -12,7 +14,321 @@ from .models import (
     MerryPayment,
     MerryPaymentAllocation,
     MerryPayout,
+    MerryWallet,
+    MerryWalletTransaction,
 )
+from .services import (
+    add_seats_to_existing_member,
+    reassign_existing_clean_seat,
+    confirm_payment_and_allocate,
+)
+
+
+# =========================================================
+# SHARED HELPERS
+# =========================================================
+def get_reusable_or_free_seat_numbers(merry):
+    """
+    Selectable seats:
+    - never-used seat numbers within 1..max_seats
+    - inactive seat numbers within 1..max_seats
+
+    Not selectable:
+    - active seat numbers
+    """
+    if not merry or not merry.max_seats or merry.max_seats <= 0:
+        return []
+
+    active_taken = set(
+        MerrySeat.objects.filter(merry=merry, is_active=True).values_list("seat_no", flat=True)
+    )
+
+    selectable = []
+    for seat_no in range(1, merry.max_seats + 1):
+        if seat_no not in active_taken:
+            selectable.append(seat_no)
+
+    return selectable
+
+
+def build_seat_status_table_html(merry):
+    if not merry:
+        return "Select/save a merry first to view seat status."
+
+    seats = list(
+        MerrySeat.objects.filter(merry=merry)
+        .select_related("member", "member__user")
+        .order_by("seat_no", "id")
+    )
+
+    if merry.max_seats and merry.max_seats > 0:
+        active_lookup = {}
+        inactive_lookup = {}
+
+        for seat in seats:
+            if seat.is_active:
+                active_lookup[seat.seat_no] = seat
+            elif seat.seat_no not in active_lookup and seat.seat_no not in inactive_lookup:
+                inactive_lookup[seat.seat_no] = seat
+
+        rows = []
+        for seat_no in range(1, merry.max_seats + 1):
+            if seat_no in active_lookup:
+                seat = active_lookup[seat_no]
+                rows.append(
+                    f"""
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat_no}</td>
+                        <td style="border:1px solid #ddd; padding:6px; color:#b91c1c;"><strong>Taken (Active)</strong></td>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat.member.user}</td>
+                        <td style="border:1px solid #ddd; padding:6px;">Yes</td>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat.payout_position or "-"}</td>
+                        <td style="border:1px solid #ddd; padding:6px; color:#6b7280;">Not selectable</td>
+                    </tr>
+                    """
+                )
+            elif seat_no in inactive_lookup:
+                seat = inactive_lookup[seat_no]
+                rows.append(
+                    f"""
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat_no}</td>
+                        <td style="border:1px solid #ddd; padding:6px; color:#92400e;"><strong>Inactive / Reusable</strong></td>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat.member.user}</td>
+                        <td style="border:1px solid #ddd; padding:6px;">No</td>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat.payout_position or "-"}</td>
+                        <td style="border:1px solid #ddd; padding:6px; color:#166534;">Selectable</td>
+                    </tr>
+                    """
+                )
+            else:
+                rows.append(
+                    f"""
+                    <tr>
+                        <td style="border:1px solid #ddd; padding:6px;">{seat_no}</td>
+                        <td style="border:1px solid #ddd; padding:6px; color:#166534;"><strong>Available</strong></td>
+                        <td style="border:1px solid #ddd; padding:6px;">-</td>
+                        <td style="border:1px solid #ddd; padding:6px;">-</td>
+                        <td style="border:1px solid #ddd; padding:6px;">-</td>
+                        <td style="border:1px solid #ddd; padding:6px; color:#166534;">Selectable</td>
+                    </tr>
+                    """
+                )
+
+        return format_html(
+            """
+            <div style="margin-top:10px;">
+                <p><strong>Seat Status Table</strong></p>
+                <p>
+                    <span style="color:#b91c1c;"><strong>Taken (Active)</strong></span> = currently assigned and not selectable.<br>
+                    <span style="color:#92400e;"><strong>Inactive / Reusable</strong></span> = previously used but inactive and selectable.<br>
+                    <span style="color:#166534;"><strong>Available</strong></span> = never used and selectable.
+                </p>
+                <div style="overflow-x:auto; max-height:320px; border:1px solid #ddd;">
+                    <table style="width:100%; border-collapse:collapse;">
+                        <thead style="background:#f8f8f8; position:sticky; top:0;">
+                            <tr>
+                                <th style="border:1px solid #ddd; padding:6px;">Seat No</th>
+                                <th style="border:1px solid #ddd; padding:6px;">Status</th>
+                                <th style="border:1px solid #ddd; padding:6px;">Current / Last Member</th>
+                                <th style="border:1px solid #ddd; padding:6px;">Seat Active</th>
+                                <th style="border:1px solid #ddd; padding:6px;">Payout Position</th>
+                                <th style="border:1px solid #ddd; padding:6px;">Selection</th>
+                            </tr>
+                        </thead>
+                        <tbody>{}</tbody>
+                    </table>
+                </div>
+            </div>
+            """,
+            format_html("".join(rows)),
+        )
+
+    if not seats:
+        return format_html(
+            """
+            <div style="margin-top:10px;">
+                <p><strong>Seat Status Table</strong></p>
+                <p>This merry has unlimited seats and no seat range to select from.</p>
+                <p>Seat checkbox selection works best when <strong>max_seats</strong> is set.</p>
+            </div>
+            """
+        )
+
+    rows = []
+    for seat in seats:
+        label = "Taken (Active)" if seat.is_active else "Inactive / Reusable"
+        color = "#b91c1c" if seat.is_active else "#92400e"
+        rows.append(
+            f"""
+            <tr>
+                <td style="border:1px solid #ddd; padding:6px;">{seat.seat_no}</td>
+                <td style="border:1px solid #ddd; padding:6px; color:{color};"><strong>{label}</strong></td>
+                <td style="border:1px solid #ddd; padding:6px;">{seat.member.user}</td>
+                <td style="border:1px solid #ddd; padding:6px;">{"Yes" if seat.is_active else "No"}</td>
+                <td style="border:1px solid #ddd; padding:6px;">{seat.payout_position or "-"}</td>
+                <td style="border:1px solid #ddd; padding:6px;">Seat selection requires max_seats</td>
+            </tr>
+            """
+        )
+
+    return format_html(
+        """
+        <div style="margin-top:10px;">
+            <p><strong>Seat Status Table</strong></p>
+            <p>This merry has unlimited seats. Set <strong>max_seats</strong> to enable admin seat selection by checkboxes.</p>
+            <div style="overflow-x:auto; max-height:320px; border:1px solid #ddd;">
+                <table style="width:100%; border-collapse:collapse;">
+                    <thead style="background:#f8f8f8; position:sticky; top:0;">
+                        <tr>
+                            <th style="border:1px solid #ddd; padding:6px;">Seat No</th>
+                            <th style="border:1px solid #ddd; padding:6px;">Status</th>
+                            <th style="border:1px solid #ddd; padding:6px;">Current / Last Member</th>
+                            <th style="border:1px solid #ddd; padding:6px;">Seat Active</th>
+                            <th style="border:1px solid #ddd; padding:6px;">Payout Position</th>
+                            <th style="border:1px solid #ddd; padding:6px;">Selection</th>
+                        </tr>
+                    </thead>
+                    <tbody>{}</tbody>
+                </table>
+            </div>
+        </div>
+        """,
+        format_html("".join(rows)),
+    )
+
+
+# =========================================================
+# FORMS
+# =========================================================
+class MerryJoinRequestAdminForm(forms.ModelForm):
+    available_seat_selection = forms.MultipleChoiceField(
+        required=False,
+        choices=[],
+        widget=forms.CheckboxSelectMultiple,
+        help_text="Select only from reusable/available seats below.",
+    )
+
+    class Meta:
+        model = MerryJoinRequest
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        merry = None
+        if self.instance and self.instance.pk and self.instance.merry_id:
+            merry = self.instance.merry
+
+        if merry and merry.max_seats and merry.max_seats > 0:
+            seat_choices = get_reusable_or_free_seat_numbers(merry)
+            self.fields["available_seat_selection"].choices = [
+                (str(n), f"Seat {n}") for n in seat_choices
+            ]
+        else:
+            self.fields["available_seat_selection"].choices = []
+            self.fields["available_seat_selection"].help_text = (
+                "Seat selection works only when max_seats is set on this merry."
+            )
+
+    def clean_available_seat_selection(self):
+        values = self.cleaned_data.get("available_seat_selection") or []
+        try:
+            return [int(v) for v in values]
+        except (ValueError, TypeError):
+            raise forms.ValidationError("Selected seats are invalid.")
+
+    def clean(self):
+        cleaned = super().clean()
+
+        status = cleaned.get("status")
+        requested_seats = cleaned.get("requested_seats")
+        merry = cleaned.get("merry") or getattr(self.instance, "merry", None)
+        selected = cleaned.get("available_seat_selection") or []
+
+        if status == "APPROVED":
+            if not merry or not merry.max_seats or merry.max_seats <= 0:
+                raise forms.ValidationError(
+                    "This merry must have max_seats set before admin can assign seats from the seat table."
+                )
+
+            if not selected:
+                raise forms.ValidationError(
+                    "You must select seat(s) from the seat table before approving."
+                )
+
+            if requested_seats and len(selected) != requested_seats:
+                raise forms.ValidationError(
+                    f"You must select exactly {requested_seats} seat(s)."
+                )
+
+        return cleaned
+
+
+class MerryMemberAdminForm(forms.ModelForm):
+    available_seat_selection = forms.MultipleChoiceField(
+        required=False,
+        choices=[],
+        widget=forms.CheckboxSelectMultiple,
+        help_text="Select only from reusable/available seats below.",
+    )
+
+    class Meta:
+        model = MerryMember
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        merry = None
+        if self.instance and self.instance.pk and self.instance.merry_id:
+            merry = self.instance.merry
+
+        if merry and merry.max_seats and merry.max_seats > 0:
+            seat_choices = get_reusable_or_free_seat_numbers(merry)
+            self.fields["available_seat_selection"].choices = [
+                (str(n), f"Seat {n}") for n in seat_choices
+            ]
+        else:
+            self.fields["available_seat_selection"].choices = []
+            self.fields["available_seat_selection"].help_text = (
+                "Seat selection works only when max_seats is set on this merry."
+            )
+
+    def clean_available_seat_selection(self):
+        values = self.cleaned_data.get("available_seat_selection") or []
+        try:
+            return [int(v) for v in values]
+        except (ValueError, TypeError):
+            raise forms.ValidationError("Selected seats are invalid.")
+
+
+class MerrySeatAdminForm(forms.ModelForm):
+    transfer_to_member = forms.ModelChoiceField(
+        queryset=MerryMember.objects.none(),
+        required=False,
+        help_text="Optional. Select another active member in the same merry to transfer this clean seat.",
+    )
+
+    class Meta:
+        model = MerrySeat
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        instance = getattr(self, "instance", None)
+        if instance and instance.pk and instance.merry_id:
+            self.fields["transfer_to_member"].queryset = (
+                MerryMember.objects.filter(
+                    merry_id=instance.merry_id,
+                    is_active=True,
+                )
+                .select_related("user", "merry")
+                .order_by("user__username", "id")
+            )
+        else:
+            self.fields["transfer_to_member"].queryset = MerryMember.objects.none()
 
 
 # =========================================================
@@ -43,30 +359,6 @@ def generate_current_period_dues(modeladmin, request, queryset):
 # =========================================================
 # ACTIONS: JOIN REQUESTS
 # =========================================================
-@admin.action(description="Approve selected join requests")
-def approve_join_requests(modeladmin, request, queryset):
-    count = 0
-
-    for jr in queryset.select_related("merry", "user"):
-        try:
-            if jr.status == "PENDING":
-                jr.approve(request.user)
-                count += 1
-        except Exception as e:
-            modeladmin.message_user(
-                request,
-                f"JoinRequest #{jr.id} failed: {e}",
-                level=messages.ERROR,
-            )
-
-    if count:
-        modeladmin.message_user(
-            request,
-            f"{count} join request(s) approved.",
-            level=messages.SUCCESS,
-        )
-
-
 @admin.action(description="Reject selected join requests")
 def reject_join_requests(modeladmin, request, queryset):
     count = 0
@@ -109,7 +401,7 @@ def recalc_due_statuses(modeladmin, request, queryset):
     count = 0
     for due in queryset:
         due.recalc_status()
-        due.save(update_fields=["status"])
+        due.save(update_fields=["status", "updated_at"])
         count += 1
 
     modeladmin.message_user(
@@ -124,110 +416,17 @@ def recalc_due_statuses(modeladmin, request, queryset):
 # =========================================================
 @admin.action(description="Mark selected payments as confirmed")
 def confirm_payments(modeladmin, request, queryset):
-    """
-    Practical admin helper:
-    - marks payment CONFIRMED
-    - stamps paid_at if missing
-    - allocates into dues
-    """
     count = 0
 
     for payment in queryset.select_related("merry", "beneficiary_member"):
         try:
             with transaction.atomic():
-                p = MerryPayment.objects.select_for_update().get(pk=payment.pk)
-
-                if p.status == "CONFIRMED":
-                    continue
-
-                if p.status in ("FAILED", "CANCELLED"):
-                    raise ValueError(f"Cannot confirm payment from status {p.status}.")
-
-                p.status = "CONFIRMED"
-                if not p.paid_at:
-                    p.paid_at = timezone.now()
-                p.save(update_fields=["status", "paid_at"])
-
-                # allocate to dues
-                remaining = p.amount
-                period_key = p.period_key
-                merry = p.merry
-                member = p.beneficiary_member
-
-                safety = 0
-                while remaining > 0:
-                    safety += 1
-                    if safety > 2000:
-                        raise ValueError("Allocation safety limit reached.")
-
-                    merry.ensure_dues_for_period(period_key=period_key)
-
-                    dues = list(
-                        MerryContributionDue.objects.select_for_update()
-                        .filter(
-                            merry=merry,
-                            seat__member=member,
-                            seat__is_active=True,
-                            period_key=period_key,
-                            status__in=["PENDING", "PARTIAL"],
-                        )
-                        .select_related("seat")
-                        .order_by("slot_no", "seat__seat_no", "id")
-                    )
-
-                    any_needed = False
-
-                    for due in dues:
-                        need = (due.due_amount or 0) - (due.paid_amount or 0)
-                        if need <= 0:
-                            continue
-
-                        any_needed = True
-                        alloc = remaining if remaining < need else need
-                        if alloc <= 0:
-                            continue
-
-                        allocation, _ = MerryPaymentAllocation.objects.get_or_create(
-                            payment=p,
-                            due=due,
-                            defaults={"amount_allocated": 0},
-                        )
-                        allocation.amount_allocated = (allocation.amount_allocated or 0) + alloc
-                        allocation.full_clean()
-                        allocation.save(update_fields=["amount_allocated"])
-
-                        due.paid_amount = (due.paid_amount or 0) + alloc
-                        due.recalc_status()
-                        due.save(update_fields=["paid_amount", "status", "updated_at"])
-
-                        remaining -= alloc
-                        if remaining <= 0:
-                            break
-
-                    if remaining <= 0:
-                        break
-
-                    if merry.payout_frequency == "MONTHLY":
-                        year = int(period_key[:4])
-                        month = int(period_key.split("-")[1])
-                        month += 1
-                        if month == 13:
-                            month = 1
-                            year += 1
-                        period_key = f"{year:04d}-{month:02d}"
-                    else:
-                        year = int(period_key[:4])
-                        week = int(period_key.split("-W")[1])
-                        from datetime import date, timedelta
-                        d = date.fromisocalendar(year, week, 1) + timedelta(days=7)
-                        y, w, _ = d.isocalendar()
-                        period_key = f"{y:04d}-W{w:02d}"
-
-                    if not any_needed:
-                        continue
-
+                confirm_payment_and_allocate(
+                    payment_id=payment.id,
+                    mpesa_receipt_number=payment.mpesa_receipt_number,
+                    paid_at=payment.paid_at or timezone.now(),
+                )
                 count += 1
-
         except Exception as e:
             modeladmin.message_user(
                 request,
@@ -345,6 +544,7 @@ class MerryContributionDueInline(admin.TabularInline):
         "paid_amount",
         "status",
         "due_date",
+        "is_advance_payable",
         "updated_at",
     )
     readonly_fields = ("updated_at",)
@@ -362,6 +562,24 @@ class MerryPaymentAllocationInline(admin.TabularInline):
     extra = 0
     fields = ("due", "amount_allocated", "created_at")
     readonly_fields = ("created_at",)
+
+
+class MerryWalletTransactionInline(admin.TabularInline):
+    model = MerryWalletTransaction
+    extra = 0
+    fields = (
+        "tx_type",
+        "amount",
+        "balance_before",
+        "balance_after",
+        "reference",
+        "narration",
+        "mpesa_receipt_number",
+        "created_at",
+    )
+    readonly_fields = fields
+    can_delete = False
+    show_change_link = True
 
 
 # =========================================================
@@ -512,6 +730,8 @@ class MerrySlotConfigAdmin(admin.ModelAdmin):
 # =========================================================
 @admin.register(MerryMember)
 class MerryMemberAdmin(admin.ModelAdmin):
+    form = MerryMemberAdminForm
+
     list_display = (
         "id",
         "merry",
@@ -528,12 +748,58 @@ class MerryMemberAdmin(admin.ModelAdmin):
     )
     ordering = ("-id",)
     list_select_related = ("merry", "user")
-    readonly_fields = ("joined_at",)
+    readonly_fields = ("joined_at", "seat_status_preview")
+
+    fieldsets = (
+        ("Member", {
+            "fields": (
+                "merry",
+                "user",
+                "is_active",
+                "joined_at",
+            )
+        }),
+        ("Seat Status", {
+            "fields": (
+                "seat_status_preview",
+            ),
+            "description": "Select from reusable or available seats only.",
+        }),
+        ("Select Seats", {
+            "fields": (
+                "available_seat_selection",
+            ),
+            "description": "Choose the seat numbers to add to this member.",
+        }),
+    )
 
     def seat_count_display(self, obj):
         return obj.seats.filter(is_active=True).count()
 
     seat_count_display.short_description = "Active Seats"
+
+    def seat_status_preview(self, obj):
+        merry = obj.merry if obj and obj.pk and obj.merry_id else None
+        return build_seat_status_table_html(merry)
+
+    seat_status_preview.short_description = "Seat Status"
+
+    def save_model(self, request, obj, form, change):
+        selected_seats = form.cleaned_data.get("available_seat_selection") or []
+
+        super().save_model(request, obj, form, change)
+
+        if change and selected_seats:
+            seats = add_seats_to_existing_member(
+                admin_user=request.user,
+                member_id=obj.id,
+                assigned_seat_numbers=selected_seats,
+            )
+            self.message_user(
+                request,
+                f"Added seat(s) to member: {', '.join(str(seat.seat_no) for seat in seats)}",
+                level=messages.SUCCESS,
+            )
 
 
 # =========================================================
@@ -541,6 +807,8 @@ class MerryMemberAdmin(admin.ModelAdmin):
 # =========================================================
 @admin.register(MerrySeat)
 class MerrySeatAdmin(admin.ModelAdmin):
+    form = MerrySeatAdminForm
+
     list_display = (
         "id",
         "merry",
@@ -559,12 +827,63 @@ class MerrySeatAdmin(admin.ModelAdmin):
     )
     ordering = ("merry", "payout_position", "id")
     list_select_related = ("merry", "member", "member__user")
-    readonly_fields = ("created_at",)
+    readonly_fields = ("created_at", "seat_status_preview")
+
+    fieldsets = (
+        ("Seat", {
+            "fields": (
+                "merry",
+                "member",
+                "seat_no",
+                "payout_position",
+                "is_active",
+                "created_at",
+            )
+        }),
+        ("Seat Status", {
+            "fields": (
+                "seat_status_preview",
+            ),
+            "description": "Active seats are taken. Inactive seats are reusable.",
+        }),
+        ("Transfer Clean Seat", {
+            "fields": (
+                "transfer_to_member",
+            ),
+            "description": (
+                "Optional. Transfer this seat to another active member in the same merry. "
+                "Works only if the seat has no dues/payout history."
+            ),
+        }),
+    )
 
     def member_user_display(self, obj):
         return obj.member.user
 
     member_user_display.short_description = "User"
+
+    def seat_status_preview(self, obj):
+        merry = obj.merry if obj and obj.pk and obj.merry_id else None
+        return build_seat_status_table_html(merry)
+
+    seat_status_preview.short_description = "Seat Status"
+
+    def save_model(self, request, obj, form, change):
+        transfer_to_member = form.cleaned_data.get("transfer_to_member")
+
+        super().save_model(request, obj, form, change)
+
+        if change and transfer_to_member and transfer_to_member.id != obj.member_id:
+            updated_seat = reassign_existing_clean_seat(
+                admin_user=request.user,
+                seat_id=obj.id,
+                new_member_id=transfer_to_member.id,
+            )
+            self.message_user(
+                request,
+                f"Seat {updated_seat.seat_no} transferred to {updated_seat.member.user}.",
+                level=messages.SUCCESS,
+            )
 
 
 # =========================================================
@@ -572,6 +891,8 @@ class MerrySeatAdmin(admin.ModelAdmin):
 # =========================================================
 @admin.register(MerryJoinRequest)
 class MerryJoinRequestAdmin(admin.ModelAdmin):
+    form = MerryJoinRequestAdminForm
+
     list_display = (
         "id",
         "merry",
@@ -598,8 +919,8 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
     )
     ordering = ("-id",)
     list_select_related = ("merry", "user", "reviewed_by")
-    readonly_fields = ("created_at", "reviewed_at")
-    actions = [approve_join_requests, reject_join_requests]
+    readonly_fields = ("created_at", "reviewed_at", "seat_status_preview")
+    actions = [reject_join_requests]
 
     fieldsets = (
         ("Request", {
@@ -611,6 +932,18 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 "note",
             )
         }),
+        ("Seat Status", {
+            "fields": (
+                "seat_status_preview",
+            ),
+            "description": "Select from reusable or available seats only.",
+        }),
+        ("Select Seats", {
+            "fields": (
+                "available_seat_selection",
+            ),
+            "description": "Choose the seat numbers to assign to this join request.",
+        }),
         ("Review", {
             "fields": (
                 "reviewed_by",
@@ -620,11 +953,68 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         }),
     )
 
+    def get_readonly_fields(self, request, obj=None):
+        ro = ["created_at", "reviewed_at", "seat_status_preview"]
+        if obj and obj.status == "APPROVED":
+            ro.extend([
+                "merry",
+                "user",
+                "requested_seats",
+                "status",
+                "note",
+                "reviewed_by",
+                "available_seat_selection",
+            ])
+        return ro
+
     def merry_open_display(self, obj):
         return obj.merry.is_open
 
     merry_open_display.boolean = True
     merry_open_display.short_description = "Merry Open"
+
+    def seat_status_preview(self, obj):
+        merry = obj.merry if obj and obj.pk and obj.merry_id else None
+        return build_seat_status_table_html(merry)
+
+    seat_status_preview.short_description = "Seat Status"
+
+    def save_model(self, request, obj, form, change):
+        selected_seats = form.cleaned_data.get("available_seat_selection") or []
+
+        if change:
+            old_obj = MerryJoinRequest.objects.select_related("merry", "user").get(pk=obj.pk)
+
+            if old_obj.status == "PENDING" and obj.status == "APPROVED":
+                member, seats = old_obj.approve(
+                    request.user,
+                    assigned_seat_numbers=selected_seats,
+                )
+                self.message_user(
+                    request,
+                    f"Join request approved. Seats assigned: {', '.join(str(seat.seat_no) for seat in seats)}",
+                    level=messages.SUCCESS,
+                )
+                return
+
+            if old_obj.status == "PENDING" and obj.status == "REJECTED":
+                old_obj.reject(request.user, note=obj.note or "")
+                self.message_user(
+                    request,
+                    "Join request rejected.",
+                    level=messages.WARNING,
+                )
+                return
+
+            if old_obj.status == "APPROVED":
+                self.message_user(
+                    request,
+                    "Approved join requests are historical records and were not reprocessed.",
+                    level=messages.INFO,
+                )
+                return
+
+        super().save_model(request, obj, form, change)
 
 
 # =========================================================
@@ -644,6 +1034,7 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "outstanding_display",
         "status",
         "due_date",
+        "is_advance_payable",
         "updated_at",
     )
     list_filter = (
@@ -652,6 +1043,7 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "slot_no",
         "merry",
         "due_date",
+        "is_advance_payable",
     )
     search_fields = (
         "merry__name",
@@ -659,7 +1051,7 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "seat__member__user__phone",
         "period_key",
     )
-    ordering = ("-id",)
+    ordering = ("due_date", "slot_no", "id")
     list_select_related = ("merry", "seat", "seat__member", "seat__member__user")
     readonly_fields = ("created_at", "updated_at")
     actions = [cancel_dues, recalc_due_statuses]
@@ -741,6 +1133,122 @@ class MerryPaymentAllocationAdmin(admin.ModelAdmin):
     ordering = ("id",)
     list_select_related = ("payment", "due")
     readonly_fields = ("created_at",)
+
+
+# =========================================================
+# WALLET ADMIN
+# =========================================================
+@admin.register(MerryWallet)
+class MerryWalletAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "user",
+        "balance",
+        "last_updated_display",
+        "tx_count_display",
+        "created_at",
+    )
+    list_filter = ("created_at", "updated_at")
+    search_fields = (
+        "user__username",
+        "user__phone",
+        "user__email",
+    )
+    ordering = ("-updated_at", "-id")
+    list_select_related = ("user",)
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+        "tx_count_display",
+    )
+    inlines = [MerryWalletTransactionInline]
+
+    fieldsets = (
+        ("Wallet", {
+            "fields": (
+                "user",
+                "balance",
+                "created_at",
+                "updated_at",
+                "tx_count_display",
+            )
+        }),
+    )
+
+    def last_updated_display(self, obj):
+        return obj.updated_at
+
+    last_updated_display.short_description = "Updated At"
+
+    def tx_count_display(self, obj):
+        return obj.user.merry_wallet_transactions.count()
+
+    tx_count_display.short_description = "Transactions"
+
+
+@admin.register(MerryWalletTransaction)
+class MerryWalletTransactionAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "user",
+        "tx_type",
+        "amount",
+        "balance_before",
+        "balance_after",
+        "reference",
+        "mpesa_receipt_number",
+        "created_at",
+    )
+    list_filter = (
+        "tx_type",
+        "created_at",
+    )
+    search_fields = (
+        "user__username",
+        "user__phone",
+        "reference",
+        "narration",
+        "mpesa_receipt_number",
+    )
+    ordering = ("-id",)
+    list_select_related = ("user",)
+    readonly_fields = (
+        "user",
+        "tx_type",
+        "amount",
+        "balance_before",
+        "balance_after",
+        "reference",
+        "narration",
+        "mpesa_receipt_number",
+        "created_at",
+    )
+
+    fieldsets = (
+        ("Wallet Transaction", {
+            "fields": (
+                "user",
+                "tx_type",
+                "amount",
+                "balance_before",
+                "balance_after",
+            )
+        }),
+        ("Reference", {
+            "fields": (
+                "reference",
+                "mpesa_receipt_number",
+                "narration",
+                "created_at",
+            )
+        }),
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # =========================================================

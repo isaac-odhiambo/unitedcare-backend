@@ -396,3 +396,5 @@ class GuarantorCandidateSerializer(serializers.ModelSerializer):
             return username
 
         return str(obj)
+class LoanRejectSerializer(serializers.Serializer):
+    rejection_reason = serializers.CharField()

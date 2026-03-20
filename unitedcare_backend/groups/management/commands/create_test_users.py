@@ -15,8 +15,8 @@ User = get_user_model()
 
 class Command(BaseCommand):
     help = (
-        "Create chama test users and seed backdated group + savings history "
-        "for Jan, Feb, Mar 2026 loan eligibility checks."
+        "Create chama test users and seed backdated rolling 3-month group + savings history "
+        "for loan eligibility checks."
     )
 
     @transaction.atomic
@@ -51,9 +51,15 @@ class Command(BaseCommand):
             },
         )
 
-        if group.created_by_id is None:
+        group_changed = False
+        if getattr(group, "created_by_id", None) is None:
             group.created_by = admin_user
-            group.save(update_fields=["created_by"])
+            group_changed = True
+        if hasattr(group, "is_active") and not group.is_active:
+            group.is_active = True
+            group_changed = True
+        if group_changed:
+            group.save()
 
         GroupFund.objects.get_or_create(group=group)
 
@@ -119,6 +125,7 @@ class Command(BaseCommand):
         self.seed_required_savings_months(seeded_users)
 
         fund = GroupFund.objects.get(group=group)
+        seeded_months = ", ".join(dt.strftime("%Y-%m") for dt in self.get_required_month_dates())
 
         self.stdout.write(self.style.WARNING(
             "⚠️ KYCProfile was not auto-created because your KYC model requires image files."
@@ -133,7 +140,34 @@ class Command(BaseCommand):
         self.stdout.write(f"Group: {group.name}")
         self.stdout.write(f"Loan product: {loan_product.name}")
         self.stdout.write(f"Group fund balance: {fund.balance}")
-        self.stdout.write("Seeded required months: 2026-01, 2026-02, 2026-03")
+        self.stdout.write(f"Seeded required months: {seeded_months}")
+
+    def get_required_month_dates(self):
+        """
+        Returns aware datetimes for:
+        - two months ago
+        - one month ago
+        - current month
+        """
+        today = timezone.localdate()
+        current_month = today.replace(day=1)
+        prev_month = self.prev_month_start(current_month)
+        prev2_month = self.prev_month_start(prev_month)
+
+        months = [prev2_month, prev_month, current_month]
+        dates = []
+        days = [10, 15, 20]
+
+        for month_start, day in zip(months, days):
+            dt = datetime(month_start.year, month_start.month, day, 10, 0, 0)
+            dates.append(timezone.make_aware(dt))
+
+        return dates
+
+    def prev_month_start(self, d):
+        if d.month == 1:
+            return d.replace(year=d.year - 1, month=12, day=1)
+        return d.replace(month=d.month - 1, day=1)
 
     def create_or_update_user(
         self,
@@ -162,22 +196,22 @@ class Command(BaseCommand):
         changed = False
 
         if not created:
-            if user.username != username:
+            if getattr(user, "username", None) != username:
                 user.username = username
                 changed = True
-            if user.email != email:
+            if getattr(user, "email", None) != email:
                 user.email = email
                 changed = True
-            if user.id_number != id_number:
+            if getattr(user, "id_number", None) != id_number:
                 user.id_number = id_number
                 changed = True
-            if user.role != role:
+            if getattr(user, "role", None) != role:
                 user.role = role
                 changed = True
-            if user.status != status:
+            if getattr(user, "status", None) != status:
                 user.status = status
                 changed = True
-            if user.is_active != is_active:
+            if getattr(user, "is_active", None) != is_active:
                 user.is_active = is_active
                 changed = True
 
@@ -190,14 +224,10 @@ class Command(BaseCommand):
         return user
 
     def seed_required_group_months(self, group, seeded_users):
-        required_dates = [
-            timezone.make_aware(datetime(2026, 1, 15, 10, 0, 0)),
-            timezone.make_aware(datetime(2026, 2, 15, 10, 0, 0)),
-            timezone.make_aware(datetime(2026, 3, 10, 10, 0, 0)),
-        ]
+        required_dates = self.get_required_month_dates()
 
         for i, user in seeded_users:
-            monthly_amount = Decimal(str(500 + (i * 100)))  # 600 ... 1500
+            monthly_amount = Decimal(str(500 + (i * 100)))
 
             for dt in required_dates:
                 month_key = dt.strftime("%Y-%m")
@@ -209,42 +239,36 @@ class Command(BaseCommand):
                     reference=reference,
                 ).exists()
 
-                if not exists:
-                    contribution = GroupContribution(
-                        group=group,
-                        user=user,
-                        amount=monthly_amount,
-                        source="MANUAL",
-                        reference=reference,
-                        note=f"Seeded monthly group contribution for {month_key}",
-                        created_at=dt,
-                    )
-                    contribution.save()
+                if exists:
+                    continue
+
+                contribution = GroupContribution.objects.create(
+                    group=group,
+                    user=user,
+                    amount=monthly_amount,
+                    source="MANUAL",
+                    reference=reference,
+                    note=f"Seeded monthly group contribution for {month_key}",
+                )
+
+                if hasattr(contribution, "created_at"):
+                    GroupContribution.objects.filter(pk=contribution.pk).update(created_at=dt)
 
     def seed_required_savings_months(self, seeded_users):
-        """
-        Tries to seed savings history for Jan/Feb/Mar 2026 using common model names.
-        This is best-effort because your exact savings models were not shared.
-        """
-
         SavingsAccount = self.safe_get_model("savings", "SavingsAccount")
         SavingsDeposit = self.safe_get_model("savings", "SavingsDeposit")
         SavingsTransaction = self.safe_get_model("savings", "SavingsTransaction")
         MpesaTransaction = self.safe_get_model("merry", "MpesaTransaction")
         PaymentLedger = self.safe_get_model("merry", "PaymentLedger")
 
-        required_dates = [
-            timezone.make_aware(datetime(2026, 1, 15, 9, 0, 0)),
-            timezone.make_aware(datetime(2026, 2, 15, 9, 0, 0)),
-            timezone.make_aware(datetime(2026, 3, 10, 9, 0, 0)),
-        ]
+        required_dates = self.get_required_month_dates()
 
         savings_accounts = {}
         if SavingsAccount:
             savings_accounts = self.ensure_savings_accounts(SavingsAccount, seeded_users)
 
         for i, user in seeded_users:
-            deposit_amount = Decimal(str(500 + (i * 100)))  # 600 ... 1500
+            deposit_amount = Decimal(str(500 + (i * 100)))
             savings_account = savings_accounts.get(user.id)
 
             for dt in required_dates:
@@ -255,7 +279,7 @@ class Command(BaseCommand):
 
                 if SavingsDeposit:
                     created_any = self.try_create_savings_deposit(
-                        SavingsDeposit= SavingsDeposit,
+                        SavingsDeposit=SavingsDeposit,
                         user=user,
                         savings_account=savings_account,
                         amount=deposit_amount,
@@ -265,7 +289,7 @@ class Command(BaseCommand):
 
                 if SavingsTransaction:
                     created_any = self.try_create_savings_transaction(
-                        SavingsTransaction= SavingsTransaction,
+                        SavingsTransaction=SavingsTransaction,
                         user=user,
                         savings_account=savings_account,
                         amount=deposit_amount,
@@ -275,7 +299,7 @@ class Command(BaseCommand):
 
                 if MpesaTransaction:
                     created_any = self.try_create_mpesa_savings_tx(
-                        MpesaTransaction= MpesaTransaction,
+                        MpesaTransaction=MpesaTransaction,
                         user=user,
                         amount=deposit_amount,
                         reference=reference,
@@ -284,16 +308,18 @@ class Command(BaseCommand):
 
                 if PaymentLedger:
                     created_any = self.try_create_payment_ledger(
-                        PaymentLedger= PaymentLedger,
+                        PaymentLedger=PaymentLedger,
                         user=user,
                         amount=deposit_amount,
                         reference=reference,
                         dt=dt,
                     ) or created_any
 
-                # If only SavingsAccount exists, at least keep balance healthy
-                if savings_account and not created_any:
-                    self.bump_savings_account_balance(savings_account, deposit_amount)
+                if savings_account:
+                    self.bump_savings_account_balance_if_needed(
+                        savings_account=savings_account,
+                        amount=deposit_amount,
+                    )
 
     def ensure_savings_accounts(self, SavingsAccount, seeded_users):
         model_fields = {f.name for f in SavingsAccount._meta.fields}
@@ -321,6 +347,8 @@ class Command(BaseCommand):
                 defaults["balance"] = opening_balance
             if "available_balance" in model_fields:
                 defaults["available_balance"] = opening_balance
+            if "reserved_amount" in model_fields:
+                defaults["reserved_amount"] = Decimal("0.00")
             if "target_amount" in model_fields:
                 defaults["target_amount"] = Decimal("0.00")
             if "status" in model_fields:
@@ -333,10 +361,38 @@ class Command(BaseCommand):
                 defaults["opened_at"] = opened_at
 
             try:
-                obj, _ = SavingsAccount.objects.get_or_create(
+                obj, created = SavingsAccount.objects.get_or_create(
                     user=user,
                     defaults=defaults,
                 )
+
+                changed = False
+
+                if not created:
+                    if "account_type" in model_fields and getattr(obj, "account_type", None) != "FLEXIBLE":
+                        obj.account_type = "FLEXIBLE"
+                        changed = True
+                    if "is_active" in model_fields and not bool(getattr(obj, "is_active", False)):
+                        obj.is_active = True
+                        changed = True
+                    if "status" in model_fields and getattr(obj, "status", None) != "ACTIVE":
+                        obj.status = "ACTIVE"
+                        changed = True
+                    if "reserved_amount" in model_fields and getattr(obj, "reserved_amount", None) is None:
+                        obj.reserved_amount = Decimal("0.00")
+                        changed = True
+                    if "balance" in model_fields and (getattr(obj, "balance", Decimal("0.00")) or Decimal("0.00")) <= 0:
+                        obj.balance = opening_balance
+                        changed = True
+                    if "available_balance" in model_fields and (
+                        getattr(obj, "available_balance", Decimal("0.00")) or Decimal("0.00")
+                    ) <= 0:
+                        obj.available_balance = opening_balance
+                        changed = True
+
+                    if changed:
+                        obj.save()
+
                 results[user.id] = obj
             except Exception as exc:
                 self.stdout.write(self.style.WARNING(
@@ -380,7 +436,19 @@ class Command(BaseCommand):
             payload["transaction_date"] = dt
 
         try:
-            SavingsDeposit.objects.create(**payload)
+            obj = SavingsDeposit.objects.create(**payload)
+
+            updates = {}
+            if "created_at" in model_fields:
+                updates["created_at"] = dt
+            if "deposited_at" in model_fields:
+                updates["deposited_at"] = dt
+            if "transaction_date" in model_fields:
+                updates["transaction_date"] = dt
+
+            if updates:
+                SavingsDeposit.objects.filter(pk=obj.pk).update(**updates)
+
             return True
         except Exception as exc:
             self.stdout.write(self.style.WARNING(
@@ -390,48 +458,71 @@ class Command(BaseCommand):
 
     def try_create_savings_transaction(self, SavingsTransaction, user, savings_account, amount, reference, dt):
         model_fields = {f.name for f in SavingsTransaction._meta.fields}
-        lookup = {"reference": reference} if "reference" in model_fields else None
 
-        if lookup and SavingsTransaction.objects.filter(**lookup).exists():
+        if "reference" in model_fields and SavingsTransaction.objects.filter(reference=reference).exists():
             return False
 
         payload = {}
 
         if "user" in model_fields:
             payload["user"] = user
+
         if "account" in model_fields and savings_account:
             payload["account"] = savings_account
-        if "savings_account" in model_fields and savings_account:
+        elif "savings_account" in model_fields and savings_account:
             payload["savings_account"] = savings_account
+
         if "amount" in model_fields:
             payload["amount"] = amount
+
         if "reference" in model_fields:
             payload["reference"] = reference
-        if "transaction_type" in model_fields:
-            payload["transaction_type"] = "DEPOSIT"
-        if "type" in model_fields:
-            payload["type"] = "DEPOSIT"
-        if "source" in model_fields:
-            payload["source"] = "MANUAL"
-        if "method" in model_fields:
-            payload["method"] = "MANUAL"
-        if "status" in model_fields:
-            payload["status"] = "SUCCESS"
-        if "note" in model_fields:
-            payload["note"] = f"Seeded savings transaction for {dt.strftime('%Y-%m')}"
-        if "description" in model_fields:
-            payload["description"] = f"Seeded savings transaction for {dt.strftime('%Y-%m')}"
-        if "created_at" in model_fields:
-            payload["created_at"] = dt
-        if "transaction_date" in model_fields:
-            payload["transaction_date"] = dt
 
         try:
-            SavingsTransaction.objects.create(**payload)
-            return True
+            obj = SavingsTransaction.objects.create(**payload)
         except Exception as exc:
             self.stdout.write(self.style.WARNING(
                 f"⚠️ SavingsTransaction create failed for {user.phone} {reference}: {exc}"
+            ))
+            return False
+
+        updates = {}
+
+        if "txn_type" in model_fields:
+            updates["txn_type"] = "DEPOSIT"
+        elif "transaction_type" in model_fields:
+            updates["transaction_type"] = "DEPOSIT"
+        elif "type" in model_fields:
+            updates["type"] = "DEPOSIT"
+
+        if "source" in model_fields:
+            updates["source"] = "MANUAL"
+
+        if "method" in model_fields:
+            updates["method"] = "MANUAL"
+
+        if "status" in model_fields:
+            updates["status"] = "SUCCESS"
+
+        if "note" in model_fields:
+            updates["note"] = f"Seeded savings transaction for {dt.strftime('%Y-%m')}"
+
+        if "description" in model_fields:
+            updates["description"] = f"Seeded savings transaction for {dt.strftime('%Y-%m')}"
+
+        if "created_at" in model_fields:
+            updates["created_at"] = dt
+
+        if "transaction_date" in model_fields:
+            updates["transaction_date"] = dt
+
+        try:
+            if updates:
+                SavingsTransaction.objects.filter(pk=obj.pk).update(**updates)
+            return True
+        except Exception as exc:
+            self.stdout.write(self.style.WARNING(
+                f"⚠️ SavingsTransaction update failed for {user.phone} {reference}: {exc}"
             ))
             return False
 
@@ -477,7 +568,17 @@ class Command(BaseCommand):
             payload["ledger_posted"] = True
 
         try:
-            MpesaTransaction.objects.create(**payload)
+            obj = MpesaTransaction.objects.create(**payload)
+
+            updates = {}
+            if "created_at" in model_fields:
+                updates["created_at"] = dt
+            if "transaction_date" in model_fields:
+                updates["transaction_date"] = dt
+
+            if updates:
+                MpesaTransaction.objects.filter(pk=obj.pk).update(**updates)
+
             return True
         except Exception as exc:
             self.stdout.write(self.style.WARNING(
@@ -488,12 +589,14 @@ class Command(BaseCommand):
     def try_create_payment_ledger(self, PaymentLedger, user, amount, reference, dt):
         model_fields = {f.name for f in PaymentLedger._meta.fields}
 
-        if "reference" in model_fields and PaymentLedger.objects.filter(
-            user=user,
-            reference=reference,
-            category="SAVINGS" if "category" in model_fields else None,
-        ).exists():
-            return False
+        if "reference" in model_fields:
+            filters = {"reference": reference}
+            if "user" in model_fields:
+                filters["user"] = user
+            if "category" in model_fields:
+                filters["category"] = "SAVINGS"
+            if PaymentLedger.objects.filter(**filters).exists():
+                return False
 
         payload = {}
 
@@ -513,7 +616,11 @@ class Command(BaseCommand):
             payload["created_at"] = dt
 
         try:
-            PaymentLedger.objects.create(**payload)
+            obj = PaymentLedger.objects.create(**payload)
+
+            if "created_at" in model_fields:
+                PaymentLedger.objects.filter(pk=obj.pk).update(created_at=dt)
+
             return True
         except Exception as exc:
             self.stdout.write(self.style.WARNING(
@@ -521,18 +628,20 @@ class Command(BaseCommand):
             ))
             return False
 
-    def bump_savings_account_balance(self, savings_account, amount):
+    def bump_savings_account_balance_if_needed(self, savings_account, amount):
         changed = False
 
         if hasattr(savings_account, "balance"):
             current = getattr(savings_account, "balance", Decimal("0.00")) or Decimal("0.00")
-            setattr(savings_account, "balance", current + amount)
-            changed = True
+            if current < amount:
+                setattr(savings_account, "balance", current + amount)
+                changed = True
 
         if hasattr(savings_account, "available_balance"):
             current = getattr(savings_account, "available_balance", Decimal("0.00")) or Decimal("0.00")
-            setattr(savings_account, "available_balance", current + amount)
-            changed = True
+            if current <= 0:
+                setattr(savings_account, "available_balance", current + amount)
+                changed = True
 
         if changed:
             savings_account.save()

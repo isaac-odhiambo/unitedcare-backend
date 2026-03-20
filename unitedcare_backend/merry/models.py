@@ -11,9 +11,16 @@
 # ✅ Less strict join-request history (only one active pending request at a time)
 # ✅ Seat numbers are now GLOBAL per merry (e.g. seat 2, 5, 19)
 # ✅ Admin can manually assign seat numbers on approval
+# ✅ Added overdue support
+# ✅ Added next-due / advance-pay support
+# ✅ Added due-date generation from slot config
+# ✅ Added merry wallet for excess manual/outside-app payments
+# ✅ Added merry wallet transaction history
+# ✅ FIXED wallet transaction inline support in admin
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -47,6 +54,60 @@ def _week_period_key(d=None) -> str:
 def _month_period_key(d=None) -> str:
     d = d or timezone.localdate()
     return f"{d.year:04d}-{d.month:02d}"
+
+
+def _parse_week_period_key(period_key: str) -> tuple[int, int]:
+    """
+    Example: 2026-W12 -> (2026, 12)
+    """
+    try:
+        year_part, week_part = period_key.split("-W")
+        return int(year_part), int(week_part)
+    except Exception as exc:
+        raise ValidationError(f"Invalid week period_key format: {period_key}") from exc
+
+
+def _parse_month_period_key(period_key: str) -> tuple[int, int]:
+    """
+    Example: 2026-03 -> (2026, 3)
+    """
+    try:
+        year_part, month_part = period_key.split("-")
+        return int(year_part), int(month_part)
+    except Exception as exc:
+        raise ValidationError(f"Invalid month period_key format: {period_key}") from exc
+
+
+def _first_weekday_in_month(year: int, month: int, weekday: int) -> date:
+    """
+    Returns first occurrence of weekday in given month.
+    weekday: Monday=0 ... Sunday=6
+    """
+    first_day = date(year, month, 1)
+    days_ahead = (weekday - first_day.weekday()) % 7
+    return first_day + timedelta(days=days_ahead)
+
+
+def _nth_weekday_in_month(year: int, month: int, weekday: int, n: int) -> Optional[date]:
+    """
+    Returns nth occurrence of weekday in given month, or None if not present.
+    n starts at 1.
+    """
+    if n < 1:
+        return None
+
+    first = _first_weekday_in_month(year, month, weekday)
+    candidate = first + timedelta(days=(n - 1) * 7)
+
+    if candidate.month != month:
+        return None
+    return candidate
+
+
+def _last_day_of_month(year: int, month: int) -> date:
+    if month == 12:
+        return date(year + 1, 1, 1) - timedelta(days=1)
+    return date(year, month + 1, 1) - timedelta(days=1)
 
 
 # ----------------------------
@@ -125,6 +186,67 @@ class MerryGoRound(models.Model):
     def total_pool_per_period(self) -> Decimal:
         return self.total_pool_per_slot() * Decimal(self.payouts_per_period or 0)
 
+    def period_start_date(self, period_key: Optional[str] = None) -> Optional[date]:
+        period_key = period_key or self.current_period_key()
+
+        if self.payout_frequency == "MONTHLY":
+            year, month = _parse_month_period_key(period_key)
+            return date(year, month, 1)
+
+        year, week = _parse_week_period_key(period_key)
+        return date.fromisocalendar(year, week, 1)  # Monday
+
+    def period_end_date(self, period_key: Optional[str] = None) -> Optional[date]:
+        period_key = period_key or self.current_period_key()
+
+        if self.payout_frequency == "MONTHLY":
+            year, month = _parse_month_period_key(period_key)
+            return _last_day_of_month(year, month)
+
+        year, week = _parse_week_period_key(period_key)
+        return date.fromisocalendar(year, week, 7)  # Sunday
+
+    def get_slot_due_date(self, period_key: str, slot_no: int) -> Optional[date]:
+        """
+        Uses MerrySlotConfig when available.
+
+        WEEKLY:
+          - due date is the configured weekday inside that ISO week.
+
+        MONTHLY:
+          - due date is the nth occurrence of configured weekday in that month,
+            where n == slot_no. If nth occurrence doesn't exist, falls back to
+            the last occurrence within the month.
+
+        If no slot config exists for the slot, returns None.
+        """
+        slot_cfg = self.slot_configs.filter(slot_no=slot_no).first()
+        if not slot_cfg:
+            return None
+
+        weekday = int(slot_cfg.weekday)
+
+        if self.payout_frequency == "MONTHLY":
+            year, month = _parse_month_period_key(period_key)
+            due_dt = _nth_weekday_in_month(year, month, weekday, slot_no)
+
+            if due_dt is not None:
+                return due_dt
+
+            last_valid = None
+            n = 1
+            while True:
+                candidate = _nth_weekday_in_month(year, month, weekday, n)
+                if candidate is None:
+                    break
+                last_valid = candidate
+                n += 1
+            return last_valid
+
+        year, week = _parse_week_period_key(period_key)
+        monday = date.fromisocalendar(year, week, 1)
+        return monday + timedelta(days=weekday)
+
     # -------- join/capacity helpers --------
     def active_seats_count(self) -> int:
         return self.seats.filter(is_active=True).count()
@@ -154,12 +276,8 @@ class MerryGoRound(models.Model):
         mx = self.seats.filter(is_active=True).aggregate(m=Max("payout_position")).get("m") or 0
         return int(mx) + 1
 
-    # ✅ NEW: global seat-number helpers
+    # -------- global seat-number helpers --------
     def available_seat_numbers(self) -> Optional[List[int]]:
-        """
-        Returns available global seat numbers for this merry if max_seats is capped.
-        If unlimited (max_seats=0), returns None because the seat range is open-ended.
-        """
         if not self.max_seats or self.max_seats <= 0:
             return None
 
@@ -169,11 +287,6 @@ class MerryGoRound(models.Model):
         return [n for n in range(1, self.max_seats + 1) if n not in taken]
 
     def next_available_seat_numbers(self, count: int) -> List[int]:
-        """
-        Auto-picks the next available global seat numbers.
-        For capped merries, chooses from 1..max_seats.
-        For unlimited merries, continues from the highest seat_no.
-        """
         if count < 1:
             raise ValidationError("count must be at least 1.")
 
@@ -209,6 +322,8 @@ class MerryGoRound(models.Model):
 
         for seat in active_seats:
             for slot_no in range(1, self.payouts_per_period + 1):
+                due_date = self.get_slot_due_date(period_key, slot_no)
+
                 _, was_created = MerryContributionDue.objects.get_or_create(
                     merry=self,
                     seat=seat,
@@ -218,7 +333,8 @@ class MerryGoRound(models.Model):
                         "due_amount": due_amt,
                         "paid_amount": Decimal("0"),
                         "status": "PENDING",
-                        "due_date": None,
+                        "due_date": due_date,
+                        "is_advance_payable": True,
                     },
                 )
                 if was_created:
@@ -378,14 +494,11 @@ class MerrySeat(models.Model):
       - gets its own payout turn
 
     seat_no is now GLOBAL inside the merry.
-    Example:
-      Member A may own seat 2, 5, 19
-      Member B may own seat 1, 7
     """
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="seats")
     member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="seats")
 
-    seat_no = models.PositiveIntegerField()  # ✅ global within merry
+    seat_no = models.PositiveIntegerField()
     payout_position = models.PositiveIntegerField(null=True, blank=True)
 
     is_active = models.BooleanField(default=True)
@@ -394,7 +507,6 @@ class MerrySeat(models.Model):
     class Meta:
         ordering = ["seat_no", "id"]
         constraints = [
-            # ✅ CHANGED: seat_no must be unique per merry, not per member
             models.UniqueConstraint(fields=["merry", "seat_no"], name="uniq_seat_no_per_merry"),
             models.UniqueConstraint(
                 fields=["merry", "payout_position"],
@@ -459,7 +571,6 @@ class MerryJoinRequest(models.Model):
     class Meta:
         ordering = ["-id"]
         constraints = [
-            # Practical: allow request history, but only ONE active pending request
             models.UniqueConstraint(
                 fields=["merry", "user"],
                 condition=Q(status="PENDING"),
@@ -531,8 +642,6 @@ class MerryJoinRequest(models.Model):
             member.joined_at = member.joined_at or timezone.now()
             member.save(update_fields=["is_active", "joined_at"])
 
-        # ✅ NEW: allow admin to assign exact global seat numbers,
-        # otherwise auto-pick available ones.
         if assigned_seat_numbers is None:
             seat_numbers = jr.merry.next_available_seat_numbers(jr.requested_seats)
         else:
@@ -622,6 +731,7 @@ class MerryContributionDue(models.Model):
     STATUS_CHOICES = (
         ("PENDING", "Pending"),
         ("PARTIAL", "Partial"),
+        ("OVERDUE", "Overdue"),
         ("PAID", "Paid"),
         ("CANCELLED", "Cancelled"),
     )
@@ -638,11 +748,13 @@ class MerryContributionDue(models.Model):
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
     due_date = models.DateField(null=True, blank=True)
 
+    is_advance_payable = models.BooleanField(default=True)
+
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["-id"]
+        ordering = ["due_date", "slot_no", "id"]
         constraints = [
             models.UniqueConstraint(
                 fields=["seat", "period_key", "slot_no"],
@@ -652,6 +764,7 @@ class MerryContributionDue(models.Model):
         indexes = [
             models.Index(fields=["merry", "period_key", "slot_no"]),
             models.Index(fields=["status", "updated_at"]),
+            models.Index(fields=["due_date", "status"]),
         ]
 
     def clean(self):
@@ -666,21 +779,46 @@ class MerryContributionDue(models.Model):
         if self.paid_amount is not None and self.paid_amount < 0:
             raise ValidationError("paid_amount cannot be negative")
 
-    def recalc_status(self):
-        if self.status == "CANCELLED":
-            return
-        paid = self.paid_amount or Decimal("0")
-        due = self.due_amount or Decimal("0")
-        if paid <= 0:
-            self.status = "PENDING"
-        elif paid < due:
-            self.status = "PARTIAL"
-        else:
-            self.status = "PAID"
-
     def outstanding(self) -> Decimal:
         out = (self.due_amount or Decimal("0")) - (self.paid_amount or Decimal("0"))
         return out if out > 0 else Decimal("0")
+
+    def is_overdue(self) -> bool:
+        if self.status in ["PAID", "CANCELLED"]:
+            return False
+        return bool(self.due_date and self.due_date < timezone.localdate())
+
+    def is_current(self) -> bool:
+        if self.status in ["PAID", "CANCELLED"]:
+            return False
+        today = timezone.localdate()
+        return bool(self.due_date and self.due_date == today)
+
+    def is_future_due(self) -> bool:
+        if self.status in ["PAID", "CANCELLED"]:
+            return False
+        return bool(self.due_date and self.due_date > timezone.localdate())
+
+    def recalc_status(self):
+        if self.status == "CANCELLED":
+            return
+
+        paid = self.paid_amount or Decimal("0")
+        due = self.due_amount or Decimal("0")
+        today = timezone.localdate()
+
+        if paid >= due:
+            self.status = "PAID"
+            return
+
+        is_past_due = bool(self.due_date and self.due_date < today)
+
+        if is_past_due:
+            self.status = "OVERDUE"
+        elif paid > 0:
+            self.status = "PARTIAL"
+        else:
+            self.status = "PENDING"
 
     def __str__(self):
         return f"Due#{self.id} seat={self.seat_id} {self.period_key} slot={self.slot_no} {self.status}"
@@ -771,6 +909,107 @@ class MerryPaymentAllocation(models.Model):
 
     def __str__(self):
         return f"Alloc#{self.id} pay={self.payment_id} due={self.due_id} amt={self.amount_allocated}"
+
+
+# ----------------------------
+# Merry Wallet
+# ----------------------------
+class MerryWallet(models.Model):
+    """
+    Stores excess merry money for a user.
+    Example:
+      - user pays 5000 via mus11
+      - 4000 clears active merry dues
+      - 1000 remains here for future merry dues
+    """
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="merry_wallet",
+    )
+    balance = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["user_id"]
+        verbose_name = "Merry Wallet"
+        verbose_name_plural = "Merry Wallets"
+        indexes = [
+            models.Index(fields=["user"]),
+            models.Index(fields=["updated_at"]),
+        ]
+
+    def clean(self):
+        if self.balance is not None and self.balance < 0:
+            raise ValidationError("Wallet balance cannot be negative.")
+
+    def __str__(self):
+        return f"MerryWallet user={self.user_id} balance={self.balance}"
+
+
+class MerryWalletTransaction(models.Model):
+    """
+    Wallet audit trail.
+    CREDIT:
+      - excess payment moved into wallet
+    DEBIT:
+      - wallet used to settle future merry dues
+    """
+    TX_TYPES = (
+        ("CREDIT", "Credit"),
+        ("DEBIT", "Debit"),
+    )
+
+    wallet = models.ForeignKey(
+        MerryWallet,
+        on_delete=models.CASCADE,
+        related_name="transactions",
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="merry_wallet_transactions",
+    )
+
+    tx_type = models.CharField(max_length=10, choices=TX_TYPES)
+
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    balance_before = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+    balance_after = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
+
+    reference = models.CharField(max_length=64, blank=True, default="")
+    narration = models.CharField(max_length=255, blank=True, default="")
+    mpesa_receipt_number = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-id"]
+        indexes = [
+            models.Index(fields=["wallet", "created_at"]),
+            models.Index(fields=["user", "created_at"]),
+            models.Index(fields=["tx_type", "created_at"]),
+            models.Index(fields=["reference"]),
+            models.Index(fields=["mpesa_receipt_number"]),
+        ]
+
+    def clean(self):
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError("Wallet transaction amount must be > 0.")
+        if self.balance_before is not None and self.balance_before < 0:
+            raise ValidationError("balance_before cannot be negative.")
+        if self.balance_after is not None and self.balance_after < 0:
+            raise ValidationError("balance_after cannot be negative.")
+        if self.wallet_id and self.user_id and self.wallet.user_id != self.user_id:
+            raise ValidationError("Wallet transaction user must match wallet.user.")
+
+    def __str__(self):
+        return (
+            f"MerryWalletTx#{self.id} wallet={self.wallet_id} user={self.user_id} "
+            f"{self.tx_type} amount={self.amount} after={self.balance_after}"
+        )
 
 
 # ----------------------------

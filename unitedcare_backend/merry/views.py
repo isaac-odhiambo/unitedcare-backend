@@ -3,6 +3,10 @@
 # + payments + allocations + seat-based payouts
 # + uses merry/services.py for core domain logic
 # + keeps allocate_payment() for backward compatibility with payments app
+# + added user dashboard summary (all merries)
+# + added merry payment breakdown (required now + optional next)
+# + dues now include due_date / advance-pay support / overdue support
+# + added merry wallet balance and wallet history endpoints
 
 from __future__ import annotations
 
@@ -28,6 +32,8 @@ from .models import (
     MerryPayment,
     MerryPaymentAllocation,
     MerryPayout,
+    MerryWallet,
+    MerryWalletTransaction,
 )
 from . import services as merry_services
 
@@ -686,6 +692,161 @@ class AdminRejectJoinRequestView(APIView):
 
 
 # ==========================================
+# Dashboard / summary
+# ==========================================
+class MyAllMerryDueSummaryView(APIView):
+    """
+    GET /api/merry/dues/summary/
+    Returns dashboard totals across all merries:
+    - total_overdue
+    - total_current_due
+    - total_next_due
+    - total_required_now
+    - total_pay_with_next
+    - per merry breakdown
+    - total_wallet_balance
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        try:
+            summary = merry_services.get_user_merry_due_summary(user=request.user)
+        except Exception as e:
+            raise _service_error(e)
+        return Response(summary, status=status.HTTP_200_OK)
+
+
+class MerryPaymentBreakdownView(APIView):
+    """
+    GET /api/merry/<merry_id>/payments/breakdown/?include_next=true|false
+    Returns payment breakdown for one merry:
+    - overdue
+    - current_due
+    - next_due
+    - required_now
+    - pay_with_next
+    - wallet_balance
+    - net_required_now_after_wallet
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, merry_id: int):
+        include_next = parse_bool(request.query_params.get("include_next"), default=False)
+
+        try:
+            data = merry_services.get_merry_member_payment_breakdown(
+                user=request.user,
+                merry_id=merry_id,
+                include_next=include_next,
+            )
+        except Exception as e:
+            raise _service_error(e)
+
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class MyMerryWalletView(APIView):
+    """
+    GET /api/merry/wallet/my/
+    Returns merry wallet balance for logged-in user.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        wallet = MerryWallet.objects.filter(user=request.user).first()
+
+        return Response(
+            {
+                "user_id": request.user.id,
+                "wallet_balance": str(wallet.balance if wallet else Decimal("0.00")),
+                "updated_at": wallet.updated_at if wallet else None,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class MyMerryWalletTransactionsView(APIView):
+    """
+    GET /api/merry/wallet/my/transactions/
+    Returns merry wallet transaction history for logged-in user.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        qs = (
+            MerryWalletTransaction.objects.filter(user=request.user)
+            .order_by("-created_at", "-id")[:100]
+        )
+
+        data = [
+            {
+                "id": tx.id,
+                "tx_type": tx.tx_type,
+                "amount": str(tx.amount),
+                "balance_before": str(tx.balance_before),
+                "balance_after": str(tx.balance_after),
+                "reference": tx.reference,
+                "narration": tx.narration,
+                "mpesa_receipt_number": tx.mpesa_receipt_number,
+                "created_at": tx.created_at,
+            }
+            for tx in qs
+        ]
+
+        return Response(
+            {
+                "user_id": request.user.id,
+                "count": len(data),
+                "results": data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class AdminUserMerryWalletView(APIView):
+    """
+    GET /api/merry/admin/users/<user_id>/wallet/
+    Admin-only wallet inspection.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, user_id: int):
+        if not is_admin(request.user):
+            raise PermissionDenied("Admin only.")
+
+        uid = parse_int(user_id, "user_id", min_value=1)
+        wallet = MerryWallet.objects.filter(user_id=uid).first()
+
+        txs = (
+            MerryWalletTransaction.objects.filter(user_id=uid)
+            .order_by("-created_at", "-id")[:50]
+        )
+
+        return Response(
+            {
+                "user_id": uid,
+                "wallet_balance": str(wallet.balance if wallet else Decimal("0.00")),
+                "updated_at": wallet.updated_at if wallet else None,
+                "transactions": [
+                    {
+                        "id": tx.id,
+                        "tx_type": tx.tx_type,
+                        "amount": str(tx.amount),
+                        "balance_before": str(tx.balance_before),
+                        "balance_after": str(tx.balance_after),
+                        "reference": tx.reference,
+                        "narration": tx.narration,
+                        "mpesa_receipt_number": tx.mpesa_receipt_number,
+                        "created_at": tx.created_at,
+                    }
+                    for tx in txs
+                ],
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ==========================================
 # Dues & Payments
 # ==========================================
 class EnsureDuesForCurrentPeriodView(APIView):
@@ -746,7 +907,7 @@ class MyMerryDuesView(APIView):
                 seat__is_active=True,
             )
             .select_related("seat")
-            .order_by("slot_no", "seat__seat_no", "id")
+            .order_by("due_date", "slot_no", "seat__seat_no", "id")
         )
 
         data = [
@@ -760,6 +921,8 @@ class MyMerryDuesView(APIView):
                 "paid_amount": str(d.paid_amount),
                 "status": d.status,
                 "outstanding": str(d.outstanding()),
+                "due_date": d.due_date,
+                "is_advance_payable": getattr(d, "is_advance_payable", True),
                 "updated_at": d.updated_at,
             }
             for d in dues
@@ -806,7 +969,7 @@ class AdminDuesView(APIView):
             validate_slot(merry, parsed_slot_no)
             qs = qs.filter(slot_no=parsed_slot_no)
 
-        qs = qs.order_by("slot_no", "seat__member__user_id", "seat__seat_no", "id")
+        qs = qs.order_by("due_date", "slot_no", "seat__member__user_id", "seat__seat_no", "id")
 
         data = []
         for d in qs:
@@ -826,6 +989,8 @@ class AdminDuesView(APIView):
                     "paid_amount": str(d.paid_amount),
                     "status": d.status,
                     "outstanding": str(d.outstanding()),
+                    "due_date": d.due_date,
+                    "is_advance_payable": getattr(d, "is_advance_payable", True),
                     "updated_at": d.updated_at,
                 }
             )

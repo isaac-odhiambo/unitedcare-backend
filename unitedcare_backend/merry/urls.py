@@ -14,6 +14,11 @@ from .views import (
     AdminListJoinRequestsView,
     AdminApproveJoinRequestView,
     AdminRejectJoinRequestView,
+    MyAllMerryDueSummaryView,
+    MerryPaymentBreakdownView,
+    MyMerryWalletView,
+    MyMerryWalletTransactionsView,
+    AdminUserMerryWalletView,
     EnsureDuesForCurrentPeriodView,
     MyMerryDuesView,
     AdminDuesView,
@@ -64,6 +69,7 @@ urlpatterns = [
     # =========================
     # Dues
     # =========================
+    path("dues/summary/", MyAllMerryDueSummaryView.as_view(), name="merry-dues-summary"),
     path("<int:merry_id>/dues/ensure/", EnsureDuesForCurrentPeriodView.as_view(), name="merry-dues-ensure"),
     path("<int:merry_id>/dues/my/", MyMerryDuesView.as_view(), name="merry-dues-my"),
     path("<int:merry_id>/dues/", AdminDuesView.as_view(), name="merry-dues-admin"),
@@ -71,9 +77,17 @@ urlpatterns = [
     # =========================
     # Payments
     # =========================
+    path("<int:merry_id>/payments/breakdown/", MerryPaymentBreakdownView.as_view(), name="merry-payment-breakdown"),
     path("<int:merry_id>/payments/intent/", CreatePaymentIntentView.as_view(), name="merry-payment-intent"),
     path("payments/my/", MyPaymentsView.as_view(), name="merry-payments-my"),
     path("payments/<int:payment_id>/confirm/", AdminMarkPaymentConfirmedView.as_view(), name="merry-payment-confirm"),
+
+    # =========================
+    # Merry wallet
+    # =========================
+    path("wallet/my/", MyMerryWalletView.as_view(), name="merry-wallet-my"),
+    path("wallet/my/transactions/", MyMerryWalletTransactionsView.as_view(), name="merry-wallet-my-transactions"),
+    path("admin/users/<int:user_id>/wallet/", AdminUserMerryWalletView.as_view(), name="merry-wallet-admin-user"),
 
     # =========================
     # Payouts

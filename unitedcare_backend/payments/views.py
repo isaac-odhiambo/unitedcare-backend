@@ -7,11 +7,12 @@ from django.db import transaction
 from django.utils import timezone
 
 from rest_framework import generics, permissions, status
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError, NotFound
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import (
+    MpesaConfig,
     MpesaTransaction,
     PaymentLedger,
     TransactionFeeConfig,
@@ -19,6 +20,7 @@ from .models import (
 )
 from .permissions import IsAdmin
 from .serializers import (
+    MpesaConfigSerializer,
     MpesaTransactionSerializer,
     PaymentLedgerSerializer,
     TransactionFeeConfigSerializer,
@@ -54,10 +56,12 @@ def _normalize_reference_token(reference: str) -> str:
 def _parse_reference(reference: str):
     """
     Supports simple references:
-      - mus12
-      - saving23 / sav23
-      - loan35
-      - grp9 / group9
+      - mus12        => merry id 12
+      - saving23     => savings
+      - sav23        => savings
+      - loan35       => loan
+      - grp9         => group
+      - group9       => group
 
     Also supports legacy references:
       - MERRY-PAYMENT-99
@@ -82,7 +86,7 @@ def _parse_reference(reference: str):
         return {
             "raw": raw,
             "normalized": norm,
-            "kind": "MERRY_USER",
+            "kind": "MERRY",
             "entity_id": int(m.group(1)),
             "purpose": "MERRY_CONTRIBUTION",
             "valid": True,
@@ -242,12 +246,9 @@ def _require_reference_format(purpose: str, reference: str) -> None:
 # Callback security helpers
 # =========================================================
 def _require_callback_token(request) -> None:
-    """
-    If MPESA_CALLBACK_TOKEN is set, require it on callback URLs as ?token=...
-    """
     token = getattr(settings, "MPESA_CALLBACK_TOKEN", "")
     if not token:
-        return  # dev mode
+        return
 
     provided = (request.query_params.get("token") or "").strip()
     if provided != token:
@@ -262,13 +263,9 @@ def _get_client_ip(request) -> str:
 
 
 def _require_safaricom_ip(request) -> None:
-    """
-    Optional IP allowlist for callbacks.
-    In production set MPESA_CALLBACK_IP_ALLOWLIST = ["1.2.3.4", ...]
-    """
     allowlist = getattr(settings, "MPESA_CALLBACK_IP_ALLOWLIST", None)
     if not allowlist:
-        return  # dev mode
+        return
 
     ip = _get_client_ip(request)
     if ip not in set(allowlist):
@@ -276,9 +273,6 @@ def _require_safaricom_ip(request) -> None:
 
 
 def _accepted_callback_response():
-    """
-    Always acknowledge callbacks to reduce retries and avoid leaking errors.
-    """
     return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
 
 
@@ -286,10 +280,6 @@ def _accepted_callback_response():
 # Optional services wiring
 # =========================================================
 def _svc(name: str):
-    """
-    Import a function from payments/services.py if it exists.
-    If not found, return None.
-    """
     try:
         from . import services
         return getattr(services, name, None)
@@ -313,26 +303,59 @@ handle_b2c_timeout_callback = _svc("handle_b2c_timeout_callback")
 
 
 # =========================================================
+# Mpesa Config
+# =========================================================
+class ActiveMpesaConfigView(APIView):
+    """
+    Authenticated users: get active Mpesa config for frontend display
+    GET /payments/mpesa-config/
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        obj = (
+            MpesaConfig.objects.filter(is_active=True)
+            .order_by("-updated_at", "-id")
+            .first()
+        )
+        if not obj:
+            raise NotFound("No active Mpesa config found.")
+        return Response(MpesaConfigSerializer(obj).data, status=status.HTTP_200_OK)
+
+
+class AdminMpesaConfigListCreateView(generics.ListCreateAPIView):
+    """
+    Admin: list/create mpesa configs
+    GET  /payments/mpesa-config/admin/
+    POST /payments/mpesa-config/admin/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    serializer_class = MpesaConfigSerializer
+    queryset = MpesaConfig.objects.all().order_by("-updated_at", "-id")
+
+
+class AdminMpesaConfigDetailView(generics.RetrieveUpdateAPIView):
+    """
+    Admin: retrieve/update a single mpesa config
+    GET   /payments/mpesa-config/admin/<pk>/
+    PATCH /payments/mpesa-config/admin/<pk>/
+    PUT   /payments/mpesa-config/admin/<pk>/
+    """
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    serializer_class = MpesaConfigSerializer
+    queryset = MpesaConfig.objects.all()
+
+
+# =========================================================
 # Fee config (Admin)
 # =========================================================
 class AdminFeeConfigListCreateView(generics.ListCreateAPIView):
-    """
-    Admin: list/create transaction fee configs
-    GET  /payments/fees/admin/
-    POST /payments/fees/admin/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = TransactionFeeConfigSerializer
     queryset = TransactionFeeConfig.objects.all().order_by("purpose")
 
 
 class AdminFeeConfigDetailView(generics.RetrieveUpdateAPIView):
-    """
-    Admin: retrieve/update fee config
-    GET   /payments/fees/admin/<pk>/
-    PATCH /payments/fees/admin/<pk>/
-    PUT   /payments/fees/admin/<pk>/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = TransactionFeeConfigSerializer
     queryset = TransactionFeeConfig.objects.all()
@@ -342,10 +365,6 @@ class AdminFeeConfigDetailView(generics.RetrieveUpdateAPIView):
 # Withdrawal (Member)
 # =========================================================
 class MyWithdrawalsView(generics.ListAPIView):
-    """
-    Member: list my withdrawal requests
-    GET /payments/withdrawals/my/
-    """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = WithdrawalSerializer
 
@@ -358,14 +377,6 @@ class MyWithdrawalsView(generics.ListAPIView):
 
 
 class RequestWithdrawalView(generics.CreateAPIView):
-    """
-    Member: create withdrawal request
-    POST /payments/withdrawals/request/
-
-    Note:
-    - The serializer/service layer should enforce all withdrawal fee logic.
-    - The amount submitted here should be treated as the base payout amount.
-    """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = WithdrawalCreateSerializer
 
@@ -389,10 +400,6 @@ class RequestWithdrawalView(generics.CreateAPIView):
 # Withdrawal (Admin)
 # =========================================================
 class AdminWithdrawalsView(generics.ListAPIView):
-    """
-    Admin: list all withdrawals
-    GET /payments/withdrawals/admin/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = WithdrawalSerializer
 
@@ -412,10 +419,6 @@ class AdminWithdrawalsView(generics.ListAPIView):
 
 
 class ApproveWithdrawalView(APIView):
-    """
-    Admin: approve a withdrawal request and start payout (B2C)
-    PATCH /payments/withdrawals/<id>/approve/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     @transaction.atomic
@@ -464,10 +467,6 @@ class ApproveWithdrawalView(APIView):
 
 
 class RejectWithdrawalView(APIView):
-    """
-    Admin: reject withdrawal
-    PATCH /payments/withdrawals/<id>/reject/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
 
     @transaction.atomic
@@ -513,10 +512,6 @@ class RejectWithdrawalView(APIView):
 # Ledger / History
 # =========================================================
 class MyLedgerHistoryView(generics.ListAPIView):
-    """
-    Member: list my ledger entries
-    GET /payments/ledger/my/
-    """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = PaymentLedgerSerializer
 
@@ -529,10 +524,6 @@ class MyLedgerHistoryView(generics.ListAPIView):
 
 
 class AdminLedgerHistoryView(generics.ListAPIView):
-    """
-    Admin: list all ledger entries
-    GET /payments/ledger/admin/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = PaymentLedgerSerializer
 
@@ -554,10 +545,6 @@ class AdminLedgerHistoryView(generics.ListAPIView):
 # Mpesa Debug / Admin list
 # =========================================================
 class AdminMpesaTransactionsView(generics.ListAPIView):
-    """
-    Admin: view mpesa transactions
-    GET /payments/mpesa/admin/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = MpesaTransactionSerializer
 
@@ -587,16 +574,6 @@ class AdminMpesaTransactionsView(generics.ListAPIView):
 # Mpesa endpoints
 # =========================================================
 class MpesaStkPushView(APIView):
-    """
-    Start STK push for deposits/contributions/repayments
-
-    POST /payments/mpesa/stk-push/
-    body: { phone, amount, purpose, reference?, narration? }
-
-    Notes:
-    - The submitted amount should be the base amount.
-    - Fee logic should be applied centrally in payments/services.py.
-    """
     permission_classes = [permissions.IsAuthenticated]
     throttle_classes = [StkPushUserThrottle, StkPushPhoneThrottle]
 
@@ -676,10 +653,6 @@ class MpesaStkPushView(APIView):
 
 
 class MpesaStkCallbackView(APIView):
-    """
-    Callback from Safaricom for STK push
-    POST /payments/mpesa/stk/callback/?token=...
-    """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -695,10 +668,6 @@ class MpesaStkCallbackView(APIView):
 
 
 class MpesaC2BValidationView(APIView):
-    """
-    C2B validation callback
-    POST /payments/mpesa/c2b/validation/?token=...
-    """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -726,10 +695,6 @@ class MpesaC2BValidationView(APIView):
 
 
 class MpesaC2BConfirmationView(APIView):
-    """
-    C2B confirmation callback
-    POST /payments/mpesa/c2b/confirmation/?token=...
-    """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -748,10 +713,6 @@ class MpesaC2BConfirmationView(APIView):
 
 
 class MpesaB2CResultView(APIView):
-    """
-    B2C result callback (withdrawals payout)
-    POST /payments/mpesa/b2c/result/?token=...
-    """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic
@@ -767,10 +728,6 @@ class MpesaB2CResultView(APIView):
 
 
 class MpesaB2CTimeoutView(APIView):
-    """
-    B2C timeout callback
-    POST /payments/mpesa/b2c/timeout/?token=...
-    """
     permission_classes = [permissions.AllowAny]
 
     @transaction.atomic

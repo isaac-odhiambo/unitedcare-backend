@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     "savings",
     "groups",
     "payments",
+    'notifications',
 ]
 
 # =========================

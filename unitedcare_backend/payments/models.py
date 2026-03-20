@@ -77,38 +77,153 @@ class TransactionFeeConfig(models.Model):
 
 
 # =========================
-# MpesaTransaction (STK + C2B + B2C)
+# Mpesa Config
 # =========================
-class MpesaTransaction(models.Model):
+class MpesaConfig(models.Model):
     """
-    Source-of-truth table for Mpesa:
-    - STK Push (customer pays you): direction=IN, channel=STK
-    - C2B Paybill (customer pays manually): direction=IN, channel=C2B
-    - B2C payout (you pay customer): direction=OUT, channel=B2C
+    Central M-Pesa payment channel configuration.
 
-    Amount design:
-    - amount = final transaction amount actually used in Mpesa call
-      * STK: total charged to customer
-      * C2B: amount actually received from customer
-      * B2C: actual payout sent to customer
-    - base_amount = business/base amount before fee
-    - transaction_fee = fee portion applied by backend
+    Stores business/payment numbers shown to users:
+    - paybill number
+    - business number / shortcode
+    - till number
 
-    For manual paybill, simple references such as:
+    Business references like:
       - mus12
       - saving23
       - loan35
       - grp9
-    should be stored in `reference`.
-    Parsing and allocation should happen in service logic, not in this model.
+    are not stored here. They are generated elsewhere.
     """
 
-    DIRECTION_CHOICES = (("IN", "Money In"), ("OUT", "Money Out"))
+    name = models.CharField(
+        max_length=100,
+        default="default",
+        unique=True,
+        help_text="Friendly config name, e.g. default or production.",
+    )
+
+    paybill_number = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Manual Paybill number shown to users.",
+    )
+
+    business_number = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Primary business/short code used for collections.",
+    )
+
+    till_number = models.CharField(
+        max_length=30,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Optional till number if Buy Goods is enabled.",
+    )
+
+    is_active = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text="Whether this config is active for the system.",
+    )
+
+    is_paybill_enabled = models.BooleanField(
+        default=True,
+        db_index=True,
+        help_text="Controls whether manual paybill option is shown/enabled.",
+    )
+
+    is_till_enabled = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Controls whether till option is shown/enabled.",
+    )
+
+    notes = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Optional admin notes.",
+    )
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name = "Mpesa Config"
+        verbose_name_plural = "Mpesa Configs"
+
+    def __str__(self):
+        return (
+            f"{self.name} | "
+            f"paybill={self.paybill_number or '-'} | "
+            f"business={self.business_number or '-'} | "
+            f"till={self.till_number or '-'}"
+        )
+
+
+# =========================
+# MpesaTransaction (central source of truth)
+# =========================
+class MpesaTransaction(models.Model):
+    """
+    CENTRAL source-of-truth for all M-Pesa flows.
+
+    Supported:
+    - STK Push from app
+    - Manual outside-app paybill (C2B)
+    - Buy Goods / Till if enabled
+    - B2C payouts
+
+    This model captures the raw payment event first.
+    Domain allocation happens later in merry/savings/loans/groups services.
+
+    Example outside-app merry payment:
+      paybill number = 123456
+      account/reference entered by payer = mus11
+
+    In that case:
+    - channel = C2B
+    - origin = EXTERNAL
+    - payment_method = PAYBILL
+    - reference = mus11
+    - external_reference_raw = mus11
+    - purpose may start as MERRY_CONTRIBUTION if detected, else OTHER until parsed
+    - allocation_status records allocation progress
+    """
+
+    DIRECTION_CHOICES = (
+        ("IN", "Money In"),
+        ("OUT", "Money Out"),
+    )
+
     CHANNEL_CHOICES = (
         ("STK", "STK Push"),
         ("C2B", "C2B Paybill"),
         ("B2C", "B2C Payout"),
     )
+
+    PAYMENT_METHOD_CHOICES = (
+        ("STK", "STK Push"),
+        ("PAYBILL", "Paybill"),
+        ("TILL", "Till / Buy Goods"),
+        ("B2C", "B2C Payout"),
+        ("OTHER", "Other"),
+    )
+
+    ORIGIN_CHOICES = (
+        ("APP", "Started Inside App"),
+        ("EXTERNAL", "Started Outside App"),
+        ("ADMIN", "Started by Admin"),
+        ("SYSTEM", "System Generated"),
+    )
+
     STATUS_CHOICES = (
         ("INITIATED", "Initiated"),
         ("PENDING", "Pending"),
@@ -117,6 +232,7 @@ class MpesaTransaction(models.Model):
         ("CANCELLED", "Cancelled"),
         ("TIMEOUT", "Timeout"),
     )
+
     PURPOSE_CHOICES = (
         ("SAVINGS_DEPOSIT", "Savings Deposit"),
         ("MERRY_CONTRIBUTION", "Merry Contribution"),
@@ -126,6 +242,17 @@ class MpesaTransaction(models.Model):
         ("LOAN_DISBURSEMENT", "Loan Disbursement"),
         ("OTHER", "Other"),
     )
+
+    MATCHED_REFERENCE_TYPE_CHOICES = (
+        ("MERRY", "Merry"),
+        ("SAVINGS", "Savings"),
+        ("LOAN", "Loan"),
+        ("GROUP", "Group"),
+        ("WITHDRAWAL", "Withdrawal"),
+        ("OTHER", "Other"),
+        ("UNKNOWN", "Unknown"),
+    )
+
     ALLOCATION_STATUS_CHOICES = (
         ("UNALLOCATED", "Unallocated"),
         ("AUTO_ALLOCATED", "Auto Allocated"),
@@ -142,16 +269,29 @@ class MpesaTransaction(models.Model):
         blank=True,
         related_name="mpesa_transactions",
         db_index=True,
-        help_text="Owner/user related to this transaction (if known).",
+        help_text="Resolved owner/user if known.",
     )
 
-    phone = models.CharField(max_length=20, validators=[phone_validator], db_index=True)
+    phone = models.CharField(
+        max_length=20,
+        validators=[phone_validator],
+        db_index=True,
+        help_text="Phone used to make or receive the transaction.",
+    )
+
+    matched_user_phone = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Registered user phone matched by backend, if any.",
+    )
 
     amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
         validators=[MinValueValidator(Decimal("0.01"))],
-        help_text="Final amount used for the actual Mpesa transaction.",
+        help_text="Final amount actually transacted through M-Pesa.",
     )
 
     base_amount = models.DecimalField(
@@ -159,7 +299,7 @@ class MpesaTransaction(models.Model):
         decimal_places=2,
         default=Decimal("0.00"),
         validators=[MinValueValidator(Decimal("0.00"))],
-        help_text="Original business/base amount before fee.",
+        help_text="Business/base amount before fee.",
     )
 
     transaction_fee = models.DecimalField(
@@ -167,12 +307,46 @@ class MpesaTransaction(models.Model):
         decimal_places=2,
         default=Decimal("0.00"),
         validators=[MinValueValidator(Decimal("0.00"))],
-        help_text="Fee portion charged or deducted by backend.",
+        help_text="Fee amount applied by backend.",
     )
 
-    direction = models.CharField(max_length=10, choices=DIRECTION_CHOICES, default="IN")
-    channel = models.CharField(max_length=10, choices=CHANNEL_CHOICES, default="STK")
-    purpose = models.CharField(max_length=30, choices=PURPOSE_CHOICES, default="OTHER")
+    direction = models.CharField(
+        max_length=10,
+        choices=DIRECTION_CHOICES,
+        default="IN",
+        db_index=True,
+    )
+
+    channel = models.CharField(
+        max_length=10,
+        choices=CHANNEL_CHOICES,
+        default="STK",
+        db_index=True,
+    )
+
+    payment_method = models.CharField(
+        max_length=20,
+        choices=PAYMENT_METHOD_CHOICES,
+        default="STK",
+        db_index=True,
+        help_text="How the payment was made: STK, PAYBILL, TILL, or B2C.",
+    )
+
+    origin = models.CharField(
+        max_length=20,
+        choices=ORIGIN_CHOICES,
+        default="APP",
+        db_index=True,
+        help_text="Where the payment started: app, external/manual, admin, or system.",
+    )
+
+    purpose = models.CharField(
+        max_length=30,
+        choices=PURPOSE_CHOICES,
+        default="OTHER",
+        db_index=True,
+    )
+
     status = models.CharField(
         max_length=20,
         choices=STATUS_CHOICES,
@@ -180,31 +354,54 @@ class MpesaTransaction(models.Model):
         db_index=True,
     )
 
-    # Business/internal reference from STK or manual paybill callback.
-    # Examples: mus12, saving23, loan35, grp9
-    reference = models.CharField(max_length=120, blank=True, default="", db_index=True)
+    reference = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Normalized business reference, e.g. mus11, saving23, loan35, grp9.",
+    )
 
-    # --- STK identifiers ---
+    external_reference_raw = models.CharField(
+        max_length=120,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="Exact account/reference entered by payer outside the app.",
+    )
+
+    matched_reference_type = models.CharField(
+        max_length=20,
+        choices=MATCHED_REFERENCE_TYPE_CHOICES,
+        default="UNKNOWN",
+        db_index=True,
+        help_text="What type of business reference this transaction matched.",
+    )
+
     merchant_request_id = models.CharField(max_length=120, null=True, blank=True)
+
     checkout_request_id = models.CharField(
         max_length=120,
         null=True,
         blank=True,
         db_index=True,
-        help_text="STK unique ID returned by Safaricom (idempotency key).",
+        help_text="Unique STK request id from Safaricom.",
     )
 
-    # --- B2C identifiers ---
     conversation_id = models.CharField(
         max_length=120,
         null=True,
         blank=True,
         db_index=True,
-        help_text="B2C unique conversation id returned by Safaricom (idempotency key).",
+        help_text="Unique B2C conversation id from Safaricom.",
     )
-    originator_conversation_id = models.CharField(max_length=120, null=True, blank=True)
 
-    # --- Result fields (callback) ---
+    originator_conversation_id = models.CharField(
+        max_length=120,
+        null=True,
+        blank=True,
+    )
+
     result_code = models.CharField(max_length=20, null=True, blank=True)
     result_desc = models.CharField(max_length=255, null=True, blank=True)
 
@@ -213,17 +410,25 @@ class MpesaTransaction(models.Model):
         null=True,
         blank=True,
         db_index=True,
-        help_text="Receipt number for successful transactions (strongest uniqueness).",
+        help_text="Safaricom receipt number for successful transactions.",
     )
-    transaction_date = models.DateTimeField(null=True, blank=True)
 
-    # Raw payloads (audit/debug)
+    transaction_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Transaction date returned by Safaricom.",
+    )
+
+    callback_received_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When the system received the callback or validation result.",
+    )
+
     request_payload = models.JSONField(null=True, blank=True)
     callback_payload = models.JSONField(null=True, blank=True)
 
-    # Optional generic link to one dominant target object.
-    # For cross-allocation cases, this may remain blank and allocation can
-    # instead be tracked in the business/domain services.
     target_content_type = models.ForeignKey(
         ContentType,
         on_delete=models.SET_NULL,
@@ -233,17 +438,17 @@ class MpesaTransaction(models.Model):
     target_object_id = models.PositiveIntegerField(null=True, blank=True)
     target_object = GenericForeignKey("target_content_type", "target_object_id")
 
-    # Idempotency for posting ledger
     ledger_posted = models.BooleanField(default=False, db_index=True)
 
-    # Allocation/admin review workflow for manual paybill and other inbound flows
     allocation_status = models.CharField(
         max_length=25,
         choices=ALLOCATION_STATUS_CHOICES,
         default="UNALLOCATED",
         db_index=True,
     )
+
     allocation_notes = models.CharField(max_length=255, blank=True, default="")
+
     allocated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -251,6 +456,7 @@ class MpesaTransaction(models.Model):
         blank=True,
         related_name="allocated_mpesa_transactions",
     )
+
     allocated_at = models.DateTimeField(null=True, blank=True)
 
     created_at = models.DateTimeField(default=timezone.now, db_index=True)
@@ -260,10 +466,13 @@ class MpesaTransaction(models.Model):
         ordering = ["-id"]
         indexes = [
             models.Index(fields=["status", "channel", "direction"]),
+            models.Index(fields=["payment_method", "origin", "created_at"]),
             models.Index(fields=["phone", "created_at"]),
             models.Index(fields=["purpose", "created_at"]),
             models.Index(fields=["allocation_status", "created_at"]),
             models.Index(fields=["reference", "channel", "status"]),
+            models.Index(fields=["external_reference_raw", "created_at"]),
+            models.Index(fields=["matched_reference_type", "created_at"]),
         ]
         constraints = [
             models.UniqueConstraint(
@@ -285,9 +494,9 @@ class MpesaTransaction(models.Model):
 
     def __str__(self):
         return (
-            f"MpesaTx#{self.id} {self.channel} {self.direction} "
-            f"amount={self.amount} base={self.base_amount} "
-            f"fee={self.transaction_fee} {self.status}"
+            f"MpesaTx#{self.id} {self.channel}/{self.payment_method} "
+            f"{self.direction} amount={self.amount} "
+            f"ref={self.reference or '-'} status={self.status}"
         )
 
 
@@ -296,12 +505,19 @@ class MpesaTransaction(models.Model):
 # =========================
 class PaymentLedger(models.Model):
     """
-    UI-friendly money history.
-    Allows multiple ledger lines per MpesaTransaction
-    (e.g. withdrawal + withdrawal fee).
+    UI-friendly central history.
+
+    One MpesaTransaction can create multiple ledger lines.
+    Example:
+    - main money in/out line
+    - fee line
+    - adjustment line
     """
 
-    ENTRY_CHOICES = (("CREDIT", "Credit (Money In)"), ("DEBIT", "Debit (Money Out)"))
+    ENTRY_CHOICES = (
+        ("CREDIT", "Credit (Money In)"),
+        ("DEBIT", "Debit (Money Out)"),
+    )
 
     CATEGORY_CHOICES = (
         ("SAVINGS", "Savings"),
@@ -320,7 +536,13 @@ class PaymentLedger(models.Model):
         related_name="ledger_entries",
         db_index=True,
     )
-    entry_type = models.CharField(max_length=10, choices=ENTRY_CHOICES, db_index=True)
+
+    entry_type = models.CharField(
+        max_length=10,
+        choices=ENTRY_CHOICES,
+        db_index=True,
+    )
+
     category = models.CharField(
         max_length=20,
         choices=CATEGORY_CHOICES,
@@ -381,8 +603,22 @@ class WithdrawalRequest(models.Model):
     4) callback -> PAID or FAILED
     """
 
-    STATUS_CHOICES = ("PENDING", "APPROVED", "REJECTED", "PROCESSING", "PAID", "FAILED", "CANCELLED")
-    SOURCE_CHOICES = ("SAVINGS", "MERRY", "GROUP", "OTHER")
+    STATUS_CHOICES = (
+        ("PENDING", "PENDING"),
+        ("APPROVED", "APPROVED"),
+        ("REJECTED", "REJECTED"),
+        ("PROCESSING", "PROCESSING"),
+        ("PAID", "PAID"),
+        ("FAILED", "FAILED"),
+        ("CANCELLED", "CANCELLED"),
+    )
+
+    SOURCE_CHOICES = (
+        ("SAVINGS", "SAVINGS"),
+        ("MERRY", "MERRY"),
+        ("GROUP", "GROUP"),
+        ("OTHER", "OTHER"),
+    )
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -391,7 +627,12 @@ class WithdrawalRequest(models.Model):
         db_index=True,
     )
 
-    phone = models.CharField(max_length=20, validators=[phone_validator], db_index=True)
+    phone = models.CharField(
+        max_length=20,
+        validators=[phone_validator],
+        db_index=True,
+    )
+
     amount = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -401,7 +642,7 @@ class WithdrawalRequest(models.Model):
 
     source = models.CharField(
         max_length=20,
-        choices=[(c, c) for c in SOURCE_CHOICES],
+        choices=SOURCE_CHOICES,
         default="SAVINGS",
         db_index=True,
     )
@@ -417,7 +658,7 @@ class WithdrawalRequest(models.Model):
 
     status = models.CharField(
         max_length=20,
-        choices=[(s, s) for s in STATUS_CHOICES],
+        choices=STATUS_CHOICES,
         default="PENDING",
         db_index=True,
     )

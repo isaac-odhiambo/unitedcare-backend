@@ -2,9 +2,10 @@ from django.contrib import admin, messages
 from django.utils import timezone
 
 from .models import (
-    TransactionFeeConfig,
+    MpesaConfig,
     MpesaTransaction,
     PaymentLedger,
+    TransactionFeeConfig,
     WithdrawalRequest,
 )
 
@@ -222,6 +223,74 @@ class PaymentLedgerInline(admin.TabularInline):
         "created_at",
     )
     can_delete = False
+
+
+# =========================================================
+# MPESA CONFIG ADMIN
+# =========================================================
+@admin.register(MpesaConfig)
+class MpesaConfigAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "name",
+        "paybill_number",
+        "business_number",
+        "till_number",
+        "is_active",
+        "is_paybill_enabled",
+        "is_till_enabled",
+        "updated_at",
+    )
+
+    list_filter = (
+        "is_active",
+        "is_paybill_enabled",
+        "is_till_enabled",
+        "updated_at",
+    )
+
+    search_fields = (
+        "name",
+        "paybill_number",
+        "business_number",
+        "till_number",
+        "notes",
+    )
+
+    ordering = ("name",)
+    readonly_fields = ("updated_at",)
+
+    fieldsets = (
+        ("Identity", {
+            "fields": (
+                "name",
+                "is_active",
+            )
+        }),
+        ("Paybill / Business", {
+            "fields": (
+                "paybill_number",
+                "business_number",
+                "is_paybill_enabled",
+            )
+        }),
+        ("Till", {
+            "fields": (
+                "till_number",
+                "is_till_enabled",
+            )
+        }),
+        ("Notes", {
+            "fields": (
+                "notes",
+            )
+        }),
+        ("Timestamp", {
+            "fields": (
+                "updated_at",
+            )
+        }),
+    )
 
 
 # =========================================================

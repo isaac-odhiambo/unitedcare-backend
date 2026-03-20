@@ -1,9 +1,12 @@
 from django.urls import path
 
 from .views import (
+    ActiveMpesaConfigView,
     AdminFeeConfigDetailView,
     AdminFeeConfigListCreateView,
     AdminLedgerHistoryView,
+    AdminMpesaConfigDetailView,
+    AdminMpesaConfigListCreateView,
     AdminMpesaTransactionsView,
     AdminWithdrawalsView,
     ApproveWithdrawalView,
@@ -20,6 +23,25 @@ from .views import (
 )
 
 urlpatterns = [
+    # =========================================================
+    # Mpesa Config
+    # =========================================================
+    path(
+        "mpesa-config/",
+        ActiveMpesaConfigView.as_view(),
+        name="payments-active-mpesa-config",
+    ),
+    path(
+        "mpesa-config/admin/",
+        AdminMpesaConfigListCreateView.as_view(),
+        name="payments-admin-mpesa-config-list-create",
+    ),
+    path(
+        "mpesa-config/admin/<int:pk>/",
+        AdminMpesaConfigDetailView.as_view(),
+        name="payments-admin-mpesa-config-detail",
+    ),
+
     # =========================================================
     # Fee Config (Admin)
     # =========================================================

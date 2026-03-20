@@ -10,6 +10,8 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from notifications.utils import create_notification
+
 from .models import Loan, LoanGuarantor
 from .serializers import (
     AddLoanGuarantorSerializer,
@@ -118,6 +120,15 @@ class RequestLoanView(APIView):
             member_note=ser.validated_data.get("member_note", ""),
         )
 
+        create_notification(
+            user=request.user,
+            title="Loan Request Submitted",
+            message="Your loan request was submitted successfully and is waiting for review.",
+            notification_type="INFO",
+            action_url="/loans/my-loans",
+            loan_id=loan.id,
+        )
+
         loan = (
             Loan.objects.select_related("product", "borrower")
             .prefetch_related(
@@ -183,6 +194,15 @@ class AddGuarantorView(APIView):
         ser.is_valid(raise_exception=True)
         guarantor = ser.save()
 
+        create_notification(
+            user=guarantor.guarantor,
+            title="Guarantee Request",
+            message=f"You have been requested to guarantee loan #{guarantor.loan.id}.",
+            notification_type="ACTION",
+            action_url="/loans/guarantees",
+            loan_id=guarantor.loan.id,
+        )
+
         return Response(
             {
                 "message": "Guarantor added. Waiting for acceptance.",
@@ -238,6 +258,15 @@ class AcceptGuaranteeView(APIView):
         guarantor_link.full_clean()
         guarantor_link.save(update_fields=["accepted", "accepted_at"])
 
+        create_notification(
+            user=guarantor_link.loan.borrower,
+            title="Guarantee Accepted",
+            message=f"Your guarantor has accepted loan #{guarantor_link.loan.id}.",
+            notification_type="SUCCESS",
+            action_url="/loans/my-loans",
+            loan_id=guarantor_link.loan.id,
+        )
+
         return Response({"message": "Guarantee accepted."}, status=status.HTTP_200_OK)
 
 
@@ -264,7 +293,20 @@ class RejectGuaranteeView(APIView):
         if guarantor_link.accepted:
             raise ValidationError("Cannot reject: already accepted.")
 
+        borrower = guarantor_link.loan.borrower
+        loan_id = guarantor_link.loan.id
+
         guarantor_link.delete()
+
+        create_notification(
+            user=borrower,
+            title="Guarantee Rejected",
+            message=f"A guarantor rejected loan #{loan_id}. Please choose another guarantor.",
+            notification_type="WARNING",
+            action_url="/loans/my-loans",
+            loan_id=loan_id,
+        )
+
         return Response({"message": "Guarantee rejected."}, status=status.HTTP_200_OK)
 
 
@@ -294,6 +336,33 @@ class ApproveLoanView(APIView):
 
         loan = approve_loan_and_create_schedule(loan)
 
+        if hasattr(loan, "reviewed_by"):
+            loan.reviewed_by = request.user
+        if hasattr(loan, "reviewed_at"):
+            loan.reviewed_at = timezone.now()
+        if hasattr(loan, "rejection_reason"):
+            loan.rejection_reason = None
+
+        update_fields = []
+        if hasattr(loan, "reviewed_by"):
+            update_fields.append("reviewed_by")
+        if hasattr(loan, "reviewed_at"):
+            update_fields.append("reviewed_at")
+        if hasattr(loan, "rejection_reason"):
+            update_fields.append("rejection_reason")
+        if update_fields:
+            loan.save(update_fields=update_fields)
+
+        create_notification(
+            user=loan.borrower,
+            created_by=request.user,
+            title="Loan Approved",
+            message="Your loan request has been approved and repayment schedule generated.",
+            notification_type="SUCCESS",
+            action_url="/loans/my-loans",
+            loan_id=loan.id,
+        )
+
         loan = (
             Loan.objects.select_related("product", "borrower")
             .prefetch_related(
@@ -309,6 +378,83 @@ class ApproveLoanView(APIView):
         return Response(
             {
                 "message": "Loan approved and schedule generated.",
+                "loan": LoanDetailSerializer(loan).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# ==========================
+# Admin: Reject loan
+# ==========================
+class RejectLoanView(APIView):
+    """
+    Admin rejects a loan and sends rejection reason to borrower.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def patch(self, request, loan_id: int):
+        if not (request.user.is_staff or request.user.is_superuser):
+            raise PermissionDenied("Only admin can reject loans.")
+
+        rejection_reason = (request.data.get("rejection_reason") or "").strip()
+        if not rejection_reason:
+            raise ValidationError({"rejection_reason": "This field is required."})
+
+        try:
+            loan = (
+                Loan.objects.select_for_update()
+                .select_related("product", "borrower")
+                .prefetch_related("guarantors", "guarantors__guarantor")
+                .get(id=loan_id)
+            )
+        except Loan.DoesNotExist:
+            raise ValidationError("Loan not found.")
+
+        loan.status = "REJECTED"
+
+        update_fields = ["status"]
+
+        if hasattr(loan, "rejection_reason"):
+            loan.rejection_reason = rejection_reason
+            update_fields.append("rejection_reason")
+
+        if hasattr(loan, "reviewed_by"):
+            loan.reviewed_by = request.user
+            update_fields.append("reviewed_by")
+
+        if hasattr(loan, "reviewed_at"):
+            loan.reviewed_at = timezone.now()
+            update_fields.append("reviewed_at")
+
+        loan.save(update_fields=update_fields)
+
+        create_notification(
+            user=loan.borrower,
+            created_by=request.user,
+            title="Loan Rejected",
+            message=f"Your loan request has been rejected. Reason: {rejection_reason}",
+            notification_type="ERROR",
+            action_url="/loans/my-loans",
+            loan_id=loan.id,
+        )
+
+        loan = (
+            Loan.objects.select_related("product", "borrower")
+            .prefetch_related(
+                "guarantors",
+                "guarantors__guarantor",
+                "security_allocations",
+                "installments",
+                "payments",
+            )
+            .get(id=loan.id)
+        )
+
+        return Response(
+            {
+                "message": "Loan rejected.",
                 "loan": LoanDetailSerializer(loan).data,
             },
             status=status.HTTP_200_OK,
@@ -343,6 +489,15 @@ class PayLoanView(APIView):
 
         record_loan_payment(loan, amount, method=method, reference=reference)
         loan = apply_payment_to_loan(loan, amount)
+
+        create_notification(
+            user=request.user,
+            title="Loan Payment Received",
+            message=f"Your payment of {amount} has been received successfully.",
+            notification_type="SUCCESS",
+            action_url="/loans/my-loans",
+            loan_id=loan.id,
+        )
 
         return Response(
             {

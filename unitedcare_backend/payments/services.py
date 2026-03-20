@@ -14,7 +14,13 @@ from django.db import transaction
 from django.utils import timezone
 
 from .balances import get_user_balance
-from .models import MpesaTransaction, PaymentLedger, TransactionFeeConfig, WithdrawalRequest
+from .models import (
+    MpesaConfig,
+    MpesaTransaction,
+    PaymentLedger,
+    TransactionFeeConfig,
+    WithdrawalRequest,
+)
 
 UserModel = get_user_model()
 
@@ -84,6 +90,18 @@ def _normalize_reference_token(reference: str) -> str:
     return ref
 
 
+def get_active_mpesa_config() -> Optional[MpesaConfig]:
+    """
+    Returns the current active Mpesa config.
+    Useful for API/config endpoints or backend display logic.
+    """
+    return (
+        MpesaConfig.objects.filter(is_active=True)
+        .order_by("-updated_at", "-id")
+        .first()
+    )
+
+
 @dataclass
 class ParsedReference:
     raw: str
@@ -97,12 +115,12 @@ class ParsedReference:
 def _parse_reference(reference: str) -> ParsedReference:
     """
     Supports simple user-friendly references:
-      - mus12
-      - saving23
-      - loan35
-      - grp9
+      - mus12      => merry id 12
+      - saving23   => savings target 23
+      - loan35     => loan 35
+      - grp9       => group 9
 
-    And keeps backward compatibility with:
+    Keeps backward compatibility with:
       - MERRY-PAYMENT-99
       - LOAN-12
       - GROUP-7
@@ -125,7 +143,7 @@ def _parse_reference(reference: str) -> ParsedReference:
         return ParsedReference(
             raw=raw,
             normalized=norm,
-            kind="MERRY_USER",
+            kind="MERRY",
             entity_id=int(m.group(1)),
             purpose="MERRY_CONTRIBUTION",
             valid=True,
@@ -468,9 +486,9 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
     parsed = _parse_reference(tx.reference or "")
 
     # --------------------------------------------
-    # New simple reference style: mus12
+    # New simple reference style: mus12 => merry id 12
     # --------------------------------------------
-    if parsed.valid and parsed.kind == "MERRY_USER":
+    if parsed.valid and parsed.kind == "MERRY":
         try:
             from merry import services as merry_services
         except Exception:
@@ -485,28 +503,70 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
         base_amount = _money(payload.get("base_amount", tx.amount))
 
         candidate_names = (
-            "apply_mpesa_contribution_by_user_reference",
-            "apply_mpesa_contribution_by_user",
+            "apply_mpesa_contribution_by_merry_reference",
+            "apply_mpesa_contribution_by_merry_id",
+            "apply_mpesa_contribution_by_reference",
             "apply_mpesa_contribution",
         )
 
         for fn_name in candidate_names:
             fn = getattr(merry_services, fn_name, None)
-            if callable(fn):
+            if not callable(fn):
+                continue
+
+            try:
+                if fn_name == "apply_mpesa_contribution_by_merry_reference":
+                    fn(
+                        merry_id=parsed.entity_id,
+                        amount=base_amount,
+                        mpesa_tx=tx,
+                        reference=tx.reference or "",
+                        user=tx.user,
+                    )
+                elif fn_name == "apply_mpesa_contribution_by_merry_id":
+                    fn(
+                        merry_id=parsed.entity_id,
+                        amount=base_amount,
+                        mpesa_tx=tx,
+                        reference=tx.reference or "",
+                        user=tx.user,
+                    )
+                elif fn_name == "apply_mpesa_contribution_by_reference":
+                    fn(
+                        reference=tx.reference or "",
+                        amount=base_amount,
+                        mpesa_tx=tx,
+                        user=tx.user,
+                    )
+                else:
+                    fn(
+                        user=tx.user,
+                        amount=base_amount,
+                        mpesa_tx=tx,
+                        reference=tx.reference or "",
+                    )
+
+                _update_tx_allocation(
+                    tx,
+                    status="AUTO_ALLOCATED",
+                    notes="Merry contribution auto-allocated from simple reference.",
+                )
+                return
+            except TypeError:
                 try:
-                    if fn_name == "apply_mpesa_contribution_by_user_reference":
+                    # fallback for older function signatures
+                    if fn_name in ("apply_mpesa_contribution_by_merry_reference", "apply_mpesa_contribution_by_merry_id"):
                         fn(
-                            user_id=parsed.entity_id,
+                            merry_id=parsed.entity_id,
                             amount=base_amount,
                             mpesa_tx=tx,
                             reference=tx.reference or "",
                         )
-                    elif fn_name == "apply_mpesa_contribution_by_user":
+                    elif fn_name == "apply_mpesa_contribution_by_reference":
                         fn(
-                            user_id=parsed.entity_id,
+                            reference=tx.reference or "",
                             amount=base_amount,
                             mpesa_tx=tx,
-                            reference=tx.reference or "",
                         )
                     else:
                         fn(
@@ -529,6 +589,13 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
                         notes=f"Merry allocation error: {str(e)}"[:255],
                     )
                     return
+            except Exception as e:
+                _update_tx_allocation(
+                    tx,
+                    status="MANUAL_REVIEW",
+                    notes=f"Merry allocation error: {str(e)}"[:255],
+                )
+                return
 
         _update_tx_allocation(
             tx,
@@ -817,7 +884,6 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     ).strip()
 
     parsed = _parse_reference(reference)
-
     purpose = parsed.purpose if parsed.valid else "OTHER"
 
     user = None
