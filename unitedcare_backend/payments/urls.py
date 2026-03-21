@@ -14,6 +14,11 @@ from .views import (
     RequestWithdrawalView,
     MyWithdrawalsView,
     MyLedgerHistoryView,
+
+    # ✅ NEW IMPORTS (added)
+    MyMpesaTransactionsView,
+    MyMpesaTransactionDetailView,
+
     MpesaStkPushView,
     MpesaStkCallbackView,
     MpesaC2BValidationView,
@@ -100,13 +105,29 @@ urlpatterns = [
     ),
 
     # =========================================================
-    # M-Pesa / STK / C2B / B2C
+    # M-Pesa / Transactions
     # =========================================================
     path(
         "mpesa/admin/",
         AdminMpesaTransactionsView.as_view(),
         name="payments-admin-mpesa-transactions",
     ),
+
+    # ✅ NEW: USER TRANSACTION ENDPOINTS (CRITICAL FOR FRONTEND POLLING)
+    path(
+        "mpesa/me/transactions/",
+        MyMpesaTransactionsView.as_view(),
+        name="payments-my-mpesa-transactions",
+    ),
+    path(
+        "mpesa/me/transactions/<int:pk>/",
+        MyMpesaTransactionDetailView.as_view(),
+        name="payments-my-mpesa-transaction-detail",
+    ),
+
+    # =========================================================
+    # STK / C2B / B2C
+    # =========================================================
     path(
         "mpesa/stk-push/",
         MpesaStkPushView.as_view(),

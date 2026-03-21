@@ -198,6 +198,19 @@ def mark_mpesa_manually_allocated(modeladmin, request, queryset):
     )
 
 
+@admin.action(description="Mark selected Mpesa transactions as invalid reference")
+def mark_mpesa_invalid_reference(modeladmin, request, queryset):
+    updated = queryset.update(
+        allocation_status="INVALID_REFERENCE",
+        allocation_notes="Marked invalid by admin",
+    )
+    modeladmin.message_user(
+        request,
+        f"{updated} Mpesa transaction(s) marked as INVALID REFERENCE.",
+        level=messages.WARNING,
+    )
+
+
 # =========================================================
 # INLINE: LEDGER ON MPESA TX
 # =========================================================
@@ -333,10 +346,14 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         "id",
         "user",
         "phone",
+        "matched_user_phone",
         "channel",
+        "payment_method",
+        "origin",
         "direction",
         "purpose",
         "reference",
+        "matched_reference_type",
         "amount",
         "status",
         "allocation_status",
@@ -350,17 +367,23 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         "status",
         "allocation_status",
         "channel",
+        "payment_method",
+        "origin",
         "direction",
         "purpose",
+        "matched_reference_type",
         "ledger_posted",
         "created_at",
         "allocated_at",
         "allocated_by",
+        "callback_received_at",
     )
 
     search_fields = (
         "phone",
+        "matched_user_phone",
         "reference",
+        "external_reference_raw",
         "checkout_request_id",
         "conversation_id",
         "merchant_request_id",
@@ -379,6 +402,7 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         "created_at",
         "updated_at",
         "allocated_at",
+        "callback_received_at",
     )
 
     actions = [
@@ -388,6 +412,7 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         mark_mpesa_cancelled,
         mark_mpesa_manual_review,
         mark_mpesa_manually_allocated,
+        mark_mpesa_invalid_reference,
     ]
 
     inlines = [PaymentLedgerInline]
@@ -397,8 +422,11 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
             "fields": (
                 "user",
                 "phone",
+                "matched_user_phone",
                 "direction",
                 "channel",
+                "payment_method",
+                "origin",
                 "purpose",
                 "status",
             )
@@ -413,6 +441,8 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
         ("Business Reference", {
             "fields": (
                 "reference",
+                "external_reference_raw",
+                "matched_reference_type",
                 "ledger_posted",
             )
         }),
@@ -442,6 +472,7 @@ class MpesaTransactionAdmin(admin.ModelAdmin):
                 "result_desc",
                 "mpesa_receipt_number",
                 "transaction_date",
+                "callback_received_at",
             )
         }),
         ("Target Object", {
@@ -503,6 +534,7 @@ class PaymentLedgerAdmin(admin.ModelAdmin):
         "mpesa_tx__mpesa_receipt_number",
         "mpesa_tx__checkout_request_id",
         "mpesa_tx__conversation_id",
+        "mpesa_tx__external_reference_raw",
     )
 
     ordering = ("-id",)
@@ -581,6 +613,7 @@ class WithdrawalRequestAdmin(admin.ModelAdmin):
         "mpesa_tx__mpesa_receipt_number",
         "mpesa_tx__conversation_id",
         "mpesa_tx__reference",
+        "mpesa_tx__external_reference_raw",
     )
 
     ordering = ("-id",)

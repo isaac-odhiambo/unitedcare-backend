@@ -30,6 +30,18 @@ from .serializers import (
     WithdrawalSerializer,
 )
 from .throttles import StkPushPhoneThrottle, StkPushUserThrottle
+from .services import (
+    get_active_mpesa_config,
+    initiate_stk_push,
+    handle_stk_callback,
+    handle_c2b_validation_callback,
+    handle_c2b_confirmation_callback,
+    create_withdrawal_request,
+    approve_withdrawal_request,
+    initiate_b2c_payout_for_withdrawal,
+    handle_b2c_result_callback,
+    handle_b2c_timeout_callback,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,15 +67,15 @@ def _normalize_reference_token(reference: str) -> str:
 
 def _parse_reference(reference: str):
     """
-    Supports simple references:
-      - mus12        => merry id 12
-      - saving23     => savings
-      - sav23        => savings
-      - loan35       => loan
-      - grp9         => group
-      - group9       => group
+    Supported primary references:
+      - mus11        => merry for USER id 11
+      - saving23     => savings for USER id 23
+      - sav23        => savings for USER id 23
+      - loan35       => loan for USER/loan ref 35
+      - grp9         => group 9
+      - group9       => group 9
 
-    Also supports legacy references:
+    Legacy supported:
       - MERRY-PAYMENT-99
       - LOAN-12
       - GROUP-7
@@ -77,8 +89,9 @@ def _parse_reference(reference: str):
             "normalized": norm,
             "kind": "EMPTY",
             "entity_id": None,
-            "purpose": "SAVINGS_DEPOSIT",
+            "purpose": "OTHER",
             "valid": False,
+            "matched_reference_type": "UNKNOWN",
         }
 
     m = re.match(r"^MUS(\d+)$", norm)
@@ -86,10 +99,11 @@ def _parse_reference(reference: str):
         return {
             "raw": raw,
             "normalized": norm,
-            "kind": "MERRY",
+            "kind": "MERRY_USER",
             "entity_id": int(m.group(1)),
             "purpose": "MERRY_CONTRIBUTION",
             "valid": True,
+            "matched_reference_type": "MERRY",
         }
 
     m = re.match(r"^SAVING(\d+)$", norm)
@@ -97,10 +111,11 @@ def _parse_reference(reference: str):
         return {
             "raw": raw,
             "normalized": norm,
-            "kind": "SAVINGS_ACCOUNT",
+            "kind": "SAVINGS_USER",
             "entity_id": int(m.group(1)),
             "purpose": "SAVINGS_DEPOSIT",
             "valid": True,
+            "matched_reference_type": "SAVINGS",
         }
 
     m = re.match(r"^SAV(\d+)$", norm)
@@ -108,10 +123,11 @@ def _parse_reference(reference: str):
         return {
             "raw": raw,
             "normalized": norm,
-            "kind": "SAVINGS_ACCOUNT",
+            "kind": "SAVINGS_USER",
             "entity_id": int(m.group(1)),
             "purpose": "SAVINGS_DEPOSIT",
             "valid": True,
+            "matched_reference_type": "SAVINGS",
         }
 
     m = re.match(r"^LOAN(\d+)$", norm)
@@ -119,10 +135,11 @@ def _parse_reference(reference: str):
         return {
             "raw": raw,
             "normalized": norm,
-            "kind": "LOAN",
+            "kind": "LOAN_USER",
             "entity_id": int(m.group(1)),
             "purpose": "LOAN_REPAYMENT",
             "valid": True,
+            "matched_reference_type": "LOAN",
         }
 
     m = re.match(r"^GRP(\d+)$", norm)
@@ -134,6 +151,7 @@ def _parse_reference(reference: str):
             "entity_id": int(m.group(1)),
             "purpose": "GROUP_CONTRIBUTION",
             "valid": True,
+            "matched_reference_type": "GROUP",
         }
 
     m = re.match(r"^GROUP(\d+)$", norm)
@@ -145,6 +163,7 @@ def _parse_reference(reference: str):
             "entity_id": int(m.group(1)),
             "purpose": "GROUP_CONTRIBUTION",
             "valid": True,
+            "matched_reference_type": "GROUP",
         }
 
     # Legacy
@@ -157,6 +176,7 @@ def _parse_reference(reference: str):
             "entity_id": int(m.group(1)),
             "purpose": "MERRY_CONTRIBUTION",
             "valid": True,
+            "matched_reference_type": "MERRY",
         }
 
     m = re.match(r"^LOAN(\d+)$", norm)
@@ -168,6 +188,7 @@ def _parse_reference(reference: str):
             "entity_id": int(m.group(1)),
             "purpose": "LOAN_REPAYMENT",
             "valid": True,
+            "matched_reference_type": "LOAN",
         }
 
     m = re.match(r"^GROUP(\d+)$", norm)
@@ -179,6 +200,7 @@ def _parse_reference(reference: str):
             "entity_id": int(m.group(1)),
             "purpose": "GROUP_CONTRIBUTION",
             "valid": True,
+            "matched_reference_type": "GROUP",
         }
 
     return {
@@ -188,18 +210,13 @@ def _parse_reference(reference: str):
         "entity_id": None,
         "purpose": "OTHER",
         "valid": False,
+        "matched_reference_type": "UNKNOWN",
     }
 
 
 def _require_reference_format(purpose: str, reference: str) -> None:
     """
-    Validate reference format early before calling services.
-
-    Allowed now:
-      - MERRY_CONTRIBUTION => mus12 OR MERRY-PAYMENT-99
-      - LOAN_REPAYMENT     => loan35 OR LOAN-35
-      - GROUP_CONTRIBUTION => grp9 OR GROUP-9
-      - SAVINGS_DEPOSIT    => optional; can be blank, saving23, sav23
+    Validate reference format before calling services.
     """
     p = (purpose or "").upper()
     ref = (reference or "").strip()
@@ -220,8 +237,9 @@ def _require_reference_format(purpose: str, reference: str) -> None:
             return
         if _extract_id(ref, "MERRY-PAYMENT-") is None:
             raise ValidationError(
-                {"reference": "For MERRY_CONTRIBUTION, use reference like 'mus12'."}
+                {"reference": "For MERRY_CONTRIBUTION, use reference like 'mus11'."}
             )
+        return
 
     if p == "LOAN_REPAYMENT":
         parsed = _parse_reference(ref)
@@ -231,6 +249,7 @@ def _require_reference_format(purpose: str, reference: str) -> None:
             raise ValidationError(
                 {"reference": "For LOAN_REPAYMENT, use reference like 'loan35'."}
             )
+        return
 
     if p == "GROUP_CONTRIBUTION":
         parsed = _parse_reference(ref)
@@ -240,6 +259,7 @@ def _require_reference_format(purpose: str, reference: str) -> None:
             raise ValidationError(
                 {"reference": "For GROUP_CONTRIBUTION, use reference like 'grp9'."}
             )
+        return
 
 
 # =========================================================
@@ -250,266 +270,76 @@ def _require_callback_token(request) -> None:
     if not token:
         return
 
-    provided = (request.query_params.get("token") or "").strip()
+    provided = (
+        request.query_params.get("token")
+        or request.headers.get("X-Callback-Token")
+        or request.headers.get("X-MPESA-CALLBACK-TOKEN")
+        or ""
+    )
     if provided != token:
         raise PermissionDenied("Invalid callback token")
 
 
-def _get_client_ip(request) -> str:
-    xff = request.META.get("HTTP_X_FORWARDED_FOR")
-    if xff:
-        return xff.split(",")[0].strip()
-    return (request.META.get("REMOTE_ADDR") or "").strip()
-
-
 def _require_safaricom_ip(request) -> None:
-    allowlist = getattr(settings, "MPESA_CALLBACK_IP_ALLOWLIST", None)
-    if not allowlist:
+    allowed_ips = getattr(settings, "MPESA_ALLOWED_IPS", None)
+    if not allowed_ips:
         return
 
-    ip = _get_client_ip(request)
-    if ip not in set(allowlist):
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    remote_addr = request.META.get("REMOTE_ADDR", "")
+
+    client_ip = forwarded.split(",")[0].strip() if forwarded else remote_addr
+    if client_ip not in allowed_ips:
         raise PermissionDenied("Callback IP not allowed")
 
 
 def _accepted_callback_response():
-    return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
+    return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
 
 
 # =========================================================
-# Optional services wiring
+# Mpesa Config Views
 # =========================================================
-def _svc(name: str):
-    try:
-        from . import services
-        return getattr(services, name, None)
-    except Exception:
-        return None
-
-
-# MPESA / withdrawal services
-initiate_stk_push = _svc("initiate_stk_push")
-handle_stk_callback = _svc("handle_stk_callback")
-
-# C2B services
-handle_c2b_validation_callback = _svc("handle_c2b_validation_callback")
-handle_c2b_confirmation_callback = _svc("handle_c2b_confirmation_callback")
-
-approve_withdrawal_request = _svc("approve_withdrawal_request")
-initiate_b2c_payout_for_withdrawal = _svc("initiate_b2c_payout_for_withdrawal")
-
-handle_b2c_result_callback = _svc("handle_b2c_result_callback")
-handle_b2c_timeout_callback = _svc("handle_b2c_timeout_callback")
-
-
-# =========================================================
-# Mpesa Config
-# =========================================================
-class ActiveMpesaConfigView(APIView):
-    """
-    Authenticated users: get active Mpesa config for frontend display
-    GET /payments/mpesa-config/
-    """
+class ActiveMpesaConfigView(generics.RetrieveAPIView):
     permission_classes = [permissions.IsAuthenticated]
+    serializer_class = MpesaConfigSerializer
 
-    def get(self, request):
-        obj = (
-            MpesaConfig.objects.filter(is_active=True)
-            .order_by("-updated_at", "-id")
-            .first()
-        )
+    def get_object(self):
+        obj = get_active_mpesa_config()
         if not obj:
-            raise NotFound("No active Mpesa config found.")
-        return Response(MpesaConfigSerializer(obj).data, status=status.HTTP_200_OK)
+            raise NotFound("No active M-Pesa configuration found.")
+        return obj
 
 
 class AdminMpesaConfigListCreateView(generics.ListCreateAPIView):
-    """
-    Admin: list/create mpesa configs
-    GET  /payments/mpesa-config/admin/
-    POST /payments/mpesa-config/admin/
-    """
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
-    serializer_class = MpesaConfigSerializer
     queryset = MpesaConfig.objects.all().order_by("-updated_at", "-id")
-
-
-class AdminMpesaConfigDetailView(generics.RetrieveUpdateAPIView):
-    """
-    Admin: retrieve/update a single mpesa config
-    GET   /payments/mpesa-config/admin/<pk>/
-    PATCH /payments/mpesa-config/admin/<pk>/
-    PUT   /payments/mpesa-config/admin/<pk>/
-    """
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = MpesaConfigSerializer
+
+
+class AdminMpesaConfigDetailView(generics.RetrieveUpdateDestroyAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
     queryset = MpesaConfig.objects.all()
+    serializer_class = MpesaConfigSerializer
 
 
 # =========================================================
-# Fee config (Admin)
+# Fee Config Views
 # =========================================================
 class AdminFeeConfigListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    queryset = TransactionFeeConfig.objects.all().order_by("-updated_at", "-id")
     serializer_class = TransactionFeeConfigSerializer
-    queryset = TransactionFeeConfig.objects.all().order_by("purpose")
 
 
-class AdminFeeConfigDetailView(generics.RetrieveUpdateAPIView):
+class AdminFeeConfigDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
-    serializer_class = TransactionFeeConfigSerializer
     queryset = TransactionFeeConfig.objects.all()
+    serializer_class = TransactionFeeConfigSerializer
 
 
 # =========================================================
-# Withdrawal (Member)
-# =========================================================
-class MyWithdrawalsView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = WithdrawalSerializer
-
-    def get_queryset(self):
-        return (
-            WithdrawalRequest.objects.filter(user=self.request.user)
-            .select_related("mpesa_tx")
-            .order_by("-id")
-        )
-
-
-class RequestWithdrawalView(generics.CreateAPIView):
-    permission_classes = [permissions.IsAuthenticated]
-    serializer_class = WithdrawalCreateSerializer
-
-    @transaction.atomic
-    def create(self, request, *args, **kwargs):
-        ser = self.get_serializer(data=request.data, context={"request": request})
-        ser.is_valid(raise_exception=True)
-
-        withdrawal = ser.save()
-
-        return Response(
-            {
-                "message": "Withdrawal request submitted. Awaiting admin approval.",
-                "withdrawal": WithdrawalSerializer(withdrawal).data,
-            },
-            status=status.HTTP_201_CREATED,
-        )
-
-
-# =========================================================
-# Withdrawal (Admin)
-# =========================================================
-class AdminWithdrawalsView(generics.ListAPIView):
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
-    serializer_class = WithdrawalSerializer
-
-    def get_queryset(self):
-        qs = (
-            WithdrawalRequest.objects.select_related(
-                "user", "approved_by", "rejected_by", "mpesa_tx"
-            )
-            .order_by("-id")
-        )
-
-        st = self.request.query_params.get("status")
-        if st:
-            qs = qs.filter(status=st.upper())
-
-        return qs
-
-
-class ApproveWithdrawalView(APIView):
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
-
-    @transaction.atomic
-    def patch(self, request, pk: int):
-        ser = WithdrawalApproveSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-
-        try:
-            w = (
-                WithdrawalRequest.objects.select_for_update()
-                .select_related("user")
-                .get(id=pk)
-            )
-        except WithdrawalRequest.DoesNotExist:
-            raise ValidationError("Withdrawal request not found.")
-
-        if w.status != "PENDING":
-            raise ValidationError("Only PENDING withdrawals can be approved.")
-
-        if approve_withdrawal_request and initiate_b2c_payout_for_withdrawal:
-            approve_withdrawal_request(withdrawal_id=w.id, approved_by=request.user)
-            tx = initiate_b2c_payout_for_withdrawal(withdrawal_id=w.id)
-
-            w.refresh_from_db()
-            return Response(
-                {
-                    "message": "Withdrawal approved. Payout initiated.",
-                    "withdrawal": WithdrawalSerializer(w).data,
-                    "mpesa_tx": MpesaTransactionSerializer(tx).data,
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        w.status = "APPROVED"
-        w.approved_by = request.user
-        w.approved_at = timezone.now()
-        w.save(update_fields=["status", "approved_by", "approved_at"])
-
-        return Response(
-            {
-                "message": "Withdrawal approved. (B2C payout not wired yet)",
-                "withdrawal": WithdrawalSerializer(w).data,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-class RejectWithdrawalView(APIView):
-    permission_classes = [permissions.IsAuthenticated, IsAdmin]
-
-    @transaction.atomic
-    def patch(self, request, pk: int):
-        ser = WithdrawalRejectSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-
-        try:
-            w = (
-                WithdrawalRequest.objects.select_for_update()
-                .select_related("user")
-                .get(id=pk)
-            )
-        except WithdrawalRequest.DoesNotExist:
-            raise ValidationError("Withdrawal request not found.")
-
-        if w.status != "PENDING":
-            raise ValidationError("Only PENDING withdrawals can be rejected.")
-
-        w.status = "REJECTED"
-        w.rejected_by = request.user
-        w.rejected_at = timezone.now()
-        w.rejection_reason = ser.validated_data.get("rejection_reason", "") or ""
-        w.save(
-            update_fields=[
-                "status",
-                "rejected_by",
-                "rejected_at",
-                "rejection_reason",
-            ]
-        )
-
-        return Response(
-            {
-                "message": "Withdrawal rejected.",
-                "withdrawal": WithdrawalSerializer(w).data,
-            },
-            status=status.HTTP_200_OK,
-        )
-
-
-# =========================================================
-# Ledger / History
+# Ledger Views
 # =========================================================
 class MyLedgerHistoryView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
@@ -517,32 +347,20 @@ class MyLedgerHistoryView(generics.ListAPIView):
 
     def get_queryset(self):
         return (
-            PaymentLedger.objects.filter(user=self.request.user)
-            .select_related("mpesa_tx")
-            .order_by("-id")
+            PaymentLedger.objects.select_related("user", "mpesa_tx")
+            .filter(user=self.request.user)
+            .order_by("-created_at", "-id")
         )
 
 
 class AdminLedgerHistoryView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
     serializer_class = PaymentLedgerSerializer
-
-    def get_queryset(self):
-        qs = PaymentLedger.objects.select_related("user", "mpesa_tx").order_by("-id")
-
-        user_id = self.request.query_params.get("user")
-        if user_id:
-            qs = qs.filter(user_id=user_id)
-
-        category = self.request.query_params.get("category")
-        if category:
-            qs = qs.filter(category=category.upper())
-
-        return qs
+    queryset = PaymentLedger.objects.select_related("user", "mpesa_tx").order_by("-created_at", "-id")
 
 
 # =========================================================
-# Mpesa Debug / Admin list
+# Mpesa Transaction Views
 # =========================================================
 class AdminMpesaTransactionsView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated, IsAdmin]
@@ -551,107 +369,140 @@ class AdminMpesaTransactionsView(generics.ListAPIView):
     def get_queryset(self):
         qs = MpesaTransaction.objects.select_related("user").order_by("-id")
 
-        st = self.request.query_params.get("status")
-        if st:
-            qs = qs.filter(status=st.upper())
+        status_q = self.request.query_params.get("status")
+        purpose_q = self.request.query_params.get("purpose")
+        payment_method_q = self.request.query_params.get("payment_method")
+        channel_q = self.request.query_params.get("channel")
+        phone_q = self.request.query_params.get("phone")
+        reference_q = self.request.query_params.get("reference")
+        receipt_q = self.request.query_params.get("mpesa_receipt_number")
 
-        purpose = self.request.query_params.get("purpose")
-        if purpose:
-            qs = qs.filter(purpose=purpose.upper())
-
-        allocation_status = self.request.query_params.get("allocation_status")
-        if allocation_status and hasattr(MpesaTransaction, "allocation_status"):
-            qs = qs.filter(allocation_status=allocation_status.upper())
-
-        channel = self.request.query_params.get("channel")
-        if channel:
-            qs = qs.filter(channel=channel.upper())
+        if status_q:
+            qs = qs.filter(status__iexact=status_q)
+        if purpose_q:
+            qs = qs.filter(purpose__iexact=purpose_q)
+        if payment_method_q:
+            qs = qs.filter(payment_method__iexact=payment_method_q)
+        if channel_q:
+            qs = qs.filter(channel__iexact=channel_q)
+        if phone_q:
+            qs = qs.filter(phone__icontains=phone_q)
+        if reference_q:
+            qs = qs.filter(reference__icontains=reference_q)
+        if receipt_q:
+            qs = qs.filter(mpesa_receipt_number__icontains=receipt_q)
 
         return qs
 
 
+class MyMpesaTransactionsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = MpesaTransactionSerializer
+
+    def get_queryset(self):
+        qs = (
+            MpesaTransaction.objects.select_related("user")
+            .filter(user=self.request.user)
+            .order_by("-id")
+        )
+
+        status_q = self.request.query_params.get("status")
+        purpose_q = self.request.query_params.get("purpose")
+        payment_method_q = self.request.query_params.get("payment_method")
+        channel_q = self.request.query_params.get("channel")
+        phone_q = self.request.query_params.get("phone")
+        reference_q = self.request.query_params.get("reference")
+        amount_q = self.request.query_params.get("amount")
+        allocation_status_q = self.request.query_params.get("allocation_status")
+
+        if status_q:
+            qs = qs.filter(status__iexact=status_q)
+        if purpose_q:
+            qs = qs.filter(purpose__iexact=purpose_q)
+        if payment_method_q:
+            qs = qs.filter(payment_method__iexact=payment_method_q)
+        if channel_q:
+            qs = qs.filter(channel__iexact=channel_q)
+        if phone_q:
+            qs = qs.filter(phone__icontains=phone_q)
+        if reference_q:
+            qs = qs.filter(reference__iexact=reference_q)
+        if allocation_status_q:
+            qs = qs.filter(allocation_status__iexact=allocation_status_q)
+
+        if amount_q:
+            try:
+                qs = qs.filter(amount=Decimal(str(amount_q)))
+            except Exception:
+                pass
+
+        return qs
+
+
+class MyMpesaTransactionDetailView(generics.RetrieveAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = MpesaTransactionSerializer
+
+    def get_queryset(self):
+        return MpesaTransaction.objects.select_related("user").filter(user=self.request.user)
+
+
 # =========================================================
-# Mpesa endpoints
+# STK Push
 # =========================================================
 class MpesaStkPushView(APIView):
     permission_classes = [permissions.IsAuthenticated]
     throttle_classes = [StkPushUserThrottle, StkPushPhoneThrottle]
 
-    ALLOWED_PURPOSES = {
-        "SAVINGS_DEPOSIT",
-        "MERRY_CONTRIBUTION",
-        "GROUP_CONTRIBUTION",
-        "LOAN_REPAYMENT",
-        "OTHER",
-    }
-
     @transaction.atomic
     def post(self, request):
         phone = (request.data.get("phone") or "").strip()
         amount = request.data.get("amount")
-        purpose = (request.data.get("purpose") or "SAVINGS_DEPOSIT").strip().upper()
+        purpose = (request.data.get("purpose") or "").strip().upper()
         reference = (request.data.get("reference") or "").strip()
         narration = (request.data.get("narration") or "").strip()
 
         if not phone:
             raise ValidationError({"phone": "Phone is required."})
-
-        try:
-            amt = Decimal(str(amount or "0"))
-        except Exception:
-            amt = Decimal("0")
-
-        if amt <= 0:
-            raise ValidationError({"amount": "Amount must be greater than 0."})
-
-        if purpose not in self.ALLOWED_PURPOSES:
-            raise ValidationError(
-                {"purpose": f"Invalid purpose. Use one of: {sorted(self.ALLOWED_PURPOSES)}"}
-            )
+        if amount in (None, ""):
+            raise ValidationError({"amount": "Amount is required."})
+        if not purpose:
+            raise ValidationError({"purpose": "Purpose is required."})
 
         _require_reference_format(purpose, reference)
 
-        if initiate_stk_push:
-            tx = initiate_stk_push(
-                user=request.user,
-                phone=phone,
-                amount=amt,
-                purpose=purpose,
-                reference=reference,
-                narration=narration,
-                target_object=None,
-            )
-            return Response(
-                {
-                    "message": "STK push initiated.",
-                    "tx": MpesaTransactionSerializer(tx).data,
-                },
-                status=status.HTTP_200_OK,
-            )
-
-        tx = MpesaTransaction.objects.create(
+        tx = initiate_stk_push(
             user=request.user,
             phone=phone,
-            amount=amt,
-            base_amount=amt,
-            transaction_fee=Decimal("0.00"),
-            direction="IN",
-            channel="STK",
+            amount=Decimal(str(amount)),
             purpose=purpose,
-            status="INITIATED",
             reference=reference,
-            request_payload=request.data,
+            narration=narration,
+        )
+
+        logger.info(
+            "STK push initiated | tx_id=%s | user_id=%s | phone=%s | amount=%s | purpose=%s | reference=%s | status=%s",
+            tx.id,
+            request.user.id,
+            phone,
+            tx.amount,
+            purpose,
+            tx.reference,
+            tx.status,
         )
 
         return Response(
             {
-                "message": "STK push stored (Safaricom call not wired yet).",
+                "message": "STK push sent successfully.",
                 "tx": MpesaTransactionSerializer(tx).data,
             },
             status=status.HTTP_200_OK,
         )
 
 
+# =========================================================
+# STK Callback
+# =========================================================
 class MpesaStkCallbackView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -660,40 +511,50 @@ class MpesaStkCallbackView(APIView):
         try:
             _require_callback_token(request)
             _require_safaricom_ip(request)
-            if handle_stk_callback:
-                handle_stk_callback(callback_payload=request.data)
+
+            tx = handle_stk_callback(callback_payload=request.data)
+
+            logger.info(
+                "STK callback processed | tx_id=%s | checkout_request_id=%s | status=%s | result_code=%s | allocation_status=%s | receipt=%s | reference=%s",
+                getattr(tx, "id", None),
+                getattr(tx, "checkout_request_id", None),
+                getattr(tx, "status", None),
+                getattr(tx, "result_code", None),
+                getattr(tx, "allocation_status", None),
+                getattr(tx, "mpesa_receipt_number", None),
+                getattr(tx, "reference", None),
+            )
         except Exception as e:
             logger.exception("STK callback handling error: %s", str(e))
+
         return _accepted_callback_response()
 
 
+# =========================================================
+# C2B Validation
+# =========================================================
 class MpesaC2BValidationView(APIView):
     permission_classes = [permissions.AllowAny]
 
-    @transaction.atomic
     def post(self, request):
         try:
             _require_callback_token(request)
             _require_safaricom_ip(request)
-
-            if handle_c2b_validation_callback:
-                result = handle_c2b_validation_callback(callback_payload=request.data)
-                if isinstance(result, dict):
-                    return Response(result, status=status.HTTP_200_OK)
-
+            return Response(
+                handle_c2b_validation_callback(callback_payload=request.data),
+                status=status.HTTP_200_OK,
+            )
         except Exception as e:
             logger.exception("C2B validation handling error: %s", str(e))
             return Response(
-                {"ResultCode": "C2B00011", "ResultDesc": "Rejected"},
+                {"ResultCode": 1, "ResultDesc": "Rejected"},
                 status=status.HTTP_200_OK,
             )
 
-        return Response(
-            {"ResultCode": "0", "ResultDesc": "Accepted"},
-            status=status.HTTP_200_OK,
-        )
 
-
+# =========================================================
+# C2B Confirmation
+# =========================================================
 class MpesaC2BConfirmationView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -703,15 +564,137 @@ class MpesaC2BConfirmationView(APIView):
             _require_callback_token(request)
             _require_safaricom_ip(request)
 
-            if handle_c2b_confirmation_callback:
-                handle_c2b_confirmation_callback(callback_payload=request.data)
+            tx = handle_c2b_confirmation_callback(callback_payload=request.data)
 
+            logger.info(
+                "C2B confirmation processed successfully | tx_id=%s | receipt=%s | status=%s | purpose=%s | allocation_status=%s | reference=%s | user_id=%s",
+                getattr(tx, "id", None),
+                getattr(tx, "mpesa_receipt_number", None),
+                getattr(tx, "status", None),
+                getattr(tx, "purpose", None),
+                getattr(tx, "allocation_status", None),
+                getattr(tx, "reference", None),
+                getattr(tx, "user_id", None),
+            )
         except Exception as e:
             logger.exception("C2B confirmation handling error: %s", str(e))
 
         return _accepted_callback_response()
 
 
+# =========================================================
+# Withdrawals
+# =========================================================
+class MyWithdrawalsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = WithdrawalSerializer
+
+    def get_queryset(self):
+        return (
+            WithdrawalRequest.objects.select_related("user", "approved_by", "rejected_by", "mpesa_tx")
+            .filter(user=self.request.user)
+            .order_by("-created_at", "-id")
+        )
+
+
+class RequestWithdrawalView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        serializer = WithdrawalCreateSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+
+        wd = create_withdrawal_request(
+            user=request.user,
+            phone=serializer.validated_data["phone"],
+            amount=serializer.validated_data["amount"],
+            source=serializer.validated_data.get("source", "SAVINGS"),
+        )
+
+        return Response(
+            WithdrawalSerializer(wd, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AdminWithdrawalsView(generics.ListAPIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+    serializer_class = WithdrawalSerializer
+    queryset = (
+        WithdrawalRequest.objects.select_related("user", "approved_by", "rejected_by", "mpesa_tx")
+        .order_by("-created_at", "-id")
+    )
+
+
+class ApproveWithdrawalView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    @transaction.atomic
+    def post(self, request, pk: int):
+        serializer = WithdrawalApproveSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+
+        wd = approve_withdrawal_request(
+            withdrawal_id=pk,
+            approved_by=request.user,
+        )
+
+        auto_initiate = serializer.validated_data.get("auto_initiate_b2c", True)
+        tx_data = None
+
+        if auto_initiate:
+            tx = initiate_b2c_payout_for_withdrawal(withdrawal_id=wd.id)
+            tx_data = MpesaTransactionSerializer(tx, context={"request": request}).data
+
+        return Response(
+            {
+                "message": "Withdrawal approved successfully.",
+                "withdrawal": WithdrawalSerializer(wd, context={"request": request}).data,
+                "mpesa_tx": tx_data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class RejectWithdrawalView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsAdmin]
+
+    @transaction.atomic
+    def post(self, request, pk: int):
+        serializer = WithdrawalRejectSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+
+        reason = serializer.validated_data.get("reason", "")
+
+        wd = WithdrawalRequest.objects.select_for_update().filter(pk=pk).first()
+        if not wd:
+            raise NotFound("Withdrawal request not found.")
+
+        if wd.status not in ("PENDING", "APPROVED"):
+            raise ValidationError("Only pending or approved withdrawals can be rejected.")
+
+        wd.status = "REJECTED"
+        wd.rejected_by = request.user
+        wd.rejected_at = timezone.now()
+        if hasattr(wd, "rejection_reason"):
+            wd.rejection_reason = reason
+            wd.save(update_fields=["status", "rejected_by", "rejected_at", "rejection_reason"])
+        else:
+            wd.save(update_fields=["status", "rejected_by", "rejected_at"])
+
+        return Response(
+            {
+                "message": "Withdrawal rejected successfully.",
+                "withdrawal": WithdrawalSerializer(wd, context={"request": request}).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# =========================================================
+# B2C Result / Timeout
+# =========================================================
 class MpesaB2CResultView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -720,10 +703,20 @@ class MpesaB2CResultView(APIView):
         try:
             _require_callback_token(request)
             _require_safaricom_ip(request)
-            if handle_b2c_result_callback:
-                handle_b2c_result_callback(callback_payload=request.data)
+
+            tx = handle_b2c_result_callback(callback_payload=request.data)
+
+            logger.info(
+                "B2C result processed | tx_id=%s | conversation_id=%s | status=%s | result_code=%s | reference=%s",
+                getattr(tx, "id", None),
+                getattr(tx, "conversation_id", None),
+                getattr(tx, "status", None),
+                getattr(tx, "result_code", None),
+                getattr(tx, "reference", None),
+            )
         except Exception as e:
-            logger.exception("B2C result callback handling error: %s", str(e))
+            logger.exception("B2C result handling error: %s", str(e))
+
         return _accepted_callback_response()
 
 
@@ -735,8 +728,17 @@ class MpesaB2CTimeoutView(APIView):
         try:
             _require_callback_token(request)
             _require_safaricom_ip(request)
-            if handle_b2c_timeout_callback:
-                handle_b2c_timeout_callback(callback_payload=request.data)
+
+            tx = handle_b2c_timeout_callback(callback_payload=request.data)
+
+            logger.info(
+                "B2C timeout processed | tx_id=%s | conversation_id=%s | status=%s | reference=%s",
+                getattr(tx, "id", None),
+                getattr(tx, "conversation_id", None),
+                getattr(tx, "status", None),
+                getattr(tx, "reference", None),
+            )
         except Exception as e:
-            logger.exception("B2C timeout callback handling error: %s", str(e))
+            logger.exception("B2C timeout handling error: %s", str(e))
+
         return _accepted_callback_response()

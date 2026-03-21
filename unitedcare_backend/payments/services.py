@@ -91,10 +91,6 @@ def _normalize_reference_token(reference: str) -> str:
 
 
 def get_active_mpesa_config() -> Optional[MpesaConfig]:
-    """
-    Returns the current active Mpesa config.
-    Useful for API/config endpoints or backend display logic.
-    """
     return (
         MpesaConfig.objects.filter(is_active=True)
         .order_by("-updated_at", "-id")
@@ -110,20 +106,25 @@ class ParsedReference:
     entity_id: Optional[int]
     purpose: str
     valid: bool
+    matched_reference_type: str
 
 
 def _parse_reference(reference: str) -> ParsedReference:
     """
-    Supports simple user-friendly references:
-      - mus12      => merry id 12
-      - saving23   => savings target 23
-      - loan35     => loan 35
-      - grp9       => group 9
+    Supported reference styles:
 
-    Keeps backward compatibility with:
-      - MERRY-PAYMENT-99
-      - LOAN-12
-      - GROUP-7
+    SIMPLE / PRIMARY
+    - mus11      => merry contribution for USER id 11
+    - saving23   => savings deposit for USER id 23
+    - sav23      => savings deposit for USER id 23
+    - loan35     => loan repayment for USER id 35
+    - grp9       => group contribution for GROUP id 9
+    - group9     => group contribution for GROUP id 9
+
+    LEGACY
+    - MERRY-PAYMENT-99
+    - LOAN-12
+    - GROUP-7
     """
     raw = (reference or "").strip()
     norm = _normalize_reference_token(raw)
@@ -134,8 +135,9 @@ def _parse_reference(reference: str) -> ParsedReference:
             normalized=norm,
             kind="EMPTY",
             entity_id=None,
-            purpose="SAVINGS_DEPOSIT",
+            purpose="OTHER",
             valid=False,
+            matched_reference_type="UNKNOWN",
         )
 
     m = re.match(r"^MUS(\d+)$", norm)
@@ -143,10 +145,11 @@ def _parse_reference(reference: str) -> ParsedReference:
         return ParsedReference(
             raw=raw,
             normalized=norm,
-            kind="MERRY",
+            kind="MERRY_USER",
             entity_id=int(m.group(1)),
             purpose="MERRY_CONTRIBUTION",
             valid=True,
+            matched_reference_type="MERRY",
         )
 
     m = re.match(r"^SAVING(\d+)$", norm)
@@ -154,10 +157,11 @@ def _parse_reference(reference: str) -> ParsedReference:
         return ParsedReference(
             raw=raw,
             normalized=norm,
-            kind="SAVINGS_ACCOUNT",
+            kind="SAVINGS_USER",
             entity_id=int(m.group(1)),
             purpose="SAVINGS_DEPOSIT",
             valid=True,
+            matched_reference_type="SAVINGS",
         )
 
     m = re.match(r"^SAV(\d+)$", norm)
@@ -165,10 +169,11 @@ def _parse_reference(reference: str) -> ParsedReference:
         return ParsedReference(
             raw=raw,
             normalized=norm,
-            kind="SAVINGS_ACCOUNT",
+            kind="SAVINGS_USER",
             entity_id=int(m.group(1)),
             purpose="SAVINGS_DEPOSIT",
             valid=True,
+            matched_reference_type="SAVINGS",
         )
 
     m = re.match(r"^LOAN(\d+)$", norm)
@@ -176,10 +181,11 @@ def _parse_reference(reference: str) -> ParsedReference:
         return ParsedReference(
             raw=raw,
             normalized=norm,
-            kind="LOAN",
+            kind="LOAN_USER",
             entity_id=int(m.group(1)),
             purpose="LOAN_REPAYMENT",
             valid=True,
+            matched_reference_type="LOAN",
         )
 
     m = re.match(r"^GRP(\d+)$", norm)
@@ -191,6 +197,7 @@ def _parse_reference(reference: str) -> ParsedReference:
             entity_id=int(m.group(1)),
             purpose="GROUP_CONTRIBUTION",
             valid=True,
+            matched_reference_type="GROUP",
         )
 
     m = re.match(r"^GROUP(\d+)$", norm)
@@ -202,6 +209,7 @@ def _parse_reference(reference: str) -> ParsedReference:
             entity_id=int(m.group(1)),
             purpose="GROUP_CONTRIBUTION",
             valid=True,
+            matched_reference_type="GROUP",
         )
 
     # -------------------------
@@ -216,6 +224,7 @@ def _parse_reference(reference: str) -> ParsedReference:
             entity_id=int(m.group(1)),
             purpose="MERRY_CONTRIBUTION",
             valid=True,
+            matched_reference_type="MERRY",
         )
 
     m = re.match(r"^LOAN(\d+)$", norm)
@@ -223,10 +232,11 @@ def _parse_reference(reference: str) -> ParsedReference:
         return ParsedReference(
             raw=raw,
             normalized=norm,
-            kind="LOAN",
+            kind="LOAN_USER",
             entity_id=int(m.group(1)),
             purpose="LOAN_REPAYMENT",
             valid=True,
+            matched_reference_type="LOAN",
         )
 
     m = re.match(r"^GROUP(\d+)$", norm)
@@ -238,6 +248,7 @@ def _parse_reference(reference: str) -> ParsedReference:
             entity_id=int(m.group(1)),
             purpose="GROUP_CONTRIBUTION",
             valid=True,
+            matched_reference_type="GROUP",
         )
 
     return ParsedReference(
@@ -247,13 +258,11 @@ def _parse_reference(reference: str) -> ParsedReference:
         entity_id=None,
         purpose="OTHER",
         valid=False,
+        matched_reference_type="UNKNOWN",
     )
 
 
 def _extract_id(reference: str, prefix: str) -> Optional[int]:
-    """
-    Backward helper kept for legacy compatibility.
-    """
     ref = (reference or "").strip()
     if not ref.startswith(prefix):
         return None
@@ -264,11 +273,6 @@ def _extract_id(reference: str, prefix: str) -> Optional[int]:
 
 
 def _create_mpesa_tx(**kwargs) -> MpesaTransaction:
-    """
-    Backward-safe create:
-    if your MpesaTransaction model already has base_amount / transaction_fee /
-    allocation fields, they will be stored; if not, they will be ignored.
-    """
     model_fields = {f.name for f in MpesaTransaction._meta.get_fields()}
     clean = {k: v for k, v in kwargs.items() if k in model_fields}
     return MpesaTransaction.objects.create(**clean)
@@ -281,27 +285,27 @@ def _update_tx_allocation(
     notes: str = "",
     allocated_by: Optional[AbstractBaseUser] = None,
 ) -> None:
-    updates = {}
+    tx.allocation_status = status
+    tx.allocation_notes = (notes or "")[:255]
 
-    if hasattr(tx, "allocation_status"):
-        tx.allocation_status = status
-        updates["allocation_status"] = status
+    update_fields = ["allocation_status", "allocation_notes"]
 
-    if hasattr(tx, "allocation_notes"):
-        tx.allocation_notes = (notes or "")[:255]
-        updates["allocation_notes"] = tx.allocation_notes
+    if status in ("AUTO_ALLOCATED", "MANUALLY_ALLOCATED", "PARTIALLY_ALLOCATED"):
+        tx.allocated_at = timezone.now()
+        update_fields.append("allocated_at")
 
-    if hasattr(tx, "allocated_at"):
-        if status in ("AUTO_ALLOCATED", "MANUALLY_ALLOCATED", "PARTIALLY_ALLOCATED"):
-            tx.allocated_at = timezone.now()
-            updates["allocated_at"] = tx.allocated_at
-
-    if hasattr(tx, "allocated_by") and allocated_by is not None:
+    if allocated_by is not None:
         tx.allocated_by = allocated_by
-        updates["allocated_by"] = allocated_by
+        update_fields.append("allocated_by")
 
-    if updates:
-        tx.save(update_fields=list(updates.keys()))
+    tx.save(update_fields=update_fields)
+
+
+def _mark_callback_received(tx: MpesaTransaction, *, callback_payload: Dict[str, Any]) -> None:
+    tx.callback_payload = callback_payload
+    tx.callback_received_at = timezone.now()
+    tx.updated_at = timezone.now()
+    tx.save(update_fields=["callback_payload", "callback_received_at", "updated_at"])
 
 
 # ============================================================
@@ -320,12 +324,6 @@ def get_fee_config(purpose: str) -> Optional[TransactionFeeConfig]:
 
 
 def calculate_transaction_fee(*, purpose: str, base_amount: Decimal) -> Decimal:
-    """
-    Central fee calculator.
-    - fixed_fee applies directly
-    - percentage_fee is % of base amount
-    - both are allowed together
-    """
     amount = _money(base_amount)
     if amount <= Decimal("0"):
         return Decimal("0.00")
@@ -352,13 +350,52 @@ def calculate_total_charge(*, purpose: str, base_amount: Decimal) -> Decimal:
     return (amount + fee).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
 
 
+def split_incoming_total_amount(*, purpose: str, total_amount: Decimal) -> Tuple[Decimal, Decimal]:
+    """
+    Reverse fee calculation for manual paybill/C2B where callback only gives the
+    final total amount paid.
+
+    Returns:
+      (base_amount, fee)
+
+    If no fee config exists:
+      base_amount = total_amount
+      fee = 0
+    """
+    total = _money(total_amount)
+    if total <= Decimal("0.00"):
+        return Decimal("0.00"), Decimal("0.00")
+
+    cfg = get_fee_config(purpose)
+    if not cfg:
+        return total, Decimal("0.00")
+
+    fixed_fee = _money(getattr(cfg, "fixed_fee", Decimal("0.00")))
+    pct = _safe_decimal(getattr(cfg, "percentage_fee", Decimal("0.00")))
+
+    if pct <= Decimal("0.00"):
+        base = (total - fixed_fee).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+        if base < Decimal("0.00"):
+            base = Decimal("0.00")
+        fee = (total - base).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+        return base, fee
+
+    divisor = Decimal("1.00") + (pct / Decimal("100"))
+    base = ((total - fixed_fee) / divisor).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+    if base < Decimal("0.00"):
+        base = Decimal("0.00")
+
+    fee = (total - base).quantize(DECIMAL_2, rounding=ROUND_HALF_UP)
+    if fee < Decimal("0.00"):
+        fee = Decimal("0.00")
+
+    return base, fee
+
+
 # ============================================================
 # Group membership guard for GROUP_CONTRIBUTION
 # ============================================================
 def _require_active_group_membership(*, user: AbstractBaseUser, group_id: int) -> None:
-    """
-    Prevent non-members from paying into a group.
-    """
     try:
         from groups.models import GroupMembership
     except Exception:
@@ -483,12 +520,15 @@ def _verify_stk_with_query(client: DarajaClient, tx: MpesaTransaction) -> Dict[s
 # ============================================================
 @transaction.atomic
 def _apply_merry_contribution(tx: MpesaTransaction) -> None:
+    """
+    IMPORTANT:
+    - mus11 means merry allocation for USER id 11
+    - reference is authoritative
+    - phone mismatch should not block allocation
+    """
     parsed = _parse_reference(tx.reference or "")
 
-    # --------------------------------------------
-    # New simple reference style: mus12 => merry id 12
-    # --------------------------------------------
-    if parsed.valid and parsed.kind == "MERRY":
+    if parsed.valid and parsed.kind == "MERRY_USER" and parsed.entity_id:
         try:
             from merry import services as merry_services
         except Exception:
@@ -500,47 +540,60 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
             return
 
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-        base_amount = _money(payload.get("base_amount", tx.amount))
+        base_amount = _money(payload.get("base_amount", tx.base_amount or tx.amount))
 
-        candidate_names = (
-            "apply_mpesa_contribution_by_merry_reference",
-            "apply_mpesa_contribution_by_merry_id",
-            "apply_mpesa_contribution_by_reference",
+        fn = getattr(merry_services, "apply_mpesa_contribution_by_user_reference", None)
+        if callable(fn):
+            try:
+                fn(
+                    user_id=parsed.entity_id,
+                    amount=base_amount,
+                    mpesa_tx=tx,
+                    reference=tx.reference or "",
+                )
+
+                note = "Merry contribution auto-allocated by user reference."
+                if tx.user_id and tx.user_id != parsed.entity_id:
+                    note = "Allocated by merry user reference; payer phone/user differs from beneficiary."
+
+                _update_tx_allocation(
+                    tx,
+                    status="AUTO_ALLOCATED",
+                    notes=note,
+                )
+                return
+            except Exception as e:
+                _update_tx_allocation(
+                    tx,
+                    status="MANUAL_REVIEW",
+                    notes=f"Merry allocation error: {str(e)}"[:255],
+                )
+                return
+
+        fallback_names = (
+            "apply_mpesa_contribution_by_user",
             "apply_mpesa_contribution",
         )
 
-        for fn_name in candidate_names:
-            fn = getattr(merry_services, fn_name, None)
-            if not callable(fn):
+        for fn_name in fallback_names:
+            fallback = getattr(merry_services, fn_name, None)
+            if not callable(fallback):
                 continue
 
             try:
-                if fn_name == "apply_mpesa_contribution_by_merry_reference":
-                    fn(
-                        merry_id=parsed.entity_id,
+                if fn_name == "apply_mpesa_contribution_by_user":
+                    fallback(
+                        user_id=parsed.entity_id,
                         amount=base_amount,
                         mpesa_tx=tx,
                         reference=tx.reference or "",
-                        user=tx.user,
-                    )
-                elif fn_name == "apply_mpesa_contribution_by_merry_id":
-                    fn(
-                        merry_id=parsed.entity_id,
-                        amount=base_amount,
-                        mpesa_tx=tx,
-                        reference=tx.reference or "",
-                        user=tx.user,
-                    )
-                elif fn_name == "apply_mpesa_contribution_by_reference":
-                    fn(
-                        reference=tx.reference or "",
-                        amount=base_amount,
-                        mpesa_tx=tx,
-                        user=tx.user,
                     )
                 else:
-                    fn(
-                        user=tx.user,
+                    beneficiary_user = UserModel.objects.filter(id=parsed.entity_id).first()
+                    if not beneficiary_user:
+                        raise ValueError("Beneficiary user not found for merry reference.")
+                    fallback(
+                        user=beneficiary_user,
                         amount=base_amount,
                         mpesa_tx=tx,
                         reference=tx.reference or "",
@@ -549,46 +602,9 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
                 _update_tx_allocation(
                     tx,
                     status="AUTO_ALLOCATED",
-                    notes="Merry contribution auto-allocated from simple reference.",
+                    notes="Merry contribution auto-allocated by fallback user reference flow.",
                 )
                 return
-            except TypeError:
-                try:
-                    # fallback for older function signatures
-                    if fn_name in ("apply_mpesa_contribution_by_merry_reference", "apply_mpesa_contribution_by_merry_id"):
-                        fn(
-                            merry_id=parsed.entity_id,
-                            amount=base_amount,
-                            mpesa_tx=tx,
-                            reference=tx.reference or "",
-                        )
-                    elif fn_name == "apply_mpesa_contribution_by_reference":
-                        fn(
-                            reference=tx.reference or "",
-                            amount=base_amount,
-                            mpesa_tx=tx,
-                        )
-                    else:
-                        fn(
-                            user=tx.user,
-                            amount=base_amount,
-                            mpesa_tx=tx,
-                            reference=tx.reference or "",
-                        )
-
-                    _update_tx_allocation(
-                        tx,
-                        status="AUTO_ALLOCATED",
-                        notes="Merry contribution auto-allocated from simple reference.",
-                    )
-                    return
-                except Exception as e:
-                    _update_tx_allocation(
-                        tx,
-                        status="MANUAL_REVIEW",
-                        notes=f"Merry allocation error: {str(e)}"[:255],
-                    )
-                    return
             except Exception as e:
                 _update_tx_allocation(
                     tx,
@@ -607,11 +623,15 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
     # --------------------------------------------
     # Legacy style: MERRY-PAYMENT-99
     # --------------------------------------------
-    payment_id = _extract_id(tx.reference or "", "MERRY-PAYMENT-")
+    if parsed.valid and parsed.kind == "MERRY_PAYMENT" and parsed.entity_id:
+        payment_id = parsed.entity_id
+    else:
+        payment_id = _extract_id(tx.reference or "", "MERRY-PAYMENT-")
+
     if not payment_id:
         _update_tx_allocation(
             tx,
-            status="MANUAL_REVIEW",
+            status="INVALID_REFERENCE",
             notes="Merry reference not mapped automatically.",
         )
         return
@@ -648,7 +668,9 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
     pay.paid_at = timezone.now()
     if tx.mpesa_receipt_number and not pay.mpesa_receipt_number:
         pay.mpesa_receipt_number = tx.mpesa_receipt_number
-    pay.save(update_fields=["status", "paid_at", "mpesa_receipt_number"])
+        pay.save(update_fields=["status", "paid_at", "mpesa_receipt_number"])
+    else:
+        pay.save(update_fields=["status", "paid_at"])
 
     allocate_payment(pay.id)
     _update_tx_allocation(
@@ -660,44 +682,199 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
 
 @transaction.atomic
 def _apply_loan_repayment(tx: MpesaTransaction) -> None:
+    """
+    loan19 => USER id 19
+    Backend loan service should find that user's active loan.
+    """
     parsed = _parse_reference(tx.reference or "")
-    loan_id = parsed.entity_id if parsed.valid and parsed.kind == "LOAN" else _extract_id(tx.reference or "", "LOAN-")
-    if not loan_id:
-        _update_tx_allocation(tx, status="INVALID_REFERENCE", notes="Invalid loan reference.")
+    beneficiary_user_id = (
+        parsed.entity_id
+        if parsed.valid and parsed.kind == "LOAN_USER"
+        else _extract_id(tx.reference or "", "LOAN-")
+    )
+
+    if not beneficiary_user_id:
+        _update_tx_allocation(
+            tx,
+            status="INVALID_REFERENCE",
+            notes="Invalid loan reference.",
+        )
         return
 
     try:
         from loans import services as loan_services
     except Exception:
-        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Loan services unavailable.")
+        _update_tx_allocation(
+            tx,
+            status="MANUAL_REVIEW",
+            notes="Loan services unavailable.",
+        )
         return
 
-    fn = getattr(loan_services, "apply_mpesa_repayment", None)
-    if callable(fn):
-        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-        base_amount = _money(payload.get("base_amount", tx.amount))
-        fn(loan_id=loan_id, amount=base_amount, mpesa_tx=tx)
-        _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Loan repayment auto-applied.")
-    else:
-        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Loan repayment function not found.")
+    payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+    base_amount = _money(payload.get("base_amount", tx.base_amount or tx.amount))
+
+    preferred_names = (
+        "apply_mpesa_repayment_by_user_reference",
+        "apply_mpesa_repayment_by_user_id",
+        "apply_mpesa_repayment_by_user",
+    )
+
+    for fn_name in preferred_names:
+        fn = getattr(loan_services, fn_name, None)
+        if not callable(fn):
+            continue
+        try:
+            if fn_name == "apply_mpesa_repayment_by_user":
+                beneficiary_user = UserModel.objects.filter(id=beneficiary_user_id).first()
+                if not beneficiary_user:
+                    raise ValueError("Beneficiary user not found for loan reference.")
+                fn(
+                    user=beneficiary_user,
+                    amount=base_amount,
+                    mpesa_tx=tx,
+                    reference=tx.reference or "",
+                )
+            else:
+                fn(
+                    user_id=beneficiary_user_id,
+                    amount=base_amount,
+                    mpesa_tx=tx,
+                    reference=tx.reference or "",
+                )
+
+            note = "Loan repayment auto-applied by user reference."
+            if tx.user_id and tx.user_id != beneficiary_user_id:
+                note = "Allocated by loan user reference; payer phone/user differs from beneficiary."
+
+            _update_tx_allocation(
+                tx,
+                status="AUTO_ALLOCATED",
+                notes=note,
+            )
+            return
+        except Exception as e:
+            _update_tx_allocation(
+                tx,
+                status="MANUAL_REVIEW",
+                notes=f"Loan allocation error: {str(e)}"[:255],
+            )
+            return
+
+    fallback = getattr(loan_services, "apply_mpesa_repayment", None)
+    if callable(fallback):
+        try:
+            fallback(
+                loan_id=beneficiary_user_id,
+                amount=base_amount,
+                mpesa_tx=tx,
+            )
+            _update_tx_allocation(
+                tx,
+                status="AUTO_ALLOCATED",
+                notes="Loan repayment auto-applied by fallback logic.",
+            )
+            return
+        except Exception as e:
+            _update_tx_allocation(
+                tx,
+                status="MANUAL_REVIEW",
+                notes=f"Loan allocation error: {str(e)}"[:255],
+            )
+            return
+
+    _update_tx_allocation(
+        tx,
+        status="MANUAL_REVIEW",
+        notes="Loan repayment function not found.",
+    )
 
 
 @transaction.atomic
 def _apply_savings_deposit(tx: MpesaTransaction) -> None:
+    """
+    saving19 / sav19 => USER id 19
+    """
+    parsed = _parse_reference(tx.reference or "")
+
     try:
         from savings import services as savings_services
     except Exception:
         _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Savings services unavailable.")
         return
 
+    payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
+    base_amount = _money(payload.get("base_amount", tx.base_amount or tx.amount))
+
+    if parsed.valid and parsed.kind == "SAVINGS_USER" and parsed.entity_id:
+        preferred_names = (
+            "apply_mpesa_deposit_by_user_reference",
+            "apply_mpesa_deposit_by_user_id",
+            "apply_mpesa_deposit_by_user",
+        )
+
+        for fn_name in preferred_names:
+            fn = getattr(savings_services, fn_name, None)
+            if not callable(fn):
+                continue
+            try:
+                if fn_name == "apply_mpesa_deposit_by_user":
+                    beneficiary_user = UserModel.objects.filter(id=parsed.entity_id).first()
+                    if not beneficiary_user:
+                        raise ValueError("Beneficiary user not found for savings reference.")
+                    fn(
+                        user=beneficiary_user,
+                        amount=base_amount,
+                        mpesa_tx=tx,
+                        reference=tx.reference or "",
+                    )
+                else:
+                    fn(
+                        user_id=parsed.entity_id,
+                        amount=base_amount,
+                        mpesa_tx=tx,
+                        reference=tx.reference or "",
+                    )
+
+                note = "Savings deposit auto-applied by user reference."
+                if tx.user_id and tx.user_id != parsed.entity_id:
+                    note = "Allocated by savings user reference; payer phone/user differs from beneficiary."
+
+                _update_tx_allocation(
+                    tx,
+                    status="AUTO_ALLOCATED",
+                    notes=note,
+                )
+                return
+            except Exception as e:
+                _update_tx_allocation(
+                    tx,
+                    status="MANUAL_REVIEW",
+                    notes=f"Savings allocation error: {str(e)}"[:255],
+                )
+                return
+
     fn = getattr(savings_services, "apply_mpesa_deposit", None)
     if callable(fn):
-        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-        base_amount = _money(payload.get("base_amount", tx.amount))
-        fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
-        _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Savings deposit auto-applied.")
-    else:
-        _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Savings deposit function not found.")
+        try:
+            if not tx.user_id:
+                raise ValueError("No user attached to transaction for fallback savings allocation.")
+            fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
+            _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Savings deposit auto-applied.")
+            return
+        except Exception as e:
+            _update_tx_allocation(
+                tx,
+                status="MANUAL_REVIEW",
+                notes=f"Savings allocation error: {str(e)}"[:255],
+            )
+            return
+
+    _update_tx_allocation(
+        tx,
+        status="MANUAL_REVIEW",
+        notes="Savings deposit function not found.",
+    )
 
 
 @transaction.atomic
@@ -711,9 +888,12 @@ def _apply_group_contribution(tx: MpesaTransaction) -> None:
     fn = getattr(group_services, "apply_mpesa_contribution", None)
     if callable(fn):
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-        base_amount = _money(payload.get("base_amount", tx.amount))
-        fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
-        _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Group contribution auto-applied.")
+        base_amount = _money(payload.get("base_amount", tx.base_amount or tx.amount))
+        try:
+            fn(user=tx.user, amount=base_amount, mpesa_tx=tx, reference=tx.reference or "")
+            _update_tx_allocation(tx, status="AUTO_ALLOCATED", notes="Group contribution auto-applied.")
+        except Exception as e:
+            _update_tx_allocation(tx, status="MANUAL_REVIEW", notes=f"Group allocation error: {str(e)}"[:255])
     else:
         _update_tx_allocation(tx, status="MANUAL_REVIEW", notes="Group contribution function not found.")
 
@@ -752,8 +932,8 @@ def _finalize_successful_incoming_tx(tx: MpesaTransaction, *, channel_label: str
         category = _purpose_to_ledger_category(tx.purpose)
         payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
 
-        base_amount = _money(payload.get("base_amount", tx.amount))
-        fee = _money(payload.get("fee", "0"))
+        base_amount = _money(payload.get("base_amount", tx.base_amount or tx.amount))
+        fee = _money(payload.get("fee", tx.transaction_fee or "0"))
 
         business_ref = (tx.reference or "").strip()
         receipt_ref = (tx.mpesa_receipt_number or "").strip()
@@ -793,20 +973,65 @@ def _finalize_successful_incoming_tx(tx: MpesaTransaction, *, channel_label: str
 
 
 # ============================================================
+# C2B HELPERS
+# ============================================================
+def _find_existing_pending_c2b_tx(
+    *,
+    phone: str,
+    total_amount: Decimal,
+    raw_reference: str,
+    purpose: str,
+) -> Optional[MpesaTransaction]:
+    """
+    Try to match an already-created pending app transaction so that
+    C2B confirmation updates that same row instead of creating a new one.
+    """
+    phone_n = normalize_phone(phone)
+    amount_n = _money(total_amount)
+    norm_ref = _normalize_reference_token(raw_reference)
+
+    recent_qs = (
+        MpesaTransaction.objects.select_for_update()
+        .filter(
+            direction__in=("IN", "INCOMING"),
+            channel__in=("STK", "C2B"),
+            payment_method__in=("PAYBILL", "STK"),
+            status__in=("INITIATED", "PENDING", "UNALLOCATED"),
+            created_at__gte=timezone.now() - timezone.timedelta(hours=12),
+        )
+        .order_by("-created_at", "-id")
+    )
+
+    for tx in recent_qs:
+        tx_ref = _normalize_reference_token(tx.reference or tx.external_reference_raw or "")
+        tx_phone = normalize_phone(tx.phone or tx.matched_user_phone or "")
+        tx_amount = _money(tx.amount)
+
+        if norm_ref and tx_ref != norm_ref:
+            continue
+        if phone_n and tx_phone and tx_phone != phone_n:
+            continue
+        if tx_amount != amount_n:
+            continue
+        if purpose and (tx.purpose or "").upper() != (purpose or "").upper():
+            continue
+
+        return tx
+
+    return None
+
+
+# ============================================================
 # C2B SERVICES
 # ============================================================
 def handle_c2b_validation_callback(*, callback_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Basic C2B validation.
-    Safaricom sends payment details before final confirmation.
-
     Accepts simple references like:
-      - mus12
-      - saving23
-      - loan35
+      - mus11
+      - saving19
+      - loan19
       - grp9
-
-    Also supports legacy references.
     """
     reference = (
         callback_payload.get("BillRefNumber")
@@ -836,12 +1061,10 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     Handles manual Paybill C2B confirmation callback.
 
     Supported references:
-      - mus12
-      - saving23
-      - loan35
-      - grp9
-
-    Legacy references are still supported too.
+      - mus11      => merry for user 11
+      - saving19   => savings for user 19
+      - loan19     => loan repayment for user 19
+      - grp9       => group 9
     """
     receipt = (
         callback_payload.get("TransID")
@@ -853,12 +1076,6 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     if not receipt:
         raise ValueError("Invalid C2B callback: missing receipt/TransID")
 
-    existing = MpesaTransaction.objects.select_for_update().filter(
-        mpesa_receipt_number=receipt
-    ).first()
-    if existing:
-        return _finalize_successful_incoming_tx(existing, channel_label="C2B")
-
     phone_raw = (
         callback_payload.get("MSISDN")
         or callback_payload.get("MSISDNNumber")
@@ -868,61 +1085,169 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     )
     phone = normalize_phone(str(phone_raw))
 
-    amount = _money(
+    total_amount = _money(
         callback_payload.get("TransAmount")
         or callback_payload.get("Amount")
         or "0"
     )
-    if amount <= Decimal("0.00"):
+    if total_amount <= Decimal("0.00"):
         raise ValueError("Invalid C2B callback: amount must be greater than 0")
 
-    reference = (
+    raw_reference = (
         callback_payload.get("BillRefNumber")
         or callback_payload.get("BillRef")
         or callback_payload.get("AccountReference")
         or ""
     ).strip()
 
-    parsed = _parse_reference(reference)
+    parsed = _parse_reference(raw_reference)
     purpose = parsed.purpose if parsed.valid else "OTHER"
 
-    user = None
-    if phone:
-        user = UserModel.objects.filter(phone=phone).first()
+    # 1. First try exact receipt match
+    existing = MpesaTransaction.objects.select_for_update().filter(
+        mpesa_receipt_number=receipt
+    ).first()
+    if existing:
+        if existing.status != "SUCCESS":
+            existing.status = "SUCCESS"
+        existing.channel = "C2B"
+        existing.payment_method = "PAYBILL"
+        existing.origin = existing.origin or "EXTERNAL"
+        existing.direction = existing.direction or "IN"
+        existing.reference = parsed.normalized or raw_reference or existing.reference
+        existing.external_reference_raw = raw_reference or existing.external_reference_raw
+        existing.matched_reference_type = parsed.matched_reference_type
+        existing.result_code = "0"
+        existing.result_desc = "C2B confirmed"
+        existing.callback_payload = callback_payload
+        existing.callback_received_at = timezone.now()
+        existing.updated_at = timezone.now()
+        if phone:
+            existing.phone = phone
+        existing.save()
+        return _finalize_successful_incoming_tx(existing, channel_label="C2B")
 
-    if parsed.valid and parsed.kind == "GROUP" and user and parsed.entity_id:
-        _require_active_group_membership(user=user, group_id=parsed.entity_id)
+    # 2. Then try to match existing pending tx created earlier by app flow
+    matched_pending = _find_existing_pending_c2b_tx(
+        phone=phone,
+        total_amount=total_amount,
+        raw_reference=raw_reference,
+        purpose=purpose,
+    )
 
-    fee = Decimal("0.00")
-    base_amount = amount
+    matched_user = UserModel.objects.filter(phone=phone).first() if phone else None
+    matched_user_phone = matched_user.phone if matched_user and getattr(matched_user, "phone", "") else ""
 
+    if parsed.valid and parsed.kind == "GROUP" and matched_user and parsed.entity_id:
+        _require_active_group_membership(user=matched_user, group_id=parsed.entity_id)
+
+    base_amount, fee = split_incoming_total_amount(
+        purpose=purpose,
+        total_amount=total_amount,
+    )
+
+    resolved_user = matched_user
+    allocation_note = ""
+
+    if parsed.valid and parsed.kind in ("MERRY_USER", "SAVINGS_USER", "LOAN_USER") and parsed.entity_id:
+        beneficiary = UserModel.objects.filter(id=parsed.entity_id).first()
+        if beneficiary:
+            resolved_user = beneficiary
+            if matched_user and beneficiary.id != matched_user.id:
+                allocation_note = "Reference beneficiary differs from payer phone user."
+
+    if matched_pending:
+        matched_pending.user = resolved_user or matched_pending.user
+        matched_pending.phone = phone or matched_pending.phone
+        matched_pending.matched_user_phone = matched_user_phone or matched_pending.matched_user_phone
+        matched_pending.amount = total_amount
+        matched_pending.base_amount = base_amount
+        matched_pending.transaction_fee = fee
+        matched_pending.direction = matched_pending.direction or "IN"
+        matched_pending.channel = "C2B"
+        matched_pending.payment_method = "PAYBILL"
+        matched_pending.origin = matched_pending.origin or "EXTERNAL"
+        matched_pending.purpose = purpose or matched_pending.purpose
+        matched_pending.status = "SUCCESS"
+        matched_pending.reference = parsed.normalized or raw_reference or matched_pending.reference
+        matched_pending.external_reference_raw = raw_reference or matched_pending.external_reference_raw
+        matched_pending.matched_reference_type = parsed.matched_reference_type
+        matched_pending.mpesa_receipt_number = receipt
+        matched_pending.result_code = "0"
+        matched_pending.result_desc = "C2B confirmed"
+        matched_pending.transaction_date = timezone.now()
+        matched_pending.callback_received_at = timezone.now()
+        matched_pending.callback_payload = callback_payload
+
+        existing_payload = matched_pending.request_payload if isinstance(matched_pending.request_payload, dict) else {}
+        existing_payload.update(
+            {
+                "base_amount": str(base_amount),
+                "fee": str(fee),
+                "total_amount": str(total_amount),
+                "source": "C2B",
+                "payment_method": "PAYBILL",
+                "origin": matched_pending.origin or "EXTERNAL",
+                "parsed_reference": {
+                    "kind": parsed.kind,
+                    "entity_id": parsed.entity_id,
+                    "purpose": parsed.purpose,
+                    "valid": parsed.valid,
+                    "matched_reference_type": parsed.matched_reference_type,
+                },
+            }
+        )
+        matched_pending.request_payload = existing_payload
+
+        if parsed.valid:
+            if not matched_pending.allocation_notes:
+                matched_pending.allocation_notes = allocation_note
+        else:
+            matched_pending.allocation_status = "INVALID_REFERENCE"
+            matched_pending.allocation_notes = "Invalid or unsupported account reference."
+
+        matched_pending.save()
+        if not parsed.valid:
+            return matched_pending
+        return _finalize_successful_incoming_tx(matched_pending, channel_label="C2B")
+
+    # 3. Only create a new tx if nothing matched
     tx = _create_mpesa_tx(
-        user=user,
+        user=resolved_user,
         phone=phone or "0700000000",
-        amount=amount,
+        matched_user_phone=matched_user_phone,
+        amount=total_amount,
         base_amount=base_amount,
         transaction_fee=fee,
         direction="IN",
         channel="C2B",
+        payment_method="PAYBILL",
+        origin="EXTERNAL",
         purpose=purpose,
         status="SUCCESS",
-        reference=reference,
+        reference=parsed.normalized or raw_reference,
+        external_reference_raw=raw_reference,
+        matched_reference_type=parsed.matched_reference_type,
         mpesa_receipt_number=receipt,
         result_code="0",
         result_desc="C2B confirmed",
         transaction_date=timezone.now(),
+        callback_received_at=timezone.now(),
         allocation_status="UNALLOCATED" if parsed.valid else "INVALID_REFERENCE",
-        allocation_notes="" if parsed.valid else "Invalid or unsupported account reference.",
+        allocation_notes=allocation_note if parsed.valid else "Invalid or unsupported account reference.",
         request_payload={
             "base_amount": str(base_amount),
             "fee": str(fee),
-            "total_amount": str(amount),
+            "total_amount": str(total_amount),
             "source": "C2B",
+            "payment_method": "PAYBILL",
+            "origin": "EXTERNAL",
             "parsed_reference": {
                 "kind": parsed.kind,
                 "entity_id": parsed.entity_id,
                 "purpose": parsed.purpose,
                 "valid": parsed.valid,
+                "matched_reference_type": parsed.matched_reference_type,
             },
         },
         callback_payload=callback_payload,
@@ -952,8 +1277,9 @@ def initiate_stk_push(
 
     IMPORTANT:
     - amount here is the BASE amount from frontend
-    - fee is calculated centrally from TransactionFeeConfig
+    - fee is calculated centrally
     - total_amount = base_amount + fee
+    - saving19 / loan19 / mus19 use USER ids
     """
     phone_n = normalize_phone(phone)
     base_amount = _money(amount)
@@ -996,23 +1322,32 @@ def initiate_stk_push(
     if recent:
         return recent
 
+    normalized_ref = parsed.normalized if parsed.valid else (reference or "")
+
     tx = _create_mpesa_tx(
         user=user,
         phone=phone_n,
+        matched_user_phone=getattr(user, "phone", "") or "",
         amount=total_amount,
         base_amount=base_amount,
         transaction_fee=fee,
         direction="IN",
         channel="STK",
+        payment_method="STK",
+        origin="APP",
         purpose=purpose_u,
         status="INITIATED",
-        reference=reference or "",
+        reference=normalized_ref,
+        external_reference_raw=reference or "",
+        matched_reference_type=parsed.matched_reference_type if parsed.valid else "UNKNOWN",
         allocation_status="UNALLOCATED",
         request_payload={
             "base_amount": str(base_amount),
             "fee": str(fee),
             "total_amount": str(total_amount),
             "narration": narration or "",
+            "payment_method": "STK",
+            "origin": "APP",
         },
         callback_payload=None,
         target_content_type=ct,
@@ -1025,7 +1360,7 @@ def initiate_stk_push(
     res = client.stk_push(
         phone=phone_n,
         amount=total_amount,
-        account_reference=reference or f"TX{tx.id}",
+        account_reference=normalized_ref or f"TX{tx.id}",
         transaction_desc=narration or purpose_u,
         callback_url=callback_url,
     )
@@ -1045,73 +1380,108 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     """
     Handles STK callback:
     - updates MpesaTransaction status fields
-    - verifies SUCCESS using STK Query
+    - treats callback ResultCode=0 as SUCCESS immediately
+    - optional STK query is only enrichment, not a blocker
     - posts ledger entries (idempotent)
     - routes to business modules
     """
     stk = (((callback_payload or {}).get("Body") or {}).get("stkCallback")) or {}
     checkout_id = stk.get("CheckoutRequestID") or ""
     merchant_id = stk.get("MerchantRequestID") or ""
-    callback_result_code = str(stk.get("ResultCode")) if stk.get("ResultCode") is not None else ""
+    callback_result_code = (
+        str(stk.get("ResultCode")) if stk.get("ResultCode") is not None else ""
+    )
     callback_result_desc = stk.get("ResultDesc") or ""
 
     if not checkout_id:
         raise ValueError("Invalid STK callback: missing CheckoutRequestID")
 
-    tx = MpesaTransaction.objects.select_for_update().filter(checkout_request_id=checkout_id).first()
+    tx = (
+        MpesaTransaction.objects.select_for_update()
+        .filter(checkout_request_id=checkout_id)
+        .first()
+    )
     if not tx:
         raise ValueError("Unknown CheckoutRequestID (no matching transaction)")
 
     tx.merchant_request_id = tx.merchant_request_id or merchant_id
-    tx.callback_payload = callback_payload
     tx.result_code = callback_result_code
     tx.result_desc = callback_result_desc
     tx.updated_at = timezone.now()
-    tx.save(update_fields=["merchant_request_id", "callback_payload", "result_code", "result_desc", "updated_at"])
+
+    _mark_callback_received(tx, callback_payload=callback_payload)
 
     if callback_result_code != "0":
         tx.status = "CANCELLED" if callback_result_code in ("1032",) else "FAILED"
-        tx.save(update_fields=["status"])
+        tx.updated_at = timezone.now()
+        tx.save(
+            update_fields=[
+                "merchant_request_id",
+                "result_code",
+                "result_desc",
+                "status",
+                "updated_at",
+            ]
+        )
         return tx
+
+    # Main fix: callback success is authoritative
+    tx.status = "SUCCESS"
+    tx.callback_received_at = timezone.now()
+    tx.updated_at = timezone.now()
 
     enable_verify = getattr(settings, "MPESA_ENABLE_STK_QUERY_VERIFICATION", True)
 
     if enable_verify:
-        client = get_daraja_client()
         try:
+            client = get_daraja_client()
             q = _verify_stk_with_query(client, tx)
+
+            receipt = q.get("MpesaReceiptNumber") or q.get("mpesaReceiptNumber")
+            amount_q = _safe_decimal(q.get("Amount"))
+            tx_date = q.get("TransactionDate")
+
+            if receipt and not tx.mpesa_receipt_number:
+                tx.mpesa_receipt_number = str(receipt)
+
+            if amount_q > Decimal("0") and amount_q != tx.amount:
+                if getattr(settings, "MPESA_STRICT_AMOUNT_MATCH", True):
+                    tx.status = "FAILED"
+                    tx.result_desc = "Amount mismatch detected during STK verification."[:255]
+                    tx.updated_at = timezone.now()
+                    tx.save(
+                        update_fields=[
+                            "merchant_request_id",
+                            "result_code",
+                            "result_desc",
+                            "status",
+                            "updated_at",
+                            "mpesa_receipt_number",
+                            "callback_received_at",
+                        ]
+                    )
+                    return tx
+
+            if tx_date and not tx.transaction_date:
+                tx.transaction_date = timezone.now()
+
         except Exception as e:
-            tx.status = "PENDING"
-            tx.result_desc = f"{tx.result_desc or ''} | Verification error: {str(e)}"[:255]
-            tx.save(update_fields=["status", "result_desc"])
-            return tx
+            # Do not revert paid callback to pending
+            warn = f"Verification warning: {str(e)}"
+            tx.result_desc = f"{tx.result_desc or ''} | {warn}"[:255]
 
-        if not _stk_query_is_success(q):
-            tx.status = "PENDING"
-            tx.result_desc = f"{tx.result_desc or ''} | STK Query not confirmed"[:255]
-            tx.save(update_fields=["status", "result_desc"])
-            return tx
-
-        receipt = q.get("MpesaReceiptNumber") or q.get("mpesaReceiptNumber")
-        amount_q = _safe_decimal(q.get("Amount"))
-        tx_date = q.get("TransactionDate")
-
-        if receipt and not tx.mpesa_receipt_number:
-            tx.mpesa_receipt_number = str(receipt)
-
-        if amount_q > Decimal("0") and amount_q != tx.amount:
-            if getattr(settings, "MPESA_STRICT_AMOUNT_MATCH", True):
-                tx.status = "FAILED"
-                tx.result_desc = "Amount mismatch detected during STK verification."[:255]
-                tx.save(update_fields=["status", "result_desc", "mpesa_receipt_number"])
-                return tx
-
-        if tx_date and not tx.transaction_date:
-            tx.transaction_date = timezone.now()
-
-    tx.status = "SUCCESS"
-    tx.updated_at = timezone.now()
-    tx.save(update_fields=["status", "updated_at", "mpesa_receipt_number", "transaction_date"])
+    tx.save(
+        update_fields=[
+            "merchant_request_id",
+            "result_code",
+            "result_desc",
+            "status",
+            "updated_at",
+            "mpesa_receipt_number",
+            "transaction_date",
+            "callback_received_at",
+        ]
+    )
 
     return _finalize_successful_incoming_tx(tx, channel_label="STK")
 
@@ -1204,14 +1574,19 @@ def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransactio
         tx = _create_mpesa_tx(
             user=wd.user,
             phone=wd.phone,
+            matched_user_phone=getattr(wd.user, "phone", "") or "",
             amount=payout_amount,
             base_amount=requested_amount,
             transaction_fee=fee,
             direction="OUT",
             channel="B2C",
+            payment_method="B2C",
+            origin="SYSTEM",
             purpose="WITHDRAWAL",
             status="INITIATED",
             reference=f"WD#{wd.id}",
+            external_reference_raw=f"WD#{wd.id}",
+            matched_reference_type="WITHDRAWAL",
             request_payload={
                 "withdrawal_id": wd.id,
                 "requested_amount": str(requested_amount),
@@ -1219,6 +1594,8 @@ def initiate_b2c_payout_for_withdrawal(*, withdrawal_id: int) -> MpesaTransactio
                 "payout_amount": str(payout_amount),
                 "source": wd.source,
                 "total_deduction": str(total_deduction),
+                "payment_method": "B2C",
+                "origin": "SYSTEM",
             },
             callback_payload=None,
             target_content_type=ct,
@@ -1272,12 +1649,13 @@ def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTran
     if not tx:
         raise ValueError("Unknown ConversationID (no matching transaction)")
 
+    _mark_callback_received(tx, callback_payload=callback_payload)
+
     tx.result_code = result_code
     tx.result_desc = result_desc
-    tx.callback_payload = callback_payload
     tx.status = "SUCCESS" if result_code == "0" else "FAILED"
     tx.updated_at = timezone.now()
-    tx.save(update_fields=["result_code", "result_desc", "callback_payload", "status", "updated_at"])
+    tx.save(update_fields=["result_code", "result_desc", "status", "updated_at"])
 
     wd = WithdrawalRequest.objects.select_for_update().filter(mpesa_tx=tx).first()
     if wd:
@@ -1301,20 +1679,17 @@ def handle_b2c_result_callback(*, callback_payload: Dict[str, Any]) -> MpesaTran
         requested_amount = _money(tx.amount + fee)
 
     if wd and wd.status == "PAID" and source_category == "SAVINGS":
-        try:
-            from savings import services as savings_services
+        from savings import services as savings_services
 
-            fn = getattr(savings_services, "apply_mpesa_withdrawal_payout", None)
-            if callable(fn):
-                fn(
-                    user=tx.user,
-                    requested_amount=requested_amount,
-                    withdrawal_ref=tx.reference or f"WD#{wd.id}",
-                    target_object=wd.target_object,
-                    mpesa_tx=tx,
-                )
-        except Exception:
-            raise
+        fn = getattr(savings_services, "apply_mpesa_withdrawal_payout", None)
+        if callable(fn):
+            fn(
+                user=tx.user,
+                requested_amount=requested_amount,
+                withdrawal_ref=tx.reference or f"WD#{wd.id}",
+                target_object=wd.target_object,
+                mpesa_tx=tx,
+            )
 
     create_ledger_entry(
         user=tx.user,
@@ -1359,10 +1734,11 @@ def handle_b2c_timeout_callback(*, callback_payload: Dict[str, Any]) -> MpesaTra
     if not tx:
         raise ValueError("Unknown ConversationID (no matching transaction)")
 
+    _mark_callback_received(tx, callback_payload=callback_payload)
+
     tx.status = "TIMEOUT"
-    tx.callback_payload = callback_payload
     tx.updated_at = timezone.now()
-    tx.save(update_fields=["status", "callback_payload", "updated_at"])
+    tx.save(update_fields=["status", "updated_at"])
 
     wd = WithdrawalRequest.objects.select_for_update().filter(mpesa_tx=tx).first()
     if wd and not wd.is_final:
