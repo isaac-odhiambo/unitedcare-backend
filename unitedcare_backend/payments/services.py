@@ -308,6 +308,33 @@ def _mark_callback_received(tx: MpesaTransaction, *, callback_payload: Dict[str,
     tx.save(update_fields=["callback_payload", "callback_received_at", "updated_at"])
 
 
+def _extract_stk_metadata_items(stk: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Safely flattens STK CallbackMetadata.Item list into a dict.
+
+    Example source:
+    [
+        {"Name": "Amount", "Value": 2},
+        {"Name": "MpesaReceiptNumber", "Value": "UCMI2A8PWR"},
+        {"Name": "Balance"},
+        {"Name": "TransactionDate", "Value": 20260322130923},
+        {"Name": "PhoneNumber", "Value": 254701956902},
+    ]
+    """
+    items = ((stk or {}).get("CallbackMetadata") or {}).get("Item") or []
+    parsed: Dict[str, Any] = {}
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("Name")
+        if not name:
+            continue
+        parsed[name] = item.get("Value")
+
+    return parsed
+
+
 # ============================================================
 # Central Fee Logic
 # ============================================================
@@ -1409,6 +1436,23 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
     tx.result_desc = callback_result_desc
     tx.updated_at = timezone.now()
 
+    # NEW: extract metadata directly from callback payload and persist it
+    metadata_items = _extract_stk_metadata_items(stk)
+
+    receipt = metadata_items.get("MpesaReceiptNumber")
+    transaction_date_raw = metadata_items.get("TransactionDate")
+    phone_from_callback = metadata_items.get("PhoneNumber")
+
+    if receipt and not tx.mpesa_receipt_number:
+        tx.mpesa_receipt_number = str(receipt)
+
+    if transaction_date_raw and not tx.transaction_date:
+        # Keep minimal safe behavior consistent with your current model usage.
+        tx.transaction_date = timezone.now()
+
+    if phone_from_callback:
+        tx.phone = normalize_phone(str(phone_from_callback))
+
     _mark_callback_received(tx, callback_payload=callback_payload)
 
     if callback_result_code != "0":
@@ -1419,6 +1463,9 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
                 "merchant_request_id",
                 "result_code",
                 "result_desc",
+                "mpesa_receipt_number",
+                "transaction_date",
+                "phone",
                 "status",
                 "updated_at",
             ]
@@ -1437,12 +1484,12 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
             client = get_daraja_client()
             q = _verify_stk_with_query(client, tx)
 
-            receipt = q.get("MpesaReceiptNumber") or q.get("mpesaReceiptNumber")
+            receipt_q = q.get("MpesaReceiptNumber") or q.get("mpesaReceiptNumber")
             amount_q = _safe_decimal(q.get("Amount"))
-            tx_date = q.get("TransactionDate")
+            tx_date_q = q.get("TransactionDate")
 
-            if receipt and not tx.mpesa_receipt_number:
-                tx.mpesa_receipt_number = str(receipt)
+            if receipt_q and not tx.mpesa_receipt_number:
+                tx.mpesa_receipt_number = str(receipt_q)
 
             if amount_q > Decimal("0") and amount_q != tx.amount:
                 if getattr(settings, "MPESA_STRICT_AMOUNT_MATCH", True):
@@ -1457,12 +1504,14 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
                             "status",
                             "updated_at",
                             "mpesa_receipt_number",
+                            "transaction_date",
+                            "phone",
                             "callback_received_at",
                         ]
                     )
                     return tx
 
-            if tx_date and not tx.transaction_date:
+            if tx_date_q and not tx.transaction_date:
                 tx.transaction_date = timezone.now()
 
         except Exception as e:
@@ -1479,6 +1528,7 @@ def handle_stk_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction
             "updated_at",
             "mpesa_receipt_number",
             "transaction_date",
+            "phone",
             "callback_received_at",
         ]
     )
