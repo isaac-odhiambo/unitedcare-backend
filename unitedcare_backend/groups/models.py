@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
-from django.db.models import Q, Sum
+from django.db.models import Q
 from django.utils import timezone
 
 
@@ -80,7 +80,9 @@ class Group(models.Model):
             raise ValidationError("max_members cannot be negative.")
 
         if self.requires_contributions and self.contribution_amount <= 0:
-            raise ValidationError("Contribution amount must be greater than 0 if contributions are required.")
+            raise ValidationError(
+                "Contribution amount must be greater than 0 if contributions are required."
+            )
 
     def active_members_count(self) -> int:
         return self.memberships.filter(is_active=True).count()
@@ -120,8 +122,16 @@ class GroupMembership(models.Model):
         ("SECRETARY", "Secretary"),
     )
 
-    group = models.ForeignKey(Group, on_delete=models.CASCADE, related_name="memberships")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_memberships")
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="group_memberships",
+    )
 
     role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="MEMBER")
     is_active = models.BooleanField(default=True)
@@ -153,8 +163,16 @@ class GroupJoinRequest(models.Model):
         ("CANCELLED", "Cancelled"),
     )
 
-    group = models.ForeignKey(Group, on_delete=models.CASCADE, related_name="join_requests")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_join_requests")
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.CASCADE,
+        related_name="join_requests",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="group_join_requests",
+    )
 
     note = models.CharField(max_length=255, blank=True, default="")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
@@ -191,7 +209,12 @@ class GroupJoinRequest(models.Model):
                 raise ValidationError(reason)
 
         if self.group_id and self.user_id:
-            if GroupMembership.objects.filter(group_id=self.group_id, user_id=self.user_id, is_active=True).exists():
+            already_member = GroupMembership.objects.filter(
+                group_id=self.group_id,
+                user_id=self.user_id,
+                is_active=True,
+            ).exists()
+            if already_member:
                 raise ValidationError("You are already an active member of this group.")
 
     @transaction.atomic
@@ -199,7 +222,11 @@ class GroupJoinRequest(models.Model):
         if self.status != "PENDING":
             raise ValidationError("Only pending requests can be approved.")
 
-        req = GroupJoinRequest.objects.select_for_update().select_related("group", "user").get(pk=self.pk)
+        req = (
+            GroupJoinRequest.objects.select_for_update()
+            .select_related("group", "user")
+            .get(pk=self.pk)
+        )
 
         ok, reason = req.group.can_accept_member()
         if not ok:
@@ -268,8 +295,14 @@ class GroupFund(models.Model):
 
     class Meta:
         constraints = [
-            models.CheckConstraint(check=Q(balance__gte=0), name="groupfund_balance_non_negative"),
-            models.CheckConstraint(check=Q(reserved_amount__gte=0), name="groupfund_reserved_non_negative"),
+            models.CheckConstraint(
+                check=Q(balance__gte=0),
+                name="groupfund_balance_non_negative",
+            ),
+            models.CheckConstraint(
+                check=Q(reserved_amount__gte=0),
+                name="groupfund_reserved_non_negative",
+            ),
         ]
 
     @property
@@ -293,8 +326,16 @@ class GroupMemberShare(models.Model):
     Tracks each member's accumulated contribution share inside a group.
     Useful for savings/investment/welfare accountability and future collateral logic.
     """
-    group = models.ForeignKey(Group, on_delete=models.CASCADE, related_name="member_shares")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_shares")
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.CASCADE,
+        related_name="member_shares",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="group_shares",
+    )
 
     total_contributed = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
     reserved_share = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal("0.00"))
@@ -303,8 +344,14 @@ class GroupMemberShare(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["group", "user"], name="uniq_group_member_share"),
-            models.CheckConstraint(check=Q(total_contributed__gte=0), name="groupshare_total_non_negative"),
-            models.CheckConstraint(check=Q(reserved_share__gte=0), name="groupshare_reserved_non_negative"),
+            models.CheckConstraint(
+                check=Q(total_contributed__gte=0),
+                name="groupshare_total_non_negative",
+            ),
+            models.CheckConstraint(
+                check=Q(reserved_share__gte=0),
+                name="groupshare_reserved_non_negative",
+            ),
         ]
         indexes = [
             models.Index(fields=["group", "user"]),
@@ -327,6 +374,14 @@ class GroupMemberShare(models.Model):
 # CONTRIBUTIONS
 # ==========================================================
 class GroupContribution(models.Model):
+    """
+    Pure contribution history record.
+
+    Important:
+    - This model does NOT update GroupFund or GroupMemberShare directly.
+    - All accounting mutations should happen in groups/services.py
+      inside post_group_contribution().
+    """
     SOURCE_CHOICES = (
         ("MANUAL", "Manual"),
         ("MPESA", "M-Pesa"),
@@ -334,8 +389,16 @@ class GroupContribution(models.Model):
         ("OTHER", "Other"),
     )
 
-    group = models.ForeignKey(Group, on_delete=models.CASCADE, related_name="contributions")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_contributions")
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.CASCADE,
+        related_name="contributions",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="group_contributions",
+    )
 
     amount = models.DecimalField(max_digits=14, decimal_places=2)
     source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="MANUAL")
@@ -357,22 +420,17 @@ class GroupContribution(models.Model):
             raise ValidationError("Contribution amount must be greater than 0.")
 
         if self.group_id and self.user_id:
-            if not GroupMembership.objects.filter(group_id=self.group_id, user_id=self.user_id, is_active=True).exists():
+            is_member = GroupMembership.objects.filter(
+                group_id=self.group_id,
+                user_id=self.user_id,
+                is_active=True,
+            ).exists()
+            if not is_member:
                 raise ValidationError("Only active group members can contribute.")
 
     def save(self, *args, **kwargs):
-        is_new = self.pk is None
         self.full_clean()
         super().save(*args, **kwargs)
-
-        if is_new:
-            fund, _ = GroupFund.objects.get_or_create(group=self.group)
-            fund.balance = (fund.balance or Decimal("0.00")) + (self.amount or Decimal("0.00"))
-            fund.save(update_fields=["balance"])
-
-            share, _ = GroupMemberShare.objects.get_or_create(group=self.group, user=self.user)
-            share.total_contributed = (share.total_contributed or Decimal("0.00")) + (self.amount or Decimal("0.00"))
-            share.save(update_fields=["total_contributed", "updated_at"])
 
     def __str__(self):
         return f"Contribution g={self.group_id} u={self.user_id} amount={self.amount}"
@@ -386,8 +444,16 @@ class GroupShareHold(models.Model):
     Lock a member's share for a loan or obligation inside the group.
     loan_id is kept as IntegerField for flexibility across apps.
     """
-    group = models.ForeignKey(Group, on_delete=models.CASCADE, related_name="share_holds")
-    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="group_share_holds")
+    group = models.ForeignKey(
+        Group,
+        on_delete=models.CASCADE,
+        related_name="share_holds",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="group_share_holds",
+    )
 
     loan_id = models.IntegerField(db_index=True)
     amount = models.DecimalField(max_digits=14, decimal_places=2)
@@ -413,4 +479,7 @@ class GroupShareHold(models.Model):
         self.save(update_fields=["is_active", "released_at"])
 
     def __str__(self):
-        return f"GroupShareHold loan={self.loan_id} group={self.group_id} user={self.user_id} amount={self.amount}"
+        return (
+            f"GroupShareHold loan={self.loan_id} "
+            f"group={self.group_id} user={self.user_id} amount={self.amount}"
+        )

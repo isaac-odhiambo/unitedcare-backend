@@ -378,11 +378,20 @@ class MerryDetailView(APIView):
     def get(self, request, merry_id: int):
         merry = get_merry_or_404(merry_id)
 
-        if not user_can_view_merry(request.user, merry):
-            raise PermissionDenied("Not allowed.")
-
         members_count = merry.members.filter(is_active=True).count()
         seats_count = merry.seats.filter(is_active=True).count()
+
+        my_member = MerryMember.objects.filter(
+            merry=merry,
+            user=request.user,
+            is_active=True,
+        ).first()
+
+        my_join_request = (
+            MerryJoinRequest.objects.filter(merry=merry, user=request.user)
+            .order_by("-created_at", "-id")
+            .first()
+        )
 
         return Response(
             {
@@ -397,12 +406,36 @@ class MerryDetailView(APIView):
                 "is_open": getattr(merry, "is_open", True),
                 "max_seats": getattr(merry, "max_seats", 0),
                 "available_seats": merry.available_seats() if hasattr(merry, "available_seats") else None,
+                "available_seat_numbers": (
+                    merry.available_seat_numbers() if hasattr(merry, "available_seat_numbers") else None
+                ),
                 "members_count": members_count,
                 "seats_count": seats_count,
                 "total_pool_per_slot": str(merry.total_pool_per_slot()),
                 "total_pool_per_period": str(merry.total_pool_per_period()),
                 "created_by": merry.created_by_id,
                 "created_at": merry.created_at,
+                "is_member": bool(my_member),
+                "my_member_id": my_member.id if my_member else None,
+                "my_join_request": (
+                    {
+                        "id": my_join_request.id,
+                        "status": my_join_request.status,
+                        "requested_seats": my_join_request.requested_seats,
+                        "created_at": my_join_request.created_at,
+                        "reviewed_at": my_join_request.reviewed_at,
+                    }
+                    if my_join_request
+                    else None
+                ),
+                "can_request_join": bool(
+                    not my_member
+                    and getattr(merry, "is_open", True)
+                    and (
+                        merry.available_seats() is None
+                        or merry.available_seats() > 0
+                    )
+                ),
             },
             status=status.HTTP_200_OK,
         )

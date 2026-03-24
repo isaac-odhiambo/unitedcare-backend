@@ -48,6 +48,26 @@ def unblock_users(modeladmin, request, queryset):
     )
 
 
+@admin.action(description="Mark selected users as phone verified")
+def verify_phone_users(modeladmin, request, queryset):
+    updated = queryset.filter(is_active=True).update(is_phone_verified=True)
+    modeladmin.message_user(
+        request,
+        f"{updated} user(s) marked as phone verified.",
+        level=messages.SUCCESS,
+    )
+
+
+@admin.action(description="Mark selected users as phone not verified")
+def unverify_phone_users(modeladmin, request, queryset):
+    updated = queryset.update(is_phone_verified=False)
+    modeladmin.message_user(
+        request,
+        f"{updated} user(s) marked as phone not verified.",
+        level=messages.WARNING,
+    )
+
+
 @admin.action(description="Set selected users as members")
 def make_members(modeladmin, request, queryset):
     count = 0
@@ -219,6 +239,7 @@ class UserAdmin(BaseUserAdmin):
         "role",
         "status",
         "is_active",
+        "is_phone_verified",
         "is_staff",
         "is_superuser",
         "kyc_status_display",
@@ -232,6 +253,7 @@ class UserAdmin(BaseUserAdmin):
         "role",
         "status",
         "is_active",
+        "is_phone_verified",
         "is_staff",
         "is_superuser",
         "date_joined",
@@ -256,6 +278,8 @@ class UserAdmin(BaseUserAdmin):
         mark_users_pending,
         block_users,
         unblock_users,
+        verify_phone_users,
+        unverify_phone_users,
         make_members,
         make_admins,
         unlock_users,
@@ -275,6 +299,7 @@ class UserAdmin(BaseUserAdmin):
                 "role",
                 "status",
                 "is_active",
+                "is_phone_verified",
                 "is_staff",
                 "is_superuser",
                 "groups",
@@ -302,6 +327,7 @@ class UserAdmin(BaseUserAdmin):
                 "role",
                 "status",
                 "is_active",
+                "is_phone_verified",
                 "is_staff",
                 "is_superuser",
                 "password1",

@@ -76,8 +76,11 @@ class User(AbstractUser):
         default="pending",
     )
 
-    # False until OTP is verified
-    is_active = models.BooleanField(default=False)
+    # Django account-level activation
+    is_active = models.BooleanField(default=True)
+
+    # App-level phone/OTP verification
+    is_phone_verified = models.BooleanField(default=False)
 
     failed_login_attempts = models.PositiveIntegerField(default=0)
     locked_until = models.DateTimeField(null=True, blank=True)
@@ -132,19 +135,19 @@ class User(AbstractUser):
         """
         OTP verified user can log in and use limited parts of the app.
         """
-        return self.is_active and not self.is_blocked
+        return self.is_phone_verified and not self.is_blocked
 
     @property
     def has_full_access(self) -> bool:
         """
         Full access only after:
-        - OTP verified (is_active=True)
+        - OTP verified
         - not blocked
         - KYC approved
         - admin/business approval done
         """
         return (
-            self.is_active
+            self.is_phone_verified
             and not self.is_blocked
             and self.status == "approved"
             and self.is_kyc_approved

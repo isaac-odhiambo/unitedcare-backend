@@ -529,7 +529,15 @@ class MerrySeatInline(admin.TabularInline):
 class MerryJoinRequestInline(admin.TabularInline):
     model = MerryJoinRequest
     extra = 0
-    fields = ("user", "requested_seats", "status", "created_at", "reviewed_by", "reviewed_at")
+    fields = (
+        "user",
+        "requested_seats",
+        "status",
+        "note",
+        "created_at",
+        "reviewed_by",
+        "reviewed_at",
+    )
     readonly_fields = ("created_at", "reviewed_by", "reviewed_at")
 
 
@@ -900,6 +908,8 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         "user",
         "requested_seats",
         "status",
+        "member_note_short",
+        "assigned_seats_display",
         "reviewed_by",
         "reviewed_at",
         "created_at",
@@ -919,7 +929,13 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
     )
     ordering = ("-id",)
     list_select_related = ("merry", "user", "reviewed_by")
-    readonly_fields = ("created_at", "reviewed_at", "seat_status_preview")
+    readonly_fields = (
+        "created_at",
+        "reviewed_at",
+        "seat_status_preview",
+        "member_note_display",
+        "assigned_seats_display",
+    )
     actions = [reject_join_requests]
 
     fieldsets = (
@@ -929,8 +945,14 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 "user",
                 "requested_seats",
                 "status",
-                "note",
             )
+        }),
+        ("Member Note", {
+            "fields": (
+                "note",
+                "member_note_display",
+            ),
+            "description": "Member request note submitted from the app.",
         }),
         ("Seat Status", {
             "fields": (
@@ -938,11 +960,17 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
             ),
             "description": "Select from reusable or available seats only.",
         }),
-        ("Select Seats", {
+        ("Assign Seats for Approval", {
             "fields": (
                 "available_seat_selection",
             ),
-            "description": "Choose the seat numbers to assign to this join request.",
+            "description": "Choose the seat numbers to assign to this join request before approving.",
+        }),
+        ("Assigned Seats", {
+            "fields": (
+                "assigned_seats_display",
+            ),
+            "description": "Visible after approval. Shows active seats assigned to the approved member in this merry.",
         }),
         ("Review", {
             "fields": (
@@ -954,7 +982,13 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
     )
 
     def get_readonly_fields(self, request, obj=None):
-        ro = ["created_at", "reviewed_at", "seat_status_preview"]
+        ro = [
+            "created_at",
+            "reviewed_at",
+            "seat_status_preview",
+            "member_note_display",
+            "assigned_seats_display",
+        ]
         if obj and obj.status == "APPROVED":
             ro.extend([
                 "merry",
@@ -972,6 +1006,54 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
 
     merry_open_display.boolean = True
     merry_open_display.short_description = "Merry Open"
+
+    def member_note_short(self, obj):
+        if not obj.note:
+            return "-"
+        text = obj.note.strip()
+        return text if len(text) <= 40 else f"{text[:40]}..."
+
+    member_note_short.short_description = "Member Note"
+
+    def member_note_display(self, obj):
+        if not obj or not obj.pk or not obj.note:
+            return "No note provided by member."
+        return obj.note
+
+    member_note_display.short_description = "Full Member Note"
+
+    def assigned_seats_display(self, obj):
+        if not obj or not obj.pk:
+            return "Save the join request first to view assigned seats."
+
+        if obj.status != "APPROVED":
+            return "Seats will appear here after approval."
+
+        member = (
+            MerryMember.objects.filter(
+                merry=obj.merry,
+                user=obj.user,
+                is_active=True,
+            )
+            .prefetch_related("seats")
+            .first()
+        )
+
+        if not member:
+            return "No active member record found yet."
+
+        seat_numbers = list(
+            member.seats.filter(is_active=True)
+            .order_by("seat_no")
+            .values_list("seat_no", flat=True)
+        )
+
+        if not seat_numbers:
+            return "No active seats assigned."
+
+        return ", ".join(str(seat_no) for seat_no in seat_numbers)
+
+    assigned_seats_display.short_description = "Assigned Seats"
 
     def seat_status_preview(self, obj):
         merry = obj.merry if obj and obj.pk and obj.merry_id else None

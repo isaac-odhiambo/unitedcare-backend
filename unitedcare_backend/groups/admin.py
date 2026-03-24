@@ -1,6 +1,5 @@
 # groups/admin.py
 from django.contrib import admin, messages
-from django.utils import timezone
 
 from .models import (
     Group,
@@ -11,6 +10,7 @@ from .models import (
     GroupContribution,
     GroupShareHold,
 )
+from .services import release_group_share_for_loan
 
 
 # =========================================================
@@ -126,30 +126,88 @@ def reject_join_requests(modeladmin, request, queryset):
 # =========================================================
 # SHARE HOLD ACTIONS
 # =========================================================
-@admin.action(description="Release selected share holds")
+@admin.action(description="Release selected share holds safely")
 def release_share_holds(modeladmin, request, queryset):
-    count = 0
-    for hold in queryset.filter(is_active=True):
-        hold.release()
-        count += 1
+    active_qs = queryset.filter(is_active=True).select_related("group", "user")
+    if not active_qs.exists():
+        modeladmin.message_user(
+            request,
+            "No active share holds selected.",
+            level=messages.WARNING,
+        )
+        return
 
-    modeladmin.message_user(
-        request,
-        f"{count} share hold(s) released.",
-        level=messages.SUCCESS,
-    )
+    released_count = 0
+    processed_pairs = set()
+
+    for hold in active_qs:
+        key = (hold.group_id, int(hold.loan_id))
+        if key in processed_pairs:
+            continue
+
+        pair_count = active_qs.filter(
+            group_id=hold.group_id,
+            loan_id=hold.loan_id,
+            is_active=True,
+        ).count()
+
+        try:
+            release_group_share_for_loan(
+                group_id=hold.group_id,
+                loan_id=int(hold.loan_id),
+            )
+            processed_pairs.add(key)
+            released_count += pair_count
+        except Exception as exc:
+            modeladmin.message_user(
+                request,
+                f"Failed to release holds for group={hold.group_id}, loan={hold.loan_id}: {exc}",
+                level=messages.ERROR,
+            )
+
+    if released_count:
+        modeladmin.message_user(
+            request,
+            f"{released_count} share hold(s) released safely.",
+            level=messages.SUCCESS,
+        )
+
+
+# =========================================================
+# READ-ONLY INLINE MIXINS
+# =========================================================
+class ReadOnlyTabularInline(admin.TabularInline):
+    extra = 0
+    can_delete = False
+    show_change_link = True
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+class ReadOnlyStackedInline(admin.StackedInline):
+    extra = 0
+    can_delete = False
+    show_change_link = True
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # =========================================================
 # INLINES
 # =========================================================
-class GroupFundInline(admin.StackedInline):
+class GroupFundInline(ReadOnlyStackedInline):
     model = GroupFund
-    extra = 0
     max_num = 1
-    can_delete = False
     fields = ("balance", "reserved_amount", "available_balance_display", "created_at")
-    readonly_fields = ("available_balance_display", "created_at")
+    readonly_fields = ("balance", "reserved_amount", "available_balance_display", "created_at")
 
     def available_balance_display(self, obj):
         return obj.available_balance if obj else "—"
@@ -171,11 +229,22 @@ class GroupJoinRequestInline(admin.TabularInline):
     readonly_fields = ("reviewed_by", "reviewed_at", "created_at")
 
 
-class GroupMemberShareInline(admin.TabularInline):
+class GroupMemberShareInline(ReadOnlyTabularInline):
     model = GroupMemberShare
-    extra = 0
-    fields = ("user", "total_contributed", "reserved_share", "available_share_display", "updated_at")
-    readonly_fields = ("available_share_display", "updated_at")
+    fields = (
+        "user",
+        "total_contributed",
+        "reserved_share",
+        "available_share_display",
+        "updated_at",
+    )
+    readonly_fields = (
+        "user",
+        "total_contributed",
+        "reserved_share",
+        "available_share_display",
+        "updated_at",
+    )
 
     def available_share_display(self, obj):
         return obj.available_share if obj else "—"
@@ -183,18 +252,16 @@ class GroupMemberShareInline(admin.TabularInline):
     available_share_display.short_description = "Available Share"
 
 
-class GroupContributionInline(admin.TabularInline):
+class GroupContributionInline(ReadOnlyTabularInline):
     model = GroupContribution
-    extra = 0
     fields = ("user", "amount", "source", "reference", "note", "created_at")
-    readonly_fields = ("created_at",)
+    readonly_fields = ("user", "amount", "source", "reference", "note", "created_at")
 
 
-class GroupShareHoldInline(admin.TabularInline):
+class GroupShareHoldInline(ReadOnlyTabularInline):
     model = GroupShareHold
-    extra = 0
     fields = ("user", "loan_id", "amount", "is_active", "created_at", "released_at")
-    readonly_fields = ("created_at", "released_at")
+    readonly_fields = ("user", "loan_id", "amount", "is_active", "created_at", "released_at")
 
 
 # =========================================================
@@ -394,7 +461,13 @@ class GroupFundAdmin(admin.ModelAdmin):
     list_filter = ("created_at",)
     search_fields = ("group__name",)
     ordering = ("-id",)
-    readonly_fields = ("available_balance_display", "created_at")
+    readonly_fields = (
+        "group",
+        "balance",
+        "reserved_amount",
+        "available_balance_display",
+        "created_at",
+    )
 
     fieldsets = (
         ("Fund", {
@@ -412,6 +485,12 @@ class GroupFundAdmin(admin.ModelAdmin):
         return obj.available_balance
 
     available_balance_display.short_description = "Available Balance"
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # =========================================================
@@ -439,7 +518,14 @@ class GroupMemberShareAdmin(admin.ModelAdmin):
         "user__email",
     )
     ordering = ("-updated_at",)
-    readonly_fields = ("available_share_display", "updated_at")
+    readonly_fields = (
+        "group",
+        "user",
+        "total_contributed",
+        "reserved_share",
+        "available_share_display",
+        "updated_at",
+    )
 
     fieldsets = (
         ("Share", {
@@ -458,6 +544,12 @@ class GroupMemberShareAdmin(admin.ModelAdmin):
         return obj.available_share
 
     available_share_display.short_description = "Available Share"
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # =========================================================
@@ -489,7 +581,15 @@ class GroupContributionAdmin(admin.ModelAdmin):
         "note",
     )
     ordering = ("-created_at",)
-    readonly_fields = ("created_at",)
+    readonly_fields = (
+        "group",
+        "user",
+        "amount",
+        "source",
+        "reference",
+        "note",
+        "created_at",
+    )
 
     fieldsets = (
         ("Contribution", {
@@ -504,6 +604,15 @@ class GroupContributionAdmin(admin.ModelAdmin):
             )
         }),
     )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return True
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # =========================================================
@@ -532,10 +641,18 @@ class GroupShareHoldAdmin(admin.ModelAdmin):
         "user__username",
         "user__phone",
         "user__email",
-        "loan_id",
+        "=loan_id",
     )
     ordering = ("-created_at",)
-    readonly_fields = ("created_at", "released_at")
+    readonly_fields = (
+        "group",
+        "user",
+        "loan_id",
+        "amount",
+        "is_active",
+        "created_at",
+        "released_at",
+    )
     actions = [release_share_holds]
 
     fieldsets = (
@@ -552,7 +669,8 @@ class GroupShareHoldAdmin(admin.ModelAdmin):
         }),
     )
 
-    def save_model(self, request, obj, form, change):
-        if not obj.is_active and not obj.released_at:
-            obj.released_at = timezone.now()
-        super().save_model(request, obj, form, change)
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

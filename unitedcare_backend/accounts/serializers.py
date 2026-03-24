@@ -65,7 +65,8 @@ class RegisterSerializer(serializers.ModelSerializer):
             password=validated_data["password"],
             role="member",
             status="pending",
-            is_active=False,
+            is_active=True,
+            is_phone_verified=False,
         )
         return user
 
@@ -101,7 +102,12 @@ class LoginSerializer(serializers.Serializer):
 
         if not user.is_active:
             raise serializers.ValidationError(
-                "Account not activated. Please verify OTP."
+                "Account disabled. Contact support."
+            )
+
+        if not user.is_phone_verified:
+            raise serializers.ValidationError(
+                "Account not verified. Please verify OTP."
             )
 
         if user.is_locked():
@@ -266,9 +272,14 @@ class ResendOTPSerializer(serializers.Serializer):
                 "User with this phone does not exist"
             )
 
-        if user.is_active:
+        if user.is_phone_verified:
             raise serializers.ValidationError(
                 "Account is already verified."
+            )
+
+        if not user.is_active:
+            raise serializers.ValidationError(
+                "Account is disabled."
             )
 
         if user.status == "blocked":
@@ -301,6 +312,7 @@ class MeSerializer(serializers.ModelSerializer):
             "role",
             "status",
             "is_active",
+            "is_phone_verified",
             "is_admin",
             "kyc_status",
             "is_kyc_approved",

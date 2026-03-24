@@ -80,7 +80,9 @@ def serialize_group_basic(group: Group, request_user=None):
 
     if request_user and request_user.is_authenticated:
         membership = GroupMembership.objects.filter(
-            group=group, user=request_user, is_active=True
+            group=group,
+            user=request_user,
+            is_active=True,
         ).first()
         payload["my_membership"] = (
             {
@@ -110,7 +112,10 @@ class GroupViewSet(viewsets.ModelViewSet):
         is_active = self.request.query_params.get("is_active")
 
         if mine in ("1", "true", "True"):
-            qs = qs.filter(memberships__user=self.request.user, memberships__is_active=True)
+            qs = qs.filter(
+                memberships__user=self.request.user,
+                memberships__is_active=True,
+            )
 
         if only_open in ("1", "true", "True"):
             qs = qs.filter(is_active=True).exclude(join_policy="CLOSED")
@@ -132,7 +137,10 @@ class GroupViewSet(viewsets.ModelViewSet):
 
     def retrieve(self, request, *args, **kwargs):
         g = self.get_object()
-        return Response(serialize_group_basic(g, request.user), status=status.HTTP_200_OK)
+        return Response(
+            serialize_group_basic(g, request.user),
+            status=status.HTTP_200_OK,
+        )
 
     def create(self, request, *args, **kwargs):
         if not is_system_admin(request.user):
@@ -245,7 +253,9 @@ class GroupViewSet(viewsets.ModelViewSet):
             g.contribution_amount = Decimal(str(data.get("contribution_amount") or "0"))
 
         if "contribution_frequency" in data:
-            g.contribution_frequency = (data.get("contribution_frequency") or "").strip().upper()
+            g.contribution_frequency = (
+                data.get("contribution_frequency") or ""
+            ).strip().upper()
 
         g.full_clean()
         g.save()
@@ -291,7 +301,9 @@ class GroupMembershipViewSet(viewsets.ModelViewSet):
             qs = qs.filter(group_id=gid)
 
             requester = GroupMembership.objects.filter(
-                group_id=gid, user=request.user, is_active=True
+                group_id=gid,
+                user=request.user,
+                is_active=True,
             ).first()
             is_group_admin = bool(requester and requester.role == "ADMIN")
             can_see_admin_fields = is_system_admin(request.user) or is_group_admin
@@ -417,7 +429,11 @@ class GroupMembershipViewSet(viewsets.ModelViewSet):
 # Join Request ViewSet
 # ---------------------------------------------------
 class GroupJoinRequestViewSet(viewsets.ModelViewSet):
-    queryset = GroupJoinRequest.objects.select_related("group", "user", "reviewed_by").all().order_by("-id")
+    queryset = GroupJoinRequest.objects.select_related(
+        "group",
+        "user",
+        "reviewed_by",
+    ).all().order_by("-id")
     permission_classes = [permissions.IsAuthenticated]
 
     def list(self, request, *args, **kwargs):
@@ -477,8 +493,14 @@ class GroupJoinRequestViewSet(viewsets.ModelViewSet):
         if group.join_policy == "CLOSED":
             raise ValidationError({"detail": "This group is closed for joining."})
 
-        if GroupMembership.objects.filter(group=group, user=request.user, is_active=True).exists():
-            raise ValidationError({"detail": "You are already an active member of this group."})
+        if GroupMembership.objects.filter(
+            group=group,
+            user=request.user,
+            is_active=True,
+        ).exists():
+            raise ValidationError(
+                {"detail": "You are already an active member of this group."}
+            )
 
         pending = GroupJoinRequest.objects.filter(
             group=group,
@@ -486,7 +508,9 @@ class GroupJoinRequestViewSet(viewsets.ModelViewSet):
             status="PENDING",
         ).exists()
         if pending:
-            raise ValidationError({"detail": "You already have a pending join request for this group."})
+            raise ValidationError(
+                {"detail": "You already have a pending join request for this group."}
+            )
 
         # OPEN groups can auto-join directly
         if group.join_policy == "OPEN":
@@ -614,7 +638,10 @@ class MyGroupSavingsSummaryView(APIView):
             if not fund:
                 fund = get_or_create_group_fund(m.group_id)
 
-            share = GroupMemberShare.objects.filter(group=m.group, user=request.user).first()
+            share = GroupMemberShare.objects.filter(
+                group=m.group,
+                user=request.user,
+            ).first()
             if not share:
                 share = get_or_create_member_share(m.group_id, request.user.id)
 
@@ -659,7 +686,7 @@ class MyGroupSavingsSummaryView(APIView):
 class PostGroupContributionView(APIView):
     """
     POST /api/groups/contribute/
-    Body: { group_id, amount, reference?, note? }
+    Body: { group_id, amount, reference?, note?, source? }
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -671,6 +698,7 @@ class PostGroupContributionView(APIView):
         amount = Decimal(str(ser.validated_data["amount"]))
         reference = (ser.validated_data.get("reference") or "").strip() or None
         note = (ser.validated_data.get("note") or "").strip() or None
+        source = (ser.validated_data.get("source") or "MANUAL").strip().upper()
 
         data = post_group_contribution(
             group_id=group_id,
@@ -678,6 +706,7 @@ class PostGroupContributionView(APIView):
             amount=amount,
             reference=reference,
             note=note,
+            source=source,
         )
         return Response(data, status=status.HTTP_200_OK)
 
@@ -696,7 +725,11 @@ class GroupContributionsHistoryView(APIView):
         group_id = int(group_id)
         require_active_membership(group_id, request.user)
 
-        qs = GroupContribution.objects.filter(group_id=group_id).select_related("user").order_by("-created_at")
+        qs = (
+            GroupContribution.objects.filter(group_id=group_id)
+            .select_related("user")
+            .order_by("-created_at")
+        )
 
         scope = (scope or "").lower().strip()
 
@@ -791,7 +824,9 @@ class GroupContributionsHistoryView(APIView):
                 payload["per_member_totals_confirmed"] = [
                     {
                         "user_id": row["user_id"],
-                        "total_contributed_confirmed": str(row["total_amount"] or Decimal("0")),
+                        "total_contributed_confirmed": str(
+                            row["total_amount"] or Decimal("0")
+                        ),
                     }
                     for row in ledger_member_totals
                 ]

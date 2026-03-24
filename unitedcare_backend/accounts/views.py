@@ -61,7 +61,7 @@ def normalize_local_kenyan_phone(phone: str) -> str:
 
 def is_stale_unverified_user(user) -> bool:
     return (
-        not user.is_active
+        not user.is_phone_verified
         and user.status == "pending"
         and user.date_joined
         <= timezone.now() - timedelta(minutes=STALE_UNVERIFIED_ACCOUNT_MINUTES)
@@ -76,7 +76,8 @@ def get_user_kyc_status(user) -> str:
 def user_has_full_access(user) -> bool:
     """
     Full access means:
-    - account can log in
+    - phone verified
+    - account enabled
     - not blocked
     - KYC approved
     - admin/business approval done
@@ -84,6 +85,7 @@ def user_has_full_access(user) -> bool:
     return (
         user.is_authenticated
         and user.is_active
+        and user.is_phone_verified
         and user.status == "approved"
         and get_user_kyc_status(user) == "approved"
     )
@@ -95,6 +97,18 @@ def build_user_payload(user) -> dict:
     Must match MeSerializer / frontend session shape.
     """
     return MeSerializer(user).data
+
+
+def get_sms_error_message(exc: Exception) -> str:
+    raw = str(exc or "").strip()
+
+    if "UserInBlacklist" in raw:
+        return (
+            "We could not send OTP to this phone number because the SMS provider "
+            "has blocked or blacklisted it. Please use another number or contact support."
+        )
+
+    return "Unable to send OTP right now. Please try again later."
 
 
 # =========================
@@ -137,7 +151,20 @@ class RegisterView(APIView):
         message = f"Your verification code is {otp_code}. Valid for 5 minutes."
 
         print(f"🔐 REGISTER OTP for {user.phone}: {otp_code}")
-        send_sms(phone_intl, message)
+
+        try:
+            send_sms(phone_intl, message)
+        except Exception as e:
+            OTP.objects.filter(phone=user.phone).delete()
+            user.delete()
+
+            return Response(
+                {
+                    "detail": get_sms_error_message(e),
+                    "error": str(e),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(
             {"detail": "Registration successful. OTP sent to phone."},
@@ -146,7 +173,7 @@ class RegisterView(APIView):
 
 
 # =========================
-# VERIFY OTP (ACTIVATE ACCOUNT)
+# VERIFY OTP (VERIFY PHONE)
 # =========================
 class VerifyOTPView(APIView):
     permission_classes = [AllowAny]
@@ -203,9 +230,11 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        user.is_active = True
+        user.is_phone_verified = True
         user.reset_failed_attempts()
-        user.save(update_fields=["is_active", "failed_login_attempts", "locked_until"])
+        user.save(
+            update_fields=["is_phone_verified", "failed_login_attempts", "locked_until"]
+        )
 
         otp.mark_used()
 
@@ -242,7 +271,13 @@ class LoginView(APIView):
 
         if not user.is_active:
             return Response(
-                {"detail": "Account not activated. Verify OTP first."},
+                {"detail": "Account disabled. Contact admin."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not user.is_phone_verified:
+            return Response(
+                {"detail": "Account not verified. Verify OTP first."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
@@ -321,7 +356,18 @@ class ForgotPasswordView(APIView):
         message = f"Your password reset OTP is {otp_code}. Valid for 5 minutes."
 
         print(f"🔐 RESET OTP for {phone_local}: {otp_code}")
-        send_sms(phone_intl, message)
+
+        try:
+            send_sms(phone_intl, message)
+        except Exception as e:
+            OTP.objects.filter(phone=phone_local, code=otp_code, is_used=False).delete()
+            return Response(
+                {
+                    "detail": get_sms_error_message(e),
+                    "error": str(e),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(
             {"detail": "OTP sent successfully."},
@@ -363,13 +409,13 @@ class ResetPasswordView(APIView):
             )
 
         user.set_password(new_password)
-        user.is_active = True
+        user.is_phone_verified = True
         user.failed_login_attempts = 0
         user.locked_until = None
         user.save(
             update_fields=[
                 "password",
-                "is_active",
+                "is_phone_verified",
                 "failed_login_attempts",
                 "locked_until",
             ]
@@ -416,7 +462,7 @@ class ResendOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if user.is_active:
+        if user.is_phone_verified:
             return Response(
                 {"detail": "Account is already verified. Please log in."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -451,7 +497,18 @@ class ResendOTPView(APIView):
         message = f"Your verification code is {code}. Valid for 5 minutes."
 
         print(f"🔐 RESEND OTP for {phone_local}: {code}")
-        send_sms(phone_intl, message)
+
+        try:
+            send_sms(phone_intl, message)
+        except Exception as e:
+            OTP.objects.filter(phone=phone_local, code=code, is_used=False).delete()
+            return Response(
+                {
+                    "detail": get_sms_error_message(e),
+                    "error": str(e),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(
             {"detail": "OTP resent successfully."},
@@ -504,7 +561,6 @@ class KYCSubmitView(APIView):
             kyc_obj.status = "submitted"
             kyc_obj.save(update_fields=["status"])
 
-        # refresh relation-safe payload after save
         user.refresh_from_db()
 
         return Response(
