@@ -2,12 +2,17 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from django.http import HttpResponse
 
 admin.site.site_header = "UnitedCare Chama Admin"
 admin.site.site_title = "UnitedCare Admin Portal"
 admin.site.index_title = "Welcome to UnitedCare Back Office"
 
+def home(request):
+    return HttpResponse("UnitedCare backend is running.")
+
 urlpatterns = [
+    path("", home, name="home"),
     path("admin/", admin.site.urls),
 
     path("api/accounts/", include("accounts.urls")),
