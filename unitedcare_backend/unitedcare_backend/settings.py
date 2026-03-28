@@ -13,15 +13,19 @@ load_dotenv()
 # =========================
 # SECURITY
 # =========================
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "change-this-in-production")
+SECRET_KEY = os.getenv("DJANGO_SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("DJANGO_SECRET_KEY is required in production.")
 
-DEBUG = os.getenv("DJANGO_DEBUG", "False").lower() == "true"
+DEBUG = False
 
 ALLOWED_HOSTS = [
     host.strip()
     for host in os.getenv("DJANGO_ALLOWED_HOSTS", "").split(",")
     if host.strip()
 ]
+if not ALLOWED_HOSTS:
+    raise ValueError("DJANGO_ALLOWED_HOSTS is required in production.")
 
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()
@@ -44,7 +48,6 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework.authtoken",
     "rest_framework_simplejwt.token_blacklist",
-    "django_extensions",
 
     "accounts",
     "merry",
@@ -102,35 +105,29 @@ TEMPLATES = [
 WSGI_APPLICATION = "unitedcare_backend.wsgi.application"
 
 # =========================
-# DATABASE (POSTGRES READY)
+# DATABASE (RENDER POSTGRES)
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is required in production.")
 
-if DATABASE_URL:
-    parsed = urlparse(DATABASE_URL)
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": parsed.path[1:],
-            "USER": parsed.username,
-            "PASSWORD": parsed.password,
-            "HOST": parsed.hostname,
-            "PORT": parsed.port or 5432,
-            "CONN_MAX_AGE": 600,
-            "OPTIONS": {"sslmode": "require"},
-        }
+parsed = urlparse(DATABASE_URL)
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": parsed.path[1:],
+        "USER": parsed.username,
+        "PASSWORD": parsed.password,
+        "HOST": parsed.hostname,
+        "PORT": parsed.port or 5432,
+        "CONN_MAX_AGE": 600,
+        "CONN_HEALTH_CHECKS": True,
+        "OPTIONS": {
+            "sslmode": os.getenv("DB_SSLMODE", "require"),
+        },
     }
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.getenv("DB_NAME", "unitedcare"),
-            "USER": os.getenv("DB_USER", "unitedcare_user"),
-            "PASSWORD": os.getenv("DB_PASSWORD", ""),
-            "HOST": os.getenv("DB_HOST", "127.0.0.1"),
-            "PORT": os.getenv("DB_PORT", "5432"),
-        }
-    }
+}
 
 # =========================
 # PASSWORD VALIDATION
@@ -145,6 +142,7 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 AUTH_USER_MODEL = "accounts.User"
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # =========================
 # REST FRAMEWORK
@@ -178,7 +176,7 @@ USE_I18N = True
 USE_TZ = True
 
 # =========================
-# STATIC (RENDER READY)
+# STATIC
 # =========================
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
@@ -191,7 +189,7 @@ MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 # =========================
-# CORS (IMPORTANT)
+# CORS
 # =========================
 CORS_ALLOW_ALL_ORIGINS = False
 CORS_ALLOWED_ORIGINS = [
@@ -210,6 +208,7 @@ EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
 EMAIL_USE_TLS = True
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
 
 # =========================
 # MPESA / DARAJA
@@ -226,7 +225,7 @@ MPESA_CALLBACK_BASE_URL = os.getenv("MPESA_CALLBACK_BASE_URL", "")
 MPESA_CALLBACK_TOKEN = os.getenv("MPESA_CALLBACK_TOKEN", "")
 
 # =========================
-# SMS (OPTIONAL)
+# SMS
 # =========================
 ENABLE_SMS = os.getenv("ENABLE_SMS", "False").lower() == "true"
 AFRICASTALKING_USERNAME = os.getenv("AFRICASTALKING_USERNAME", "")
@@ -236,17 +235,27 @@ AFRICASTALKING_SENDER_ID = os.getenv("AFRICASTALKING_SENDER_ID", "")
 # =========================
 # SECURITY HARDENING
 # =========================
-if not DEBUG:
-    SECURE_SSL_REDIRECT = True
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
+SECURE_SSL_REDIRECT = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
 
-    SECURE_HSTS_SECONDS = 31536000
-    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-    SECURE_HSTS_PRELOAD = True
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
 
-    SECURE_CONTENT_TYPE_NOSNIFF = True
-    X_FRAME_OPTIONS = "DENY"
+SECURE_HSTS_SECONDS = 31536000
+SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+SECURE_HSTS_PRELOAD = True
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_BROWSER_XSS_FILTER = True
+X_FRAME_OPTIONS = "DENY"
+SECURE_REFERRER_POLICY = "same-origin"
+
+# =========================
+# OPTIONAL UPLOAD PROTECTION
+# =========================
+DATA_UPLOAD_MAX_MEMORY_SIZE = 10485760
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10485760
 
 # # unitedcare_backend/settings.py
 
