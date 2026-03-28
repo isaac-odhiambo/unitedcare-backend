@@ -80,7 +80,7 @@ def user_has_full_access(user) -> bool:
     - KYC approved
     - admin/business approval done
 
-    OTP is not mandatory for full access at launch.
+    OTP is not mandatory at login for now.
     """
     return (
         user.is_authenticated
@@ -169,8 +169,7 @@ class RegisterView(APIView):
 
     def post(self, request):
         data = request.data.copy()
-        phone_local = normalize_local_kenyan_phone(data.get("phone", ""))
-        data["phone"] = phone_local
+        data["phone"] = normalize_local_kenyan_phone(data.get("phone", ""))
 
         serializer = RegisterSerializer(data=data)
         serializer.is_valid(raise_exception=True)
@@ -204,9 +203,8 @@ class VerifyOTPView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            user = UserModel.objects.get(phone=phone_local)
-        except UserModel.DoesNotExist:
+        user = UserModel.objects.filter(phone=phone_local).first()
+        if not user:
             return Response(
                 {"detail": "User not found."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -225,9 +223,10 @@ class VerifyOTPView(APIView):
         )
 
         if not otp or otp.is_expired():
-            user.failed_login_attempts += 1
+            user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
 
             if user.failed_login_attempts >= MAX_OTP_ATTEMPTS:
+                user.save(update_fields=["failed_login_attempts"])
                 user.lock_account()
             else:
                 user.save(update_fields=["failed_login_attempts"])
@@ -289,12 +288,11 @@ class LoginView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        user.reset_failed_attempts()
-
         refresh = RefreshToken.for_user(user)
 
         return Response(
             {
+                "detail": "Login successful.",
                 "access": str(refresh.access_token),
                 "refresh": str(refresh),
                 "user": build_user_payload(user),
@@ -316,9 +314,8 @@ class ForgotPasswordView(APIView):
 
         email = serializer.validated_data["email"].strip().lower()
 
-        try:
-            user = UserModel.objects.get(email__iexact=email)
-        except UserModel.DoesNotExist:
+        user = UserModel.objects.filter(email__iexact=email).first()
+        if not user:
             return Response(
                 {"detail": "User with this email does not exist."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -400,9 +397,8 @@ class ResetPasswordView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            user = UserModel.objects.get(email__iexact=email)
-        except UserModel.DoesNotExist:
+        user = UserModel.objects.filter(email__iexact=email).first()
+        if not user:
             return Response(
                 {"detail": "User not found."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -453,9 +449,8 @@ class ResendOTPView(APIView):
         phone_intl = normalize_kenyan_phone(phone_local)
         now = timezone.now()
 
-        try:
-            user = UserModel.objects.get(phone=phone_local)
-        except UserModel.DoesNotExist:
+        user = UserModel.objects.filter(phone=phone_local).first()
+        if not user:
             return Response(
                 {"detail": "User not found."},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -476,10 +471,12 @@ class ResendOTPView(APIView):
             )
 
         hour_ago = now - timedelta(hours=1)
-        if (
-            OTP.objects.filter(phone=phone_local, created_at__gte=hour_ago).count()
-            >= OTP_MAX_PER_HOUR
-        ):
+        otp_count = OTP.objects.filter(
+            phone=phone_local,
+            created_at__gte=hour_ago,
+        ).count()
+
+        if otp_count >= OTP_MAX_PER_HOUR:
             return Response(
                 {"detail": "OTP request limit reached. Try again later."},
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -547,7 +544,11 @@ class KYCSubmitView(APIView):
 
         kyc_obj, _ = KYCProfile.objects.get_or_create(user=user)
 
-        serializer = KYCSubmitSerializer(kyc_obj, data=request.data)
+        serializer = KYCSubmitSerializer(
+            kyc_obj,
+            data=request.data,
+            partial=False,
+        )
         serializer.is_valid(raise_exception=True)
         serializer.save()
 

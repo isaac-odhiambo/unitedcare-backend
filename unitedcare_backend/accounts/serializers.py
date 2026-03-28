@@ -13,7 +13,30 @@ MAX_OTP_ATTEMPTS = 5
 
 
 # =========================================================
-# 🔐 REGISTER SERIALIZER
+# HELPERS
+# =========================================================
+def normalize_local_kenyan_phone(phone: str) -> str:
+    """
+    Normalize to local DB format only:
+    07XXXXXXXX or 01XXXXXXXX
+
+    Examples:
+    +254701234567 -> 0701234567
+    254701234567  -> 0701234567
+    0701234567    -> 0701234567
+    """
+    phone = str(phone or "").strip().replace(" ", "")
+
+    if phone.startswith("+254") and len(phone) == 13:
+        return "0" + phone[4:]
+    if phone.startswith("254") and len(phone) == 12:
+        return "0" + phone[3:]
+
+    return phone
+
+
+# =========================================================
+# REGISTER SERIALIZER
 # =========================================================
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True)
@@ -33,15 +56,20 @@ class RegisterSerializer(serializers.ModelSerializer):
         value = " ".join(str(value).strip().split())
         if not re.match(r"^[A-Za-z\s'-]+$", value):
             raise serializers.ValidationError(
-                "Name can contain letters, spaces, hyphens, and apostrophes only"
+                "Name can contain letters, spaces, hyphens, and apostrophes only."
             )
         return value
 
     def validate_phone(self, value):
-        value = str(value).strip()
+        value = normalize_local_kenyan_phone(value)
         if not re.match(r"^(07|01)\d{8}$", value):
             raise serializers.ValidationError(
-                "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)"
+                "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)."
+            )
+
+        if User.objects.filter(phone=value).exists():
+            raise serializers.ValidationError(
+                "A user with this phone number already exists."
             )
         return value
 
@@ -51,7 +79,7 @@ class RegisterSerializer(serializers.ModelSerializer):
 
         if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError(
-                "A user with this email already exists"
+                "A user with this email already exists."
             )
         return value
 
@@ -62,7 +90,7 @@ class RegisterSerializer(serializers.ModelSerializer):
         value = str(value).strip()
         if not re.match(r"^\d{1,9}$", value):
             raise serializers.ValidationError(
-                "ID number must be numeric and not exceed 9 digits"
+                "ID number must be numeric and not exceed 9 digits."
             )
         return value
 
@@ -86,47 +114,65 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 
 # =========================================================
-# 🔐 LOGIN SERIALIZER (WITH ACCOUNT LOCKING, NO OTP BLOCK)
+# LOGIN SERIALIZER
+# - handles missing phone safely
+# - prevents 500 for invalid credentials
+# - supports local phone normalization
 # =========================================================
 class LoginSerializer(serializers.Serializer):
     phone = serializers.CharField()
     password = serializers.CharField(write_only=True)
 
     def validate_phone(self, value):
-        value = str(value).strip()
+        value = normalize_local_kenyan_phone(value)
+
         if not re.match(r"^(07|01)\d{8}$", value):
             raise serializers.ValidationError(
-                "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)"
+                "Enter a valid Kenyan phone number (07XXXXXXXX or 01XXXXXXXX)."
             )
         return value
 
     def validate(self, data):
-        phone = data["phone"]
-        password = data["password"]
+        phone = data.get("phone", "")
+        password = data.get("password", "")
 
-        try:
-            user = User.objects.get(phone=phone)
-        except User.DoesNotExist:
-            raise serializers.ValidationError("Invalid phone or password")
+        phone = normalize_local_kenyan_phone(phone)
+
+        if not phone or not password:
+            raise serializers.ValidationError(
+                {"detail": "Phone and password are required."}
+            )
+
+        user = User.objects.filter(phone=phone).first()
+
+        # Do not expose whether phone exists or not
+        if not user:
+            raise serializers.ValidationError(
+                {"detail": "Invalid phone or password."}
+            )
 
         if user.status == "blocked":
             raise serializers.ValidationError(
-                "Your account has been blocked. Contact support."
+                {"detail": "Your account has been blocked. Contact support."}
             )
 
         if not user.is_active:
             raise serializers.ValidationError(
-                "Account disabled. Contact support."
+                {"detail": "Account disabled. Contact support."}
             )
 
         if user.is_locked():
-            remaining = int(
-                (user.locked_until - timezone.now()).total_seconds() / 60
-            ) + 1
+            remaining_seconds = max(
+                0,
+                int((user.locked_until - timezone.now()).total_seconds())
+            )
+            remaining_minutes = max(1, (remaining_seconds // 60) + (1 if remaining_seconds % 60 else 0))
             raise serializers.ValidationError(
-                f"Account locked. Try again in {remaining} minutes."
+                {"detail": f"Account locked. Try again in {remaining_minutes} minutes."}
             )
 
+        # Depending on your auth backend, username may be phone.
+        # This matches your current setup.
         auth_user = authenticate(
             request=self.context.get("request"),
             username=phone,
@@ -134,27 +180,29 @@ class LoginSerializer(serializers.Serializer):
         )
 
         if not auth_user:
-            user.failed_login_attempts += 1
-            user.save(update_fields=["failed_login_attempts"])
+            user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
 
             if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+                user.save(update_fields=["failed_login_attempts"])
                 user.lock_account()
                 raise serializers.ValidationError(
-                    "Too many failed attempts. Account locked for 15 minutes."
+                    {"detail": "Too many failed attempts. Account locked for 15 minutes."}
                 )
 
+            user.save(update_fields=["failed_login_attempts"])
             remaining = MAX_FAILED_ATTEMPTS - user.failed_login_attempts
             raise serializers.ValidationError(
-                f"Invalid credentials. {remaining} attempts remaining."
+                {"detail": f"Invalid phone or password. {remaining} attempts remaining."}
             )
 
-        user.reset_failed_attempts()
-        data["user"] = user
+        # Use authenticated user object in case backend returns a proper instance
+        auth_user.reset_failed_attempts()
+        data["user"] = auth_user
         return data
 
 
 # =========================================================
-# 📩 FORGOT PASSWORD (REQUEST EMAIL RESET)
+# FORGOT PASSWORD (REQUEST EMAIL RESET)
 # =========================================================
 class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
@@ -165,17 +213,14 @@ class ForgotPasswordSerializer(serializers.Serializer):
 
         if not User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError(
-                "User with this email does not exist"
+                "User with this email does not exist."
             )
 
         return value
 
 
 # =========================================================
-# 🔄 RESET PASSWORD (EMAIL-BASED)
-# NOTE:
-# This serializer assumes your view will verify the reset token/code
-# before calling save(), or will pass the verified user through context.
+# RESET PASSWORD (EMAIL-BASED)
 # =========================================================
 class ResetPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
@@ -187,7 +232,7 @@ class ResetPasswordSerializer(serializers.Serializer):
 
         if not User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError(
-                "User with this email does not exist"
+                "User with this email does not exist."
             )
 
         return value
@@ -208,25 +253,24 @@ class ResetPasswordSerializer(serializers.Serializer):
 
 
 # =========================================================
-# 🔁 RESEND OTP
+# RESEND OTP
 # Used only for phone verification / sensitive actions
 # =========================================================
 class ResendOTPSerializer(serializers.Serializer):
     phone = serializers.CharField()
 
     def validate_phone(self, value):
-        value = str(value).strip()
+        value = normalize_local_kenyan_phone(value)
 
         if not re.match(r"^(07|01)\d{8}$", value):
             raise serializers.ValidationError(
-                "Enter a valid Kenyan phone number"
+                "Enter a valid Kenyan phone number."
             )
 
-        try:
-            user = User.objects.get(phone=value)
-        except User.DoesNotExist:
+        user = User.objects.filter(phone=value).first()
+        if not user:
             raise serializers.ValidationError(
-                "User with this phone does not exist"
+                "User with this phone does not exist."
             )
 
         if user.is_phone_verified:
@@ -249,7 +293,7 @@ class ResendOTPSerializer(serializers.Serializer):
 
 
 # =========================================================
-# 👤 CURRENT USER
+# CURRENT USER
 # =========================================================
 class MeSerializer(serializers.ModelSerializer):
     is_admin = serializers.SerializerMethodField()
@@ -307,7 +351,7 @@ class UpdateMeSerializer(serializers.ModelSerializer):
         value = " ".join(str(value).strip().split())
         if not re.match(r"^[A-Za-z\s'-]+$", value):
             raise serializers.ValidationError(
-                "Name can contain letters, spaces, hyphens, and apostrophes only"
+                "Name can contain letters, spaces, hyphens, and apostrophes only."
             )
         return value
 
@@ -321,14 +365,14 @@ class UpdateMeSerializer(serializers.ModelSerializer):
 
         if qs.exists():
             raise serializers.ValidationError(
-                "A user with this email already exists"
+                "A user with this email already exists."
             )
 
         return value
 
 
 # =========================================================
-# 🧾 KYC SUBMISSION
+# KYC SUBMISSION
 # =========================================================
 class KYCSubmitSerializer(serializers.ModelSerializer):
     class Meta:
