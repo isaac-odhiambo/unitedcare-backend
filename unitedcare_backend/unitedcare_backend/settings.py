@@ -158,6 +158,7 @@ REST_FRAMEWORK = {
         "login": os.getenv("THROTTLE_LOGIN", "10/min"),
         "otp": os.getenv("THROTTLE_OTP", "5/hour"),
         "stk_push": "5/min",
+        "stk_push_phone": "20/min",
     },
 }
 
