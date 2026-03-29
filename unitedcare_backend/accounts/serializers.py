@@ -1,4 +1,4 @@
-from django.contrib.auth import authenticate, get_user_model
+from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import validate_email
 from django.utils import timezone
@@ -170,11 +170,7 @@ class LoginSerializer(serializers.Serializer):
                 {"detail": f"Account locked. Try again in {remaining} minutes."}
             )
 
-        auth_user = authenticate(
-            request=self.context.get("request"),
-            username=phone,
-            password=password,
-        )
+        auth_user = user if user.check_password(password) else None
 
         if not auth_user:
             current_attempts = int(getattr(user, "failed_login_attempts", 0) or 0) + 1
