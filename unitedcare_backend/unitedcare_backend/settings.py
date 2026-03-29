@@ -157,7 +157,7 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "login": os.getenv("THROTTLE_LOGIN", "10/min"),
         "otp": os.getenv("THROTTLE_OTP", "5/hour"),
-        "stk_push": "10/min",
+        "stk_push": "5/min",
     },
 }
 
