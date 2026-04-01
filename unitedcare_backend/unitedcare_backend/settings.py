@@ -231,6 +231,18 @@ MPESA_CALLBACK_BASE_URL = os.getenv("MPESA_CALLBACK_BASE_URL", "")
 MPESA_CALLBACK_TOKEN = os.getenv("MPESA_CALLBACK_TOKEN", "")
 
 # =========================
+# MPESA C2B CALLBACK URLS
+# =========================
+MPESA_C2B_VALIDATION_URL = (
+    f"{MPESA_CALLBACK_BASE_URL}/payments/c2b/validation/?token={MPESA_CALLBACK_TOKEN}"
+)
+
+MPESA_C2B_CONFIRMATION_URL = (
+    f"{MPESA_CALLBACK_BASE_URL}/payments/c2b/confirmation/?token={MPESA_CALLBACK_TOKEN}"
+)
+
+
+# =========================
 # SMS
 # =========================
 ENABLE_SMS = os.getenv("ENABLE_SMS", "False").lower() == "true"

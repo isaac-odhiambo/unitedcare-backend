@@ -15,7 +15,7 @@ from .views import (
     MyWithdrawalsView,
     MyLedgerHistoryView,
 
-    # ✅ NEW IMPORTS (added)
+    # ✅ USER TRANSACTIONS
     MyMpesaTransactionsView,
     MyMpesaTransactionDetailView,
 
@@ -112,8 +112,6 @@ urlpatterns = [
         AdminMpesaTransactionsView.as_view(),
         name="payments-admin-mpesa-transactions",
     ),
-
-    # ✅ NEW: USER TRANSACTION ENDPOINTS (CRITICAL FOR FRONTEND POLLING)
     path(
         "mpesa/me/transactions/",
         MyMpesaTransactionsView.as_view(),
@@ -126,7 +124,7 @@ urlpatterns = [
     ),
 
     # =========================================================
-    # STK / C2B / B2C
+    # STK
     # =========================================================
     path(
         "mpesa/stk-push/",
@@ -138,16 +136,25 @@ urlpatterns = [
         MpesaStkCallbackView.as_view(),
         name="payments-mpesa-stk-callback",
     ),
+
+    # =========================================================
+    # C2B CALLBACKS
+    # IMPORTANT: do NOT include the word "mpesa" in these URLs
+    # =========================================================
     path(
-        "mpesa/c2b/validation/",
+        "c2b/validation/",
         MpesaC2BValidationView.as_view(),
-        name="payments-mpesa-c2b-validation",
+        name="payments-c2b-validation",
     ),
     path(
-        "mpesa/c2b/confirmation/",
+        "c2b/confirmation/",
         MpesaC2BConfirmationView.as_view(),
-        name="payments-mpesa-c2b-confirmation",
+        name="payments-c2b-confirmation",
     ),
+
+    # =========================================================
+    # B2C
+    # =========================================================
     path(
         "mpesa/b2c/result/",
         MpesaB2CResultView.as_view(),
