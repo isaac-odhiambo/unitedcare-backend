@@ -530,6 +530,57 @@ class MpesaStkCallbackView(APIView):
         return _accepted_callback_response()
 
 
+# # =========================================================
+# # C2B Validation
+# # =========================================================
+# class MpesaC2BValidationView(APIView):
+#     permission_classes = [permissions.AllowAny]
+
+#     def post(self, request):
+#         try:
+#             _require_callback_token(request)
+#             _require_safaricom_ip(request)
+#             return Response(
+#                 handle_c2b_validation_callback(callback_payload=request.data),
+#                 status=status.HTTP_200_OK,
+#             )
+#         except Exception as e:
+#             logger.exception("C2B validation handling error: %s", str(e))
+#             return Response(
+#                 {"ResultCode": 1, "ResultDesc": "Rejected"},
+#                 status=status.HTTP_200_OK,
+#             )
+
+
+# # =========================================================
+# # C2B Confirmation
+# # =========================================================
+# class MpesaC2BConfirmationView(APIView):
+#     permission_classes = [permissions.AllowAny]
+
+#     @transaction.atomic
+#     def post(self, request):
+#         try:
+#             _require_callback_token(request)
+#             _require_safaricom_ip(request)
+
+#             tx = handle_c2b_confirmation_callback(callback_payload=request.data)
+
+#             logger.info(
+#                 "C2B confirmation processed successfully | tx_id=%s | receipt=%s | status=%s | purpose=%s | allocation_status=%s | reference=%s | user_id=%s",
+#                 getattr(tx, "id", None),
+#                 getattr(tx, "mpesa_receipt_number", None),
+#                 getattr(tx, "status", None),
+#                 getattr(tx, "purpose", None),
+#                 getattr(tx, "allocation_status", None),
+#                 getattr(tx, "reference", None),
+#                 getattr(tx, "user_id", None),
+#             )
+#         except Exception as e:
+#             logger.exception("C2B confirmation handling error: %s", str(e))
+
+#         return _accepted_callback_response()
+
 # =========================================================
 # C2B Validation
 # =========================================================
@@ -538,12 +589,23 @@ class MpesaC2BValidationView(APIView):
 
     def post(self, request):
         try:
+            logger.info("========== C2B VALIDATION HIT ==========")
+            logger.info("C2B validation query params: %s", dict(request.query_params))
+            logger.info("C2B validation headers token: %s", request.headers.get("X-Callback-Token"))
+            logger.info("C2B validation content type: %s", request.content_type)
+            logger.info("C2B validation raw body: %s", request.body.decode("utf-8", errors="ignore"))
+            logger.info("C2B validation parsed data: %s", request.data)
+
             _require_callback_token(request)
             _require_safaricom_ip(request)
-            return Response(
-                handle_c2b_validation_callback(callback_payload=request.data),
-                status=status.HTTP_200_OK,
-            )
+
+            result = handle_c2b_validation_callback(callback_payload=request.data)
+
+            logger.info("C2B validation handler result: %s", result)
+            logger.info("========== C2B VALIDATION SUCCESS ==========")
+
+            return Response(result, status=status.HTTP_200_OK)
+
         except Exception as e:
             logger.exception("C2B validation handling error: %s", str(e))
             return Response(
@@ -561,6 +623,13 @@ class MpesaC2BConfirmationView(APIView):
     @transaction.atomic
     def post(self, request):
         try:
+            logger.info("========== C2B CONFIRMATION HIT ==========")
+            logger.info("C2B confirmation query params: %s", dict(request.query_params))
+            logger.info("C2B confirmation headers token: %s", request.headers.get("X-Callback-Token"))
+            logger.info("C2B confirmation content type: %s", request.content_type)
+            logger.info("C2B confirmation raw body: %s", request.body.decode("utf-8", errors="ignore"))
+            logger.info("C2B confirmation parsed data: %s", request.data)
+
             _require_callback_token(request)
             _require_safaricom_ip(request)
 
@@ -576,12 +645,12 @@ class MpesaC2BConfirmationView(APIView):
                 getattr(tx, "reference", None),
                 getattr(tx, "user_id", None),
             )
+            logger.info("========== C2B CONFIRMATION SUCCESS ==========")
+
         except Exception as e:
             logger.exception("C2B confirmation handling error: %s", str(e))
 
         return _accepted_callback_response()
-
-
 # =========================================================
 # Withdrawals
 # =========================================================
