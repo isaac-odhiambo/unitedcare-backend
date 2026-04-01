@@ -555,31 +555,6 @@ class MpesaC2BValidationView(APIView):
 # =========================================================
 # C2B Confirmation
 # =========================================================
-# class MpesaC2BConfirmationView(APIView):
-#     permission_classes = [permissions.AllowAny]
-
-#     @transaction.atomic
-#     def post(self, request):
-#         try:
-#             _require_callback_token(request)
-#             _require_safaricom_ip(request)
-
-#             tx = handle_c2b_confirmation_callback(callback_payload=request.data)
-
-#             logger.info(
-#                 "C2B confirmation processed successfully | tx_id=%s | receipt=%s | status=%s | purpose=%s | allocation_status=%s | reference=%s | user_id=%s",
-#                 getattr(tx, "id", None),
-#                 getattr(tx, "mpesa_receipt_number", None),
-#                 getattr(tx, "status", None),
-#                 getattr(tx, "purpose", None),
-#                 getattr(tx, "allocation_status", None),
-#                 getattr(tx, "reference", None),
-#                 getattr(tx, "user_id", None),
-#             )
-#         except Exception as e:
-#             logger.exception("C2B confirmation handling error: %s", str(e))
-
-#         return _accepted_callback_response()
 class MpesaC2BConfirmationView(APIView):
     permission_classes = [permissions.AllowAny]
 
@@ -589,22 +564,23 @@ class MpesaC2BConfirmationView(APIView):
             _require_callback_token(request)
             _require_safaricom_ip(request)
 
-            print("🔥 CALLBACK DATA:", request.data)
-
             tx = handle_c2b_confirmation_callback(callback_payload=request.data)
 
-            print("✅ TX CREATED:", tx)
-
             logger.info(
-                "C2B confirmation processed successfully | tx_id=%s",
+                "C2B confirmation processed successfully | tx_id=%s | receipt=%s | status=%s | purpose=%s | allocation_status=%s | reference=%s | user_id=%s",
                 getattr(tx, "id", None),
+                getattr(tx, "mpesa_receipt_number", None),
+                getattr(tx, "status", None),
+                getattr(tx, "purpose", None),
+                getattr(tx, "allocation_status", None),
+                getattr(tx, "reference", None),
+                getattr(tx, "user_id", None),
             )
-
         except Exception as e:
-            print("❌ ERROR:", str(e))
             logger.exception("C2B confirmation handling error: %s", str(e))
 
         return _accepted_callback_response()
+
 
 # =========================================================
 # Withdrawals
