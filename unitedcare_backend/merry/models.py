@@ -554,7 +554,7 @@ class MerryJoinRequest(models.Model):
     )
 
     requested_seats = models.PositiveIntegerField(default=1)
-    status = models.CharField(max_length=20, choices=STATUS, default="PENDING")
+    status = models.CharField(max_length=50, choices=STATUS, default="PENDING")
     note = models.CharField(max_length=255, blank=True, default="")
 
     reviewed_by = models.ForeignKey(
@@ -745,7 +745,7 @@ class MerryContributionDue(models.Model):
     due_amount = models.DecimalField(max_digits=12, decimal_places=2)
     paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
 
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="PENDING")
     due_date = models.DateField(null=True, blank=True)
 
     is_advance_payable = models.BooleanField(default=True)
@@ -855,7 +855,7 @@ class MerryPayment(models.Model):
     period_key = models.CharField(max_length=20, db_index=True)
 
     amount = models.DecimalField(max_digits=12, decimal_places=2)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="PENDING")
     paid_at = models.DateTimeField(null=True, blank=True)
 
     mpesa_receipt_number = models.CharField(max_length=64, null=True, blank=True, db_index=True)
@@ -1032,7 +1032,7 @@ class MerryPayout(models.Model):
 
     amount = models.DecimalField(max_digits=12, decimal_places=2)
 
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="SCHEDULED")
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="SCHEDULED")
     paid_at = models.DateTimeField(null=True, blank=True)
 
     notes = models.CharField(max_length=255, blank=True, default="")

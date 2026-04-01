@@ -653,7 +653,7 @@ class AdminRejectJoinRequestSerializer(serializers.Serializer):
 
 
 class EnsureDuesSerializer(serializers.Serializer):
-    period_key = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    period_key = serializers.CharField(required=False, allow_blank=True, max_length=50)
 
     def validate(self, attrs):
         merry: MerryGoRound = self.context["merry"]
@@ -666,7 +666,7 @@ class EnsureDuesSerializer(serializers.Serializer):
 
 class CreatePaymentIntentSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=12, decimal_places=2)
-    payer_phone = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    payer_phone = serializers.CharField(required=False, allow_blank=True, max_length=50)
 
     def validate(self, attrs):
         request = self.context["request"]
@@ -699,7 +699,7 @@ class CreatePayoutSerializer(serializers.Serializer):
     Seat-based payout creation
     """
     seat_id = serializers.IntegerField(min_value=1)
-    period_key = serializers.CharField(required=False, allow_blank=True, max_length=20)
+    period_key = serializers.CharField(required=False, allow_blank=True, max_length=50)
     slot_no = serializers.IntegerField(required=False, min_value=1)
     amount = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
     compute_amount = serializers.BooleanField(required=False)
