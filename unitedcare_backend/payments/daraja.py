@@ -11,10 +11,6 @@ from django.conf import settings
 from django.core.cache import cache
 
 
-# ============================================================
-# Data Classes
-# ============================================================
-
 @dataclass
 class STKPushResult:
     merchant_request_id: str
@@ -29,17 +25,9 @@ class B2CResult:
     response_description: str = ""
 
 
-# ============================================================
-# Custom Exception
-# ============================================================
-
 class DarajaError(Exception):
     pass
 
-
-# ============================================================
-# Daraja Client
-# ============================================================
 
 class DarajaClient:
     """
@@ -74,13 +62,10 @@ class DarajaClient:
 
         self.consumer_key = str(getattr(settings, "DARAJA_CONSUMER_KEY", "") or "").strip()
         self.consumer_secret = str(getattr(settings, "DARAJA_CONSUMER_SECRET", "") or "").strip()
+        self.timeout = int(getattr(settings, "DARAJA_TIMEOUT", 30) or 30)
 
         if not self.consumer_key or not self.consumer_secret:
             raise DarajaError("Missing DARAJA_CONSUMER_KEY or DARAJA_CONSUMER_SECRET")
-
-    # ============================================================
-    # Access Token
-    # ============================================================
 
     def _get_access_token(self) -> str:
         cached_token = cache.get(self.TOKEN_CACHE_KEY)
@@ -98,7 +83,7 @@ class DarajaClient:
         }
 
         try:
-            r = requests.get(url, headers=headers, timeout=30)
+            r = requests.get(url, headers=headers, timeout=self.timeout)
         except requests.RequestException as e:
             raise DarajaError(f"Access token request error: {e}")
 
@@ -125,7 +110,6 @@ class DarajaClient:
         except (TypeError, ValueError):
             expires_in = 3599
 
-        # Cache slightly shorter than actual expiry to avoid edge expiry failures
         cache_timeout = max(expires_in - 60, 60)
         cache.set(self.TOKEN_CACHE_KEY, token, timeout=cache_timeout)
 
@@ -141,10 +125,6 @@ class DarajaClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-
-    # ============================================================
-    # Phone Normalization
-    # ============================================================
 
     @staticmethod
     def _normalize_msisdn(phone: str) -> str:
@@ -162,10 +142,6 @@ class DarajaClient:
             raise DarajaError(f"Invalid Kenyan phone format for MPesa: {phone!r}")
 
         return p
-
-    # ============================================================
-    # Helpers
-    # ============================================================
 
     @staticmethod
     def _timestamp() -> str:
@@ -196,10 +172,6 @@ class DarajaClient:
 
         return shortcode, timestamp, password
 
-    # ============================================================
-    # STK PUSH
-    # ============================================================
-
     def stk_push(
         self,
         *,
@@ -221,20 +193,23 @@ class DarajaClient:
             "BusinessShortCode": shortcode,
             "Password": password,
             "Timestamp": timestamp,
-            "TransactionType": "CustomerPayBillOnline",
+            "TransactionType": str(
+                getattr(settings, "STK_TRANSACTION_TYPE", "CustomerPayBillOnline")
+                or "CustomerPayBillOnline"
+            ).strip(),
             "Amount": self._amount_to_int(Decimal(amount)),
             "PartyA": msisdn,
             "PartyB": shortcode,
             "PhoneNumber": msisdn,
             "CallBackURL": callback_url,
             "AccountReference": str(account_reference or "")[:32],
-            "TransactionDesc": str(transaction_desc or "")[:32],
+            "TransactionDesc": str(transaction_desc or "Payment")[:100],
         }
 
         url = f"{self.base_url}/mpesa/stkpush/v1/processrequest"
 
         try:
-            r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+            r = requests.post(url, json=payload, headers=self._headers(), timeout=self.timeout)
         except requests.RequestException as e:
             raise DarajaError(f"STK push request error: {e}")
 
@@ -255,10 +230,6 @@ class DarajaClient:
             customer_message=str(data.get("CustomerMessage", "") or ""),
         )
 
-    # ============================================================
-    # STK QUERY
-    # ============================================================
-
     def stk_query(self, *, checkout_request_id: str) -> Dict[str, Any]:
         shortcode, timestamp, password = self._stk_password()
 
@@ -276,7 +247,7 @@ class DarajaClient:
         url = f"{self.base_url}/mpesa/stkpushquery/v1/query"
 
         try:
-            r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+            r = requests.post(url, json=payload, headers=self._headers(), timeout=self.timeout)
         except requests.RequestException as e:
             raise DarajaError(f"STK query request error: {e}")
 
@@ -289,10 +260,6 @@ class DarajaClient:
             raise DarajaError(f"STK query response was not valid JSON: {r.text!r}")
 
         return data
-
-    # ============================================================
-    # B2C PAYOUT
-    # ============================================================
 
     def b2c_payout(
         self,
@@ -336,7 +303,7 @@ class DarajaClient:
         url = f"{self.base_url}/mpesa/b2c/v1/paymentrequest"
 
         try:
-            r = requests.post(url, json=payload, headers=self._headers(), timeout=30)
+            r = requests.post(url, json=payload, headers=self._headers(), timeout=self.timeout)
         except requests.RequestException as e:
             raise DarajaError(f"B2C request error: {e}")
 
