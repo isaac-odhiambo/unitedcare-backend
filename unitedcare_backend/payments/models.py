@@ -325,7 +325,7 @@ class MpesaTransaction(models.Model):
     )
 
     payment_method = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=PAYMENT_METHOD_CHOICES,
         default="STK",
         db_index=True,
@@ -333,7 +333,7 @@ class MpesaTransaction(models.Model):
     )
 
     origin = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=ORIGIN_CHOICES,
         default="APP",
         db_index=True,
@@ -348,7 +348,7 @@ class MpesaTransaction(models.Model):
     )
 
     status = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=STATUS_CHOICES,
         default="INITIATED",
         db_index=True,
@@ -371,17 +371,17 @@ class MpesaTransaction(models.Model):
     )
 
     matched_reference_type = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=MATCHED_REFERENCE_TYPE_CHOICES,
         default="UNKNOWN",
         db_index=True,
         help_text="What type of business reference this transaction matched.",
     )
 
-    merchant_request_id = models.CharField(max_length=120, null=True, blank=True)
+    merchant_request_id = models.CharField(max_length=150, null=True, blank=True)
 
     checkout_request_id = models.CharField(
-        max_length=120,
+        max_length=150,
         null=True,
         blank=True,
         db_index=True,
@@ -389,7 +389,7 @@ class MpesaTransaction(models.Model):
     )
 
     conversation_id = models.CharField(
-        max_length=120,
+        max_length=150,
         null=True,
         blank=True,
         db_index=True,
@@ -397,12 +397,12 @@ class MpesaTransaction(models.Model):
     )
 
     originator_conversation_id = models.CharField(
-        max_length=120,
+        max_length=150,
         null=True,
         blank=True,
     )
 
-    result_code = models.CharField(max_length=20, null=True, blank=True)
+    result_code = models.CharField(max_length=30, null=True, blank=True)
     result_desc = models.CharField(max_length=255, null=True, blank=True)
 
     mpesa_receipt_number = models.CharField(
