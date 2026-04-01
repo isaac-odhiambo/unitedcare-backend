@@ -37,12 +37,12 @@ class DarajaClient:
       - B2C payout
 
     Required settings:
-      DARAJA_ENV = "sandbox" | "production"
-      DARAJA_CONSUMER_KEY
-      DARAJA_CONSUMER_SECRET
+      MPESA_ENV = "sandbox" | "production"
+      MPESA_CONSUMER_KEY
+      MPESA_CONSUMER_SECRET
 
-      STK_SHORTCODE
-      STK_PASSKEY
+      MPESA_SHORTCODE
+      MPESA_PASSKEY
 
       B2C_SHORTCODE
       B2C_INITIATOR_NAME
@@ -53,19 +53,19 @@ class DarajaClient:
     TOKEN_CACHE_KEY = "daraja_access_token"
 
     def __init__(self):
-        env = str(getattr(settings, "DARAJA_ENV", "sandbox") or "sandbox").lower().strip()
+        env = str(getattr(settings, "MPESA_ENV", "sandbox") or "sandbox").lower().strip()
 
         if env == "production":
             self.base_url = "https://api.safaricom.co.ke"
         else:
             self.base_url = "https://sandbox.safaricom.co.ke"
 
-        self.consumer_key = str(getattr(settings, "DARAJA_CONSUMER_KEY", "") or "").strip()
-        self.consumer_secret = str(getattr(settings, "DARAJA_CONSUMER_SECRET", "") or "").strip()
+        self.consumer_key = str(getattr(settings, "MPESA_CONSUMER_KEY", "") or "").strip()
+        self.consumer_secret = str(getattr(settings, "MPESA_CONSUMER_SECRET", "") or "").strip()
         self.timeout = int(getattr(settings, "DARAJA_TIMEOUT", 30) or 30)
 
         if not self.consumer_key or not self.consumer_secret:
-            raise DarajaError("Missing DARAJA_CONSUMER_KEY or DARAJA_CONSUMER_SECRET")
+            raise DarajaError("Missing MPESA_CONSUMER_KEY or MPESA_CONSUMER_SECRET")
 
     def _get_access_token(self) -> str:
         cached_token = cache.get(self.TOKEN_CACHE_KEY)
@@ -90,7 +90,7 @@ class DarajaClient:
         if r.status_code != 200:
             raise DarajaError(
                 f"Access token failed: {r.status_code} | response={r.text!r} | "
-                f"env={getattr(settings, 'DARAJA_ENV', '')!r} | "
+                f"env={getattr(settings, 'MPESA_ENV', '')!r} | "
                 f"base_url={self.base_url!r}"
             )
 
@@ -160,11 +160,11 @@ class DarajaClient:
         return int(amt)
 
     def _stk_password(self) -> tuple[str, str, str]:
-        shortcode = str(getattr(settings, "STK_SHORTCODE", "") or "").strip()
-        passkey = str(getattr(settings, "STK_PASSKEY", "") or "").strip()
+        shortcode = str(getattr(settings, "MPESA_SHORTCODE", "") or "").strip()
+        passkey = str(getattr(settings, "MPESA_PASSKEY", "") or "").strip()
 
         if not shortcode or not passkey:
-            raise DarajaError("Missing STK_SHORTCODE or STK_PASSKEY")
+            raise DarajaError("Missing MPESA_SHORTCODE or MPESA_PASSKEY")
 
         timestamp = self._timestamp()
         password_raw = f"{shortcode}{passkey}{timestamp}"
