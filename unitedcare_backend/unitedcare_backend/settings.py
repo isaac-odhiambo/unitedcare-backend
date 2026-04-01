@@ -219,13 +219,13 @@ DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER)
 # =========================
 # MPESA / DARAJA
 # =========================
-DARAJA_ENV = os.getenv("DARAJA_ENV", "sandbox")
+MPESA_ENV = os.getenv("MPESA_ENV", "sandbox")
 
-DARAJA_CONSUMER_KEY = os.getenv("DARAJA_CONSUMER_KEY", "")
-DARAJA_CONSUMER_SECRET = os.getenv("DARAJA_CONSUMER_SECRET", "")
+MPESA_CONSUMER_KEY = os.getenv("MPESA_CONSUMER_KEY", "")
+MPESA_CONSUMER_SECRET = os.getenv("MPESA_CONSUMER_SECRET", "")
 
-STK_SHORTCODE = os.getenv("STK_SHORTCODE", "")
-STK_PASSKEY = os.getenv("STK_PASSKEY", "")
+MPESA_SHORTCODE = os.getenv("MPESA_SHORTCODE", "")
+MPESA_PASSKEY = os.getenv("MPESA_PASSKEY", "")
 
 MPESA_CALLBACK_BASE_URL = os.getenv("MPESA_CALLBACK_BASE_URL", "")
 MPESA_CALLBACK_TOKEN = os.getenv("MPESA_CALLBACK_TOKEN", "")
