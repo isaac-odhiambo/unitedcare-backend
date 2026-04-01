@@ -1003,6 +1003,15 @@ def _finalize_successful_incoming_tx(tx: MpesaTransaction, *, channel_label: str
 # C2B HELPERS
 # ============================================================
 
+# ============================================================
+# C2B HELPERS
+# ============================================================
+
+def _looks_like_normal_phone(value: str) -> bool:
+    v = normalize_phone(value or "")
+    return bool(re.match(r"^(07|01)\d{8}$", v))
+
+
 def _find_existing_pending_c2b_tx(
     *,
     phone: str,
@@ -1020,6 +1029,7 @@ def _find_existing_pending_c2b_tx(
     phone_n = normalize_phone(phone)
     amount_n = _money(total_amount)
     norm_ref = _normalize_reference_token(raw_reference)
+    callback_phone_is_normal = _looks_like_normal_phone(phone_n)
 
     recent_qs = (
         MpesaTransaction.objects.select_for_update()
@@ -1032,12 +1042,6 @@ def _find_existing_pending_c2b_tx(
         )
         .order_by("-created_at", "-id")
     )
-
-    def _looks_like_normal_phone(value: str) -> bool:
-        v = normalize_phone(value or "")
-        return bool(re.match(r"^(07|01)\d{8}$", v))
-
-    callback_phone_is_normal = _looks_like_normal_phone(phone_n)
 
     for tx in recent_qs:
         tx_ref = _normalize_reference_token(tx.reference or tx.external_reference_raw or "")
@@ -1053,13 +1057,47 @@ def _find_existing_pending_c2b_tx(
         if purpose and (tx.purpose or "").upper() != (purpose or "").upper():
             continue
 
-        # Only enforce phone equality when callback phone is a normal phone number.
+        # Only enforce phone equality if callback phone looks like a real normal phone.
         if callback_phone_is_normal and tx_phone and tx_phone != phone_n:
             continue
 
         return tx
 
     return None
+
+
+# ============================================================
+# C2B SERVICES
+# ============================================================
+def handle_c2b_validation_callback(*, callback_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Basic C2B validation.
+    Accepts simple references like:
+      - mus11
+      - saving19
+      - loan19
+      - grp9
+    """
+    reference = (
+        callback_payload.get("BillRefNumber")
+        or callback_payload.get("BillRef")
+        or callback_payload.get("AccountReference")
+        or ""
+    ).strip()
+
+    amount = _money(callback_payload.get("TransAmount", "0"))
+
+    if amount <= Decimal("0.00"):
+        return {"ResultCode": "C2B00012", "ResultDesc": "Invalid amount"}
+
+    if not reference:
+        return {"ResultCode": "C2B00012", "ResultDesc": "Missing account reference"}
+
+    parsed = _parse_reference(reference)
+    if not parsed.valid:
+        return {"ResultCode": "C2B00012", "ResultDesc": "Invalid account reference"}
+
+    return {"ResultCode": "0", "ResultDesc": "Accepted"}
 
 
 @transaction.atomic
@@ -1090,7 +1128,6 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
         or callback_payload.get("MobileNumber")
         or ""
     ).strip()
-
     phone = normalize_phone(phone_raw)
 
     total_amount = _money(
@@ -1111,12 +1148,15 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     parsed = _parse_reference(raw_reference)
     purpose = parsed.purpose if parsed.valid else "OTHER"
 
+    # 1. Exact receipt match first
     existing = MpesaTransaction.objects.select_for_update().filter(
         mpesa_receipt_number=receipt
     ).first()
+
     if existing:
         if existing.status != "SUCCESS":
             existing.status = "SUCCESS"
+
         existing.channel = "C2B"
         existing.payment_method = "PAYBILL"
         existing.origin = existing.origin or "EXTERNAL"
@@ -1129,11 +1169,14 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
         existing.callback_payload = callback_payload
         existing.callback_received_at = timezone.now()
         existing.updated_at = timezone.now()
+
         if phone:
             existing.phone = phone
+
         existing.save()
         return _finalize_successful_incoming_tx(existing, channel_label="C2B")
 
+    # 2. Match an existing pending tx
     matched_pending = _find_existing_pending_c2b_tx(
         phone=phone,
         total_amount=total_amount,
@@ -1144,10 +1187,14 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
     matched_user = None
     matched_user_phone = ""
 
-    # Only try direct phone-to-user matching if callback phone looks like a normal Kenyan number.
-    if re.match(r"^(07|01)\d{8}$", phone or ""):
+    # Only use direct phone-to-user matching if callback phone looks normal.
+    if _looks_like_normal_phone(phone):
         matched_user = UserModel.objects.filter(phone=phone).first()
-        matched_user_phone = matched_user.phone if matched_user and getattr(matched_user, "phone", "") else ""
+        matched_user_phone = (
+            matched_user.phone
+            if matched_user and getattr(matched_user, "phone", "")
+            else ""
+        )
 
     if parsed.valid and parsed.kind == "GROUP" and matched_user and parsed.entity_id:
         _require_active_group_membership(user=matched_user, group_id=parsed.entity_id)
@@ -1170,8 +1217,13 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
 
     if matched_pending:
         matched_pending.user = resolved_user or matched_pending.user
-        matched_pending.phone = phone or matched_pending.phone
-        matched_pending.matched_user_phone = matched_user_phone or matched_pending.matched_user_phone
+
+        if phone:
+            matched_pending.phone = phone
+
+        if matched_user_phone:
+            matched_pending.matched_user_phone = matched_user_phone
+
         matched_pending.amount = total_amount
         matched_pending.base_amount = base_amount
         matched_pending.transaction_fee = fee
@@ -1191,7 +1243,11 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
         matched_pending.callback_received_at = timezone.now()
         matched_pending.callback_payload = callback_payload
 
-        existing_payload = matched_pending.request_payload if isinstance(matched_pending.request_payload, dict) else {}
+        existing_payload = (
+            matched_pending.request_payload
+            if isinstance(matched_pending.request_payload, dict)
+            else {}
+        )
         existing_payload.update(
             {
                 "base_amount": str(base_amount),
@@ -1219,295 +1275,16 @@ def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> Mpe
             matched_pending.allocation_notes = "Invalid or unsupported account reference."
 
         matched_pending.save()
+
         if not parsed.valid:
             return matched_pending
+
         return _finalize_successful_incoming_tx(matched_pending, channel_label="C2B")
 
+    # 3. Create a fresh C2B tx
     tx = _create_mpesa_tx(
         user=resolved_user,
         phone=phone,
-        matched_user_phone=matched_user_phone,
-        amount=total_amount,
-        base_amount=base_amount,
-        transaction_fee=fee,
-        direction="IN",
-        channel="C2B",
-        payment_method="PAYBILL",
-        origin="EXTERNAL",
-        purpose=purpose,
-        status="SUCCESS",
-        reference=parsed.normalized or raw_reference,
-        external_reference_raw=raw_reference,
-        matched_reference_type=parsed.matched_reference_type,
-        mpesa_receipt_number=receipt,
-        result_code="0",
-        result_desc="C2B confirmed",
-        transaction_date=timezone.now(),
-        callback_received_at=timezone.now(),
-        allocation_status="UNALLOCATED" if parsed.valid else "INVALID_REFERENCE",
-        allocation_notes=allocation_note if parsed.valid else "Invalid or unsupported account reference.",
-        request_payload={
-            "base_amount": str(base_amount),
-            "fee": str(fee),
-            "total_amount": str(total_amount),
-            "source": "C2B",
-            "payment_method": "PAYBILL",
-            "origin": "EXTERNAL",
-            "parsed_reference": {
-                "kind": parsed.kind,
-                "entity_id": parsed.entity_id,
-                "purpose": parsed.purpose,
-                "valid": parsed.valid,
-                "matched_reference_type": parsed.matched_reference_type,
-            },
-        },
-        callback_payload=callback_payload,
-    )
-
-    if not parsed.valid:
-        return tx
-
-    return _finalize_successful_incoming_tx(tx, channel_label="C2B")
-# def _find_existing_pending_c2b_tx(
-#     *,
-#     phone: str,
-#     total_amount: Decimal,
-#     raw_reference: str,
-#     purpose: str,
-# ) -> Optional[MpesaTransaction]:
-#     """
-#     Try to match an already-created pending app transaction so that
-#     C2B confirmation updates that same row instead of creating a new one.
-#     """
-#     phone_n = normalize_phone(phone)
-#     amount_n = _money(total_amount)
-#     norm_ref = _normalize_reference_token(raw_reference)
-
-#     recent_qs = (
-#         MpesaTransaction.objects.select_for_update()
-#         .filter(
-#             direction__in=("IN", "INCOMING"),
-#             channel__in=("STK", "C2B"),
-#             payment_method__in=("PAYBILL", "STK"),
-#             status__in=("INITIATED", "PENDING", "UNALLOCATED"),
-#             created_at__gte=timezone.now() - timezone.timedelta(hours=12),
-#         )
-#         .order_by("-created_at", "-id")
-#     )
-
-#     for tx in recent_qs:
-#         tx_ref = _normalize_reference_token(tx.reference or tx.external_reference_raw or "")
-#         tx_phone = normalize_phone(tx.phone or tx.matched_user_phone or "")
-#         tx_amount = _money(tx.amount)
-
-#         if norm_ref and tx_ref != norm_ref:
-#             continue
-#         if phone_n and tx_phone and tx_phone != phone_n:
-#             continue
-#         if tx_amount != amount_n:
-#             continue
-#         if purpose and (tx.purpose or "").upper() != (purpose or "").upper():
-#             continue
-
-#         return tx
-
-#     return None
-
-
-# # ============================================================
-# # C2B SERVICES
-# # ============================================================
-# def handle_c2b_validation_callback(*, callback_payload: Dict[str, Any]) -> Dict[str, Any]:
-#     """
-#     Basic C2B validation.
-#     Accepts simple references like:
-#       - mus11
-#       - saving19
-#       - loan19
-#       - grp9
-#     """
-#     reference = (
-#         callback_payload.get("BillRefNumber")
-#         or callback_payload.get("BillRef")
-#         or callback_payload.get("AccountReference")
-#         or ""
-#     ).strip()
-
-#     amount = _money(callback_payload.get("TransAmount", "0"))
-
-#     if amount <= Decimal("0.00"):
-#         return {"ResultCode": "C2B00012", "ResultDesc": "Invalid amount"}
-
-#     if not reference:
-#         return {"ResultCode": "C2B00012", "ResultDesc": "Missing account reference"}
-
-#     parsed = _parse_reference(reference)
-#     if not parsed.valid:
-#         return {"ResultCode": "C2B00012", "ResultDesc": "Invalid account reference"}
-
-#     return {"ResultCode": "0", "ResultDesc": "Accepted"}
-
-
-# @transaction.atomic
-# def handle_c2b_confirmation_callback(*, callback_payload: Dict[str, Any]) -> MpesaTransaction:
-#     """
-#     Handles manual Paybill C2B confirmation callback.
-
-#     Supported references:
-#       - mus11      => merry for user 11
-#       - saving19   => savings for user 19
-#       - loan19     => loan repayment for user 19
-#       - grp9       => group 9
-#     """
-#     receipt = (
-#         callback_payload.get("TransID")
-#         or callback_payload.get("TransactionID")
-#         or callback_payload.get("MpesaReceiptNumber")
-#         or ""
-#     ).strip()
-
-#     if not receipt:
-#         raise ValueError("Invalid C2B callback: missing receipt/TransID")
-
-#     phone_raw = (
-#         callback_payload.get("MSISDN")
-#         or callback_payload.get("MSISDNNumber")
-#         or callback_payload.get("PhoneNumber")
-#         or callback_payload.get("MobileNumber")
-#         or ""
-#     )
-#     phone = normalize_phone(str(phone_raw))
-
-#     total_amount = _money(
-#         callback_payload.get("TransAmount")
-#         or callback_payload.get("Amount")
-#         or "0"
-#     )
-#     if total_amount <= Decimal("0.00"):
-#         raise ValueError("Invalid C2B callback: amount must be greater than 0")
-
-#     raw_reference = (
-#         callback_payload.get("BillRefNumber")
-#         or callback_payload.get("BillRef")
-#         or callback_payload.get("AccountReference")
-#         or ""
-#     ).strip()
-
-#     parsed = _parse_reference(raw_reference)
-#     purpose = parsed.purpose if parsed.valid else "OTHER"
-
-#     # 1. First try exact receipt match
-#     existing = MpesaTransaction.objects.select_for_update().filter(
-#         mpesa_receipt_number=receipt
-#     ).first()
-#     if existing:
-#         if existing.status != "SUCCESS":
-#             existing.status = "SUCCESS"
-#         existing.channel = "C2B"
-#         existing.payment_method = "PAYBILL"
-#         existing.origin = existing.origin or "EXTERNAL"
-#         existing.direction = existing.direction or "IN"
-#         existing.reference = parsed.normalized or raw_reference or existing.reference
-#         existing.external_reference_raw = raw_reference or existing.external_reference_raw
-#         existing.matched_reference_type = parsed.matched_reference_type
-#         existing.result_code = "0"
-#         existing.result_desc = "C2B confirmed"
-#         existing.callback_payload = callback_payload
-#         existing.callback_received_at = timezone.now()
-#         existing.updated_at = timezone.now()
-#         if phone:
-#             existing.phone = phone
-#         existing.save()
-#         return _finalize_successful_incoming_tx(existing, channel_label="C2B")
-
-    # 2. Then try to match existing pending tx created earlier by app flow
-    matched_pending = _find_existing_pending_c2b_tx(
-        phone=phone,
-        total_amount=total_amount,
-        raw_reference=raw_reference,
-        purpose=purpose,
-    )
-
-    matched_user = UserModel.objects.filter(phone=phone).first() if phone else None
-    matched_user_phone = matched_user.phone if matched_user and getattr(matched_user, "phone", "") else ""
-
-    if parsed.valid and parsed.kind == "GROUP" and matched_user and parsed.entity_id:
-        _require_active_group_membership(user=matched_user, group_id=parsed.entity_id)
-
-    base_amount, fee = split_incoming_total_amount(
-        purpose=purpose,
-        total_amount=total_amount,
-    )
-
-    resolved_user = matched_user
-    allocation_note = ""
-
-    if parsed.valid and parsed.kind in ("MERRY_USER", "SAVINGS_USER", "LOAN_USER") and parsed.entity_id:
-        beneficiary = UserModel.objects.filter(id=parsed.entity_id).first()
-        if beneficiary:
-            resolved_user = beneficiary
-            if matched_user and beneficiary.id != matched_user.id:
-                allocation_note = "Reference beneficiary differs from payer phone user."
-
-    if matched_pending:
-        matched_pending.user = resolved_user or matched_pending.user
-        matched_pending.phone = phone or matched_pending.phone
-        matched_pending.matched_user_phone = matched_user_phone or matched_pending.matched_user_phone
-        matched_pending.amount = total_amount
-        matched_pending.base_amount = base_amount
-        matched_pending.transaction_fee = fee
-        matched_pending.direction = matched_pending.direction or "IN"
-        matched_pending.channel = "C2B"
-        matched_pending.payment_method = "PAYBILL"
-        matched_pending.origin = matched_pending.origin or "EXTERNAL"
-        matched_pending.purpose = purpose or matched_pending.purpose
-        matched_pending.status = "SUCCESS"
-        matched_pending.reference = parsed.normalized or raw_reference or matched_pending.reference
-        matched_pending.external_reference_raw = raw_reference or matched_pending.external_reference_raw
-        matched_pending.matched_reference_type = parsed.matched_reference_type
-        matched_pending.mpesa_receipt_number = receipt
-        matched_pending.result_code = "0"
-        matched_pending.result_desc = "C2B confirmed"
-        matched_pending.transaction_date = timezone.now()
-        matched_pending.callback_received_at = timezone.now()
-        matched_pending.callback_payload = callback_payload
-
-        existing_payload = matched_pending.request_payload if isinstance(matched_pending.request_payload, dict) else {}
-        existing_payload.update(
-            {
-                "base_amount": str(base_amount),
-                "fee": str(fee),
-                "total_amount": str(total_amount),
-                "source": "C2B",
-                "payment_method": "PAYBILL",
-                "origin": matched_pending.origin or "EXTERNAL",
-                "parsed_reference": {
-                    "kind": parsed.kind,
-                    "entity_id": parsed.entity_id,
-                    "purpose": parsed.purpose,
-                    "valid": parsed.valid,
-                    "matched_reference_type": parsed.matched_reference_type,
-                },
-            }
-        )
-        matched_pending.request_payload = existing_payload
-
-        if parsed.valid:
-            if not matched_pending.allocation_notes:
-                matched_pending.allocation_notes = allocation_note
-        else:
-            matched_pending.allocation_status = "INVALID_REFERENCE"
-            matched_pending.allocation_notes = "Invalid or unsupported account reference."
-
-        matched_pending.save()
-        if not parsed.valid:
-            return matched_pending
-        return _finalize_successful_incoming_tx(matched_pending, channel_label="C2B")
-
-    # 3. Only create a new tx if nothing matched
-    tx = _create_mpesa_tx(
-        user=resolved_user,
-        phone=phone or "0700000000",
         matched_user_phone=matched_user_phone,
         amount=total_amount,
         base_amount=base_amount,
