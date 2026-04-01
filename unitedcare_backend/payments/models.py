@@ -196,6 +196,11 @@ class MpesaTransaction(models.Model):
     - external_reference_raw = mus11
     - purpose may start as MERRY_CONTRIBUTION if detected, else OTHER until parsed
     - allocation_status records allocation progress
+
+    NOTE:
+    For C2B v2 / production callbacks, Safaricom may send an encrypted or hashed
+    MSISDN instead of a normal phone number. Therefore `phone` must be able to
+    store longer raw identifiers and should not enforce local phone validation.
     """
 
     DIRECTION_CHOICES = (
@@ -273,14 +278,19 @@ class MpesaTransaction(models.Model):
     )
 
     phone = models.CharField(
-        max_length=20,
-        validators=[phone_validator],
+        max_length=100,
+        blank=True,
+        default="",
         db_index=True,
-        help_text="Phone used to make or receive the transaction.",
+        help_text=(
+            "Raw payer/receiver identifier from M-Pesa. "
+            "For STK/B2C this may be a normal phone number. "
+            "For C2B v2 it may be an encrypted/hash MSISDN."
+        ),
     )
 
     matched_user_phone = models.CharField(
-        max_length=20,
+        max_length=30,
         blank=True,
         default="",
         db_index=True,
