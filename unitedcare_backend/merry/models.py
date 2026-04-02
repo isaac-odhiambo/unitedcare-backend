@@ -851,7 +851,7 @@ class MerryPayment(models.Model):
         related_name="merry_payments_initiated",
     )
 
-    payer_phone = models.CharField(max_length=20, db_index=True)
+    payer_phone = models.CharField(max_length=50, db_index=True)
     period_key = models.CharField(max_length=20, db_index=True)
 
     amount = models.DecimalField(max_digits=12, decimal_places=2)

@@ -1020,16 +1020,14 @@ def _find_existing_pending_c2b_tx(
     purpose: str,
 ) -> Optional[MpesaTransaction]:
     """
-    Try to match an already-created pending app transaction so that
-    C2B confirmation updates that same row instead of creating a new one.
-
-    For C2B v2, callback MSISDN may be encrypted/hashed, so reference and amount
-    are stronger matching signals than phone.
+    Clean matching:
+    - ALWAYS trust phone from Safaricom
+    - match by reference + amount + phone
     """
+
     phone_n = normalize_phone(phone)
     amount_n = _money(total_amount)
     norm_ref = _normalize_reference_token(raw_reference)
-    callback_phone_is_normal = _looks_like_normal_phone(phone_n)
 
     recent_qs = (
         MpesaTransaction.objects.select_for_update()
@@ -1045,7 +1043,7 @@ def _find_existing_pending_c2b_tx(
 
     for tx in recent_qs:
         tx_ref = _normalize_reference_token(tx.reference or tx.external_reference_raw or "")
-        tx_phone = normalize_phone(tx.phone or tx.matched_user_phone or "")
+        tx_phone = normalize_phone(tx.phone or "")
         tx_amount = _money(tx.amount)
 
         if norm_ref and tx_ref != norm_ref:
@@ -1057,8 +1055,8 @@ def _find_existing_pending_c2b_tx(
         if purpose and (tx.purpose or "").upper() != (purpose or "").upper():
             continue
 
-        # Only enforce phone equality if callback phone looks like a real normal phone.
-        if callback_phone_is_normal and tx_phone and tx_phone != phone_n:
+        # ✅ ALWAYS enforce phone match
+        if tx_phone and tx_phone != phone_n:
             continue
 
         return tx
