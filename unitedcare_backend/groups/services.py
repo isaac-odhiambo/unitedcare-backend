@@ -383,15 +383,13 @@ def release_group_share_for_loan(*, group_id: int, loan_id: int) -> dict:
 @transaction.atomic
 def apply_mpesa_contribution(*, user, amount: Decimal, mpesa_tx, reference: str = "") -> dict:
     """
-    Apply an MPESA group contribution using the payment reference.
+    Apply MPESA group contribution.
 
-    Expected references:
-    - GROUP1 / GROUP-1 / group1 / group-1
-    - GRP1 / grp1
-    - or any format supported by normalize_group_reference / parser below
-
-    This function is called by payments.services._apply_group_contribution(tx).
+    Supports:
+    - GROUP1 / GROUP-1 / GRP1  (old format)
+    - UN1 / WF12 / MG7         (new format: <group_code><user_id>)
     """
+
     if not user:
         raise ValidationError("MPESA transaction has no linked user.")
 
@@ -402,33 +400,89 @@ def apply_mpesa_contribution(*, user, amount: Decimal, mpesa_tx, reference: str 
     ref_upper = raw_reference.upper().replace(" ", "")
 
     group_id = None
+    target_user = user  # default (in-app payments)
 
+    # ======================================================
+    # 1. OLD FORMAT SUPPORT (GROUP1 / GRP1)
+    # ======================================================
     if ref_upper.startswith("GROUP-"):
         suffix = ref_upper.replace("GROUP-", "", 1)
         if suffix.isdigit():
             group_id = int(suffix)
+
     elif ref_upper.startswith("GROUP"):
         suffix = ref_upper.replace("GROUP", "", 1)
         if suffix.isdigit():
             group_id = int(suffix)
+
     elif ref_upper.startswith("GRP"):
         suffix = ref_upper.replace("GRP", "", 1)
         if suffix.isdigit():
             group_id = int(suffix)
 
+    # ======================================================
+    # 2. NEW FORMAT SUPPORT (UN1, WF12, MG7)
+    # ======================================================
+    else:
+        letters = ""
+        digits = ""
+
+        for ch in ref_upper:
+            if ch.isalpha():
+                if digits:
+                    # letters after digits → invalid
+                    raise ValidationError(f"Invalid reference format: {raw_reference}")
+                letters += ch
+            elif ch.isdigit():
+                digits += ch
+            else:
+                raise ValidationError(f"Invalid characters in reference: {raw_reference}")
+
+        if not letters or not digits:
+            raise ValidationError(f"Invalid reference format: {raw_reference}")
+
+        # find group by payment_code
+        group = Group.objects.filter(payment_code=letters).first()
+        if not group:
+            raise ValidationError(f"Group with code '{letters}' not found.")
+
+        group_id = group.id
+
+        # override user using parsed user_id
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+
+        parsed_user = User.objects.filter(id=int(digits)).first()
+        if not parsed_user:
+            raise ValidationError(f"User with id {digits} not found.")
+
+        target_user = parsed_user
+
+    # ======================================================
+    # FINAL VALIDATION
+    # ======================================================
     if not group_id:
         raise ValidationError(f"Invalid group reference: {raw_reference}")
 
+    # ensure user is a member
+    require_active_membership(group_id, target_user)
+
+    # ======================================================
+    # CREATE UNIQUE REFERENCE
+    # ======================================================
     receipt = getattr(mpesa_tx, "mpesa_receipt_number", None)
     tx_id = getattr(mpesa_tx, "id", None)
 
-    unique_reference = receipt or f"MPESA_TX#{tx_id}" if tx_id else raw_reference
+    unique_reference = receipt or (f"MPESA_TX#{tx_id}" if tx_id else raw_reference)
 
     note = f"MPESA contribution via transaction #{tx_id}" if tx_id else "MPESA contribution"
 
+    # ======================================================
+    # POST CONTRIBUTION
+    # ======================================================
     return post_group_contribution(
         group_id=group_id,
-        user=user,
+        user=target_user,
         amount=amount,
         reference=unique_reference,
         note=note,
