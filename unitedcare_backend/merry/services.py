@@ -830,7 +830,18 @@ def apply_mpesa_contribution_by_user_reference(
     paid_at = timezone.now()
 
     if mpesa_tx is not None:
-        payer_phone = getattr(mpesa_tx, "phone", "") or ""
+        tx_phone = (getattr(mpesa_tx, "phone", "") or "").strip()
+        matched_user_phone = (getattr(mpesa_tx, "matched_user_phone", "") or "").strip()
+        user_phone = (getattr(user, "phone", "") or "").strip()
+
+        # Prefer a real normalized Kenyan phone and avoid hashed/encrypted callback values.
+        if tx_phone.startswith("254") and len(tx_phone) <= 15:
+            payer_phone = tx_phone
+        elif matched_user_phone.startswith("254") and len(matched_user_phone) <= 15:
+            payer_phone = matched_user_phone
+        elif user_phone.startswith("254") and len(user_phone) <= 15:
+            payer_phone = user_phone
+
         mpesa_receipt = getattr(mpesa_tx, "mpesa_receipt_number", None)
         tx_date = getattr(mpesa_tx, "transaction_date", None)
         if tx_date:
@@ -943,6 +954,7 @@ def apply_mpesa_contribution_by_user_reference(
         "wallet_balance_after": q2(wallet_balance_after),
     }
 
+
 def apply_mpesa_contribution_by_user(
     *,
     user_id: int,
@@ -956,7 +968,6 @@ def apply_mpesa_contribution_by_user(
         mpesa_tx=mpesa_tx,
         reference=reference,
     )
-
 
 def apply_mpesa_contribution(
     *,
