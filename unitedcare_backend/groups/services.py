@@ -379,3 +379,58 @@ def release_group_share_for_loan(*, group_id: int, loan_id: int) -> dict:
         "loan_id": int(loan_id),
         "released_total": str(released_total),
     }
+
+@transaction.atomic
+def apply_mpesa_contribution(*, user, amount: Decimal, mpesa_tx, reference: str = "") -> dict:
+    """
+    Apply an MPESA group contribution using the payment reference.
+
+    Expected references:
+    - GROUP1 / GROUP-1 / group1 / group-1
+    - GRP1 / grp1
+    - or any format supported by normalize_group_reference / parser below
+
+    This function is called by payments.services._apply_group_contribution(tx).
+    """
+    if not user:
+        raise ValidationError("MPESA transaction has no linked user.")
+
+    raw_reference = (reference or getattr(mpesa_tx, "reference", "") or "").strip()
+    if not raw_reference:
+        raise ValidationError("Missing group payment reference.")
+
+    ref_upper = raw_reference.upper().replace(" ", "")
+
+    group_id = None
+
+    if ref_upper.startswith("GROUP-"):
+        suffix = ref_upper.replace("GROUP-", "", 1)
+        if suffix.isdigit():
+            group_id = int(suffix)
+    elif ref_upper.startswith("GROUP"):
+        suffix = ref_upper.replace("GROUP", "", 1)
+        if suffix.isdigit():
+            group_id = int(suffix)
+    elif ref_upper.startswith("GRP"):
+        suffix = ref_upper.replace("GRP", "", 1)
+        if suffix.isdigit():
+            group_id = int(suffix)
+
+    if not group_id:
+        raise ValidationError(f"Invalid group reference: {raw_reference}")
+
+    receipt = getattr(mpesa_tx, "mpesa_receipt_number", None)
+    tx_id = getattr(mpesa_tx, "id", None)
+
+    unique_reference = receipt or f"MPESA_TX#{tx_id}" if tx_id else raw_reference
+
+    note = f"MPESA contribution via transaction #{tx_id}" if tx_id else "MPESA contribution"
+
+    return post_group_contribution(
+        group_id=group_id,
+        user=user,
+        amount=amount,
+        reference=unique_reference,
+        note=note,
+        source="MPESA",
+    )
