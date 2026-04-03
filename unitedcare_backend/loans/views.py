@@ -22,11 +22,13 @@ from .serializers import (
     LoanListSerializer,
     LoanPaymentCreateSerializer,
     LoanRequestSerializer,
+    LoanSecurityPreviewSerializer,
 )
 from .services import (
     approve_loan_and_create_schedule,
     apply_payment_to_loan,
     get_loan_eligibility_preview,
+    get_loan_security_preview,
     record_loan_payment,
     request_global_loan,
 )
@@ -59,6 +61,40 @@ class LoanEligibilityPreviewView(APIView):
         preview = get_loan_eligibility_preview(user=request.user)
         data = LoanEligibilityPreviewSerializer(preview).data
         return Response(data, status=status.HTTP_200_OK)
+
+
+# ==========================
+# Loans: Security Preview
+# ==========================
+class LoanSecurityPreviewView(APIView):
+    """
+    Returns full security breakdown for a requested loan:
+    - borrower savings
+    - merry
+    - group
+    - guarantors
+    - total secured
+    - shortfall
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        principal = request.data.get("principal", 0)
+        guarantor_ids = request.data.get("guarantor_ids", []) or []
+
+        try:
+            principal = Decimal(str(principal))
+        except Exception:
+            raise ValidationError({"principal": "Invalid amount."})
+
+        preview = get_loan_security_preview(
+            borrower=request.user,
+            principal=principal,
+            guarantor_ids=guarantor_ids,
+        )
+
+        serializer = LoanSecurityPreviewSerializer(preview)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
 
 # ==========================
@@ -143,7 +179,10 @@ class RequestLoanView(APIView):
 
         return Response(
             {
-                "message": "Loan request submitted.",
+                "message": "Loan request submitted successfully.",
+                "loan_id": loan.id,
+                "status": loan.status,
+                "note": "Your loan will be approved once it is fully secured.",
                 "loan": LoanDetailSerializer(loan).data,
             },
             status=status.HTTP_201_CREATED,
@@ -267,7 +306,13 @@ class AcceptGuaranteeView(APIView):
             loan_id=guarantor_link.loan.id,
         )
 
-        return Response({"message": "Guarantee accepted."}, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "message": "Guarantee accepted.",
+                "note": "This loan will be approved once total security reaches 100%.",
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ==========================
@@ -455,6 +500,7 @@ class RejectLoanView(APIView):
         return Response(
             {
                 "message": "Loan rejected.",
+                "note": "You can submit a new request after adjusting your amount or guarantors.",
                 "loan": LoanDetailSerializer(loan).data,
             },
             status=status.HTTP_200_OK,
@@ -501,10 +547,11 @@ class PayLoanView(APIView):
 
         return Response(
             {
-                "message": "Payment applied.",
+                "message": "Payment received successfully.",
                 "loan_status": loan.status,
                 "total_paid": str(loan.total_paid),
                 "outstanding_balance": str(loan.outstanding_balance),
+                "note": "Your loan will be closed automatically once fully paid.",
             },
             status=status.HTTP_200_OK,
         )

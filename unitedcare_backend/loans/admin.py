@@ -59,36 +59,88 @@ def approve_loans(modeladmin, request, queryset):
 
 @admin.action(description="Reject selected loans")
 def reject_loans(modeladmin, request, queryset):
-    updated = queryset.filter(status__in=("PENDING", "UNDER_REVIEW")).update(
-        status="REJECTED",
-        rejected_at=timezone.now(),
-    )
-    modeladmin.message_user(
-        request,
-        f"{updated} loan(s) rejected.",
-        level=messages.WARNING,
-    )
+    count = 0
+    failed = 0
+
+    for loan in queryset:
+        try:
+            if loan.status not in ("PENDING", "UNDER_REVIEW", "APPROVED", "DEFAULTED"):
+                continue
+
+            # Safety: if security had already been reserved, release it first.
+            if loan.security_reserved_total and loan.security_reserved_total > 0:
+                release_reserved_security_for_loan(loan)
+
+            loan.status = "REJECTED"
+            if hasattr(loan, "rejected_at"):
+                loan.rejected_at = timezone.now()
+                loan.save(update_fields=["status", "rejected_at"])
+            else:
+                loan.save(update_fields=["status"])
+
+            count += 1
+        except Exception as e:
+            failed += 1
+            modeladmin.message_user(
+                request,
+                f"Loan #{loan.id} rejection failed: {e}",
+                level=messages.ERROR,
+            )
+
+    if count:
+        modeladmin.message_user(
+            request,
+            f"{count} loan(s) rejected.",
+            level=messages.WARNING,
+        )
+    if failed:
+        modeladmin.message_user(
+            request,
+            f"{failed} loan(s) could not be rejected.",
+            level=messages.ERROR,
+        )
 
 
 @admin.action(description="Mark selected loans as completed")
 def complete_loans(modeladmin, request, queryset):
     count = 0
+    failed = 0
+
     for loan in queryset:
-        if loan.status != "APPROVED":
-            continue
+        try:
+            if loan.status != "APPROVED":
+                continue
 
-        loan.recompute_balances()
-        loan.status = "COMPLETED"
-        loan.outstanding_balance = 0
-        loan.completed_at = timezone.now()
-        loan.save(update_fields=["status", "outstanding_balance", "completed_at"])
-        count += 1
+            loan.recompute_balances()
+            loan.status = "COMPLETED"
+            loan.outstanding_balance = 0
+            loan.completed_at = timezone.now()
+            loan.save(update_fields=["status", "outstanding_balance", "completed_at"])
 
-    modeladmin.message_user(
-        request,
-        f"{count} loan(s) marked as COMPLETED.",
-        level=messages.SUCCESS,
-    )
+            # Important: release security after completion.
+            release_reserved_security_for_loan(loan)
+
+            count += 1
+        except Exception as e:
+            failed += 1
+            modeladmin.message_user(
+                request,
+                f"Loan #{loan.id} completion failed: {e}",
+                level=messages.ERROR,
+            )
+
+    if count:
+        modeladmin.message_user(
+            request,
+            f"{count} loan(s) marked as COMPLETED.",
+            level=messages.SUCCESS,
+        )
+    if failed:
+        modeladmin.message_user(
+            request,
+            f"{failed} loan(s) could not be completed.",
+            level=messages.WARNING,
+        )
 
 
 @admin.action(description="Mark selected loans as defaulted")
@@ -207,18 +259,40 @@ def mark_installments_unpaid(modeladmin, request, queryset):
 # =========================================================
 # SECURITY ALLOCATION ACTIONS
 # =========================================================
-@admin.action(description="Release selected security allocations")
+@admin.action(description="Release security via parent loan cleanup")
 def release_security_allocations(modeladmin, request, queryset):
+    """
+    Safer than releasing allocations one by one, because the parent loan
+    service also restores savings/group reserved amounts correctly.
+    """
     count = 0
-    for allocation in queryset.filter(is_active=True):
-        allocation.release()
-        count += 1
+    failed = 0
+    loan_ids = list(queryset.values_list("loan_id", flat=True).distinct())
 
-    modeladmin.message_user(
-        request,
-        f"{count} security allocation(s) released.",
-        level=messages.SUCCESS,
-    )
+    for loan in Loan.objects.filter(id__in=loan_ids):
+        try:
+            release_reserved_security_for_loan(loan)
+            count += 1
+        except Exception as e:
+            failed += 1
+            modeladmin.message_user(
+                request,
+                f"Loan #{loan.id} security release failed: {e}",
+                level=messages.ERROR,
+            )
+
+    if count:
+        modeladmin.message_user(
+            request,
+            f"Released security for {count} loan(s).",
+            level=messages.SUCCESS,
+        )
+    if failed:
+        modeladmin.message_user(
+            request,
+            f"{failed} loan(s) could not release security.",
+            level=messages.WARNING,
+        )
 
 
 # =========================================================

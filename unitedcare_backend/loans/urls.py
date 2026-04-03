@@ -5,6 +5,7 @@ from django.urls import path
 from .views import (
     MyLoansView,
     LoanEligibilityPreviewView,
+    LoanSecurityPreviewView,
     LoanGuarantorCandidatesView,
     RequestLoanView,
     LoanDetailView,
@@ -13,12 +14,11 @@ from .views import (
     AcceptGuaranteeView,
     RejectGuaranteeView,
     ApproveLoanView,
-    RejectLoanView,  # ✅ ADDED
+    RejectLoanView,
     PayLoanView,
 )
 
 urlpatterns = [
-
     # ===============================
     # Borrower endpoints
     # ===============================
@@ -26,8 +26,11 @@ urlpatterns = [
     # List my loans
     path("myloans/", MyLoansView.as_view(), name="my-loans"),
 
-    # Preview eligibility (max amount, collateral etc)
+    # Basic eligibility preview
     path("eligibility/", LoanEligibilityPreviewView.as_view(), name="loan-eligibility"),
+
+    # Full security preview for selected amount + guarantors
+    path("security-preview/", LoanSecurityPreviewView.as_view(), name="loan-security-preview"),
 
     # Search guarantor candidates
     path("guarantor-candidates/", LoanGuarantorCandidatesView.as_view(), name="guarantor-candidates"),
@@ -40,7 +43,6 @@ urlpatterns = [
 
     # Add guarantor
     path("loan/add-guarantor/", AddGuarantorView.as_view(), name="add-guarantor"),
-
 
     # ===============================
     # Guarantor endpoints
@@ -67,7 +69,6 @@ urlpatterns = [
         name="reject-guarantee",
     ),
 
-
     # ===============================
     # Admin / Approver endpoints
     # ===============================
@@ -79,13 +80,12 @@ urlpatterns = [
         name="approve-loan",
     ),
 
-    # ✅ Reject loan (with reason)
+    # Reject loan
     path(
         "loan/<int:loan_id>/reject/",
         RejectLoanView.as_view(),
         name="reject-loan",
     ),
-
 
     # ===============================
     # Payments

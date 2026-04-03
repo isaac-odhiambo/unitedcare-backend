@@ -12,8 +12,6 @@ from .models import (
     LoanSecurityAllocation,
     MemberCreditProfile,
 )
-from .services import get_default_loan_product
-
 
 User = get_user_model()
 
@@ -132,7 +130,7 @@ class AddLoanGuarantorSerializer(serializers.Serializer):
             raise serializers.ValidationError("Only the borrower can add guarantors to this loan.")
 
         if loan.status not in ("PENDING", "UNDER_REVIEW"):
-            raise serializers.ValidationError("You can only add guarantors to a pending/review loan.")
+            raise serializers.ValidationError("You can only add guarantors to a pending or under-review loan.")
 
         if loan.borrower_id == guarantor.id:
             raise serializers.ValidationError("Borrower cannot guarantee their own loan.")
@@ -369,6 +367,35 @@ class LoanEligibilityPreviewSerializer(serializers.Serializer):
 
 
 # ==========================================================
+# Loan Security Preview (NEW)
+# ==========================================================
+class LoanSecurityPreviewGuarantorSerializer(serializers.Serializer):
+    guarantor_id = serializers.IntegerField()
+    guarantor_name = serializers.CharField()
+    available_security = serializers.DecimalField(max_digits=12, decimal_places=2)
+    used_security = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+
+class LoanSecurityPreviewSerializer(serializers.Serializer):
+    eligible = serializers.BooleanField()
+    principal = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    borrower_savings = serializers.DecimalField(max_digits=12, decimal_places=2)
+    borrower_merry = serializers.DecimalField(max_digits=12, decimal_places=2)
+    borrower_group = serializers.DecimalField(max_digits=12, decimal_places=2)
+    borrower_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    guarantor_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    secured_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    shortfall = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    fully_secured = serializers.BooleanField()
+    message = serializers.CharField()
+
+    guarantors = LoanSecurityPreviewGuarantorSerializer(many=True)
+
+
+# ==========================================================
 # Guarantor candidate list
 # ==========================================================
 class GuarantorCandidateSerializer(serializers.ModelSerializer):
@@ -396,5 +423,10 @@ class GuarantorCandidateSerializer(serializers.ModelSerializer):
             return username
 
         return str(obj)
+
+
+# ==========================================================
+# Reject loan
+# ==========================================================
 class LoanRejectSerializer(serializers.Serializer):
     rejection_reason = serializers.CharField()
