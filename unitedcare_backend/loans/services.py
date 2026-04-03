@@ -1174,6 +1174,137 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
 # ==========================================================
 # Payments
 # ==========================================================
+REPAYABLE_LOAN_STATUSES = (
+    "APPROVED",
+    "DISBURSED",
+    "UNDER_REPAYMENT",
+    "DEFAULTED",
+)
+
+
+def _repayable_loans_queryset():
+    return (
+        Loan.objects.select_for_update()
+        .select_related("product", "borrower")
+        .filter(status__in=REPAYABLE_LOAN_STATUSES)
+    )
+
+
+def _get_single_repayable_loan_for_borrower(*, user_id: int) -> Loan:
+    qs = _repayable_loans_queryset().filter(borrower_id=user_id).order_by("-id")
+    rows = list(qs[:2])
+
+    if not rows:
+        raise ValidationError("No active repayable loan found for this borrower.")
+
+    if len(rows) > 1:
+        raise ValidationError(
+            "Multiple active repayable loans found for this borrower."
+        )
+
+    return rows[0]
+
+
+def _split_payment_amounts(*, loan: Loan, amount: Decimal) -> tuple[Decimal, Decimal]:
+    """
+    Returns:
+      applied_to_loan, excess_to_savings
+    """
+    amt = q2(amount)
+    if amt <= 0:
+        raise ValidationError("Payment amount must be greater than 0.")
+
+    outstanding = q2(loan.outstanding_balance or Decimal("0.00"))
+    if outstanding <= 0:
+        return Decimal("0.00"), amt
+
+    applied = q2(min(amt, outstanding))
+    excess = q2(max(Decimal("0.00"), amt - applied))
+    return applied, excess
+
+
+def _safe_create_savings_transaction(
+    *,
+    account: SavingsAccount,
+    amount: Decimal,
+    reference: str,
+    narration: str,
+) -> None:
+    """
+    Best-effort transaction logging for overpayment moved to savings.
+    This avoids breaking if your SavingsTransaction model has slightly
+    different optional fields across environments.
+    """
+    try:
+        field_names = {f.name for f in SavingsTransaction._meta.get_fields()}
+        payload = {}
+
+        if "account" in field_names:
+            payload["account"] = account
+        if "txn_type" in field_names:
+            payload["txn_type"] = "DEPOSIT"
+        if "amount" in field_names:
+            payload["amount"] = q2(amount)
+        if "reference" in field_names:
+            payload["reference"] = reference
+        if "narration" in field_names:
+            payload["narration"] = narration
+        if "description" in field_names and "narration" not in payload:
+            payload["description"] = narration
+        if "balance_after" in field_names:
+            payload["balance_after"] = q2(
+                getattr(account, "balance", Decimal("0.00"))
+            )
+        if "created_at" in field_names:
+            payload["created_at"] = timezone.now()
+
+        if "account" in payload and "txn_type" in payload and "amount" in payload:
+            SavingsTransaction.objects.create(**payload)
+    except Exception:
+        # Do not break repayment success if only savings transaction logging fails.
+        pass
+
+
+def _move_excess_to_savings(
+    *,
+    loan: Loan,
+    excess_amount: Decimal,
+    reference: Optional[str] = None,
+) -> Decimal:
+    excess = q2(excess_amount)
+    if excess <= 0:
+        return Decimal("0.00")
+
+    acct = SavingsAccount.objects.select_for_update().get(
+        id=get_primary_savings_account(loan.borrower).id
+    )
+
+    current_balance = q2(getattr(acct, "balance", Decimal("0.00")))
+    acct.balance = q2(current_balance + excess)
+
+    update_fields = []
+    if hasattr(acct, "balance"):
+        update_fields.append("balance")
+    if hasattr(acct, "updated_at"):
+        acct.updated_at = timezone.now()
+        update_fields.append("updated_at")
+
+    if update_fields:
+        acct.save(update_fields=update_fields)
+    else:
+        acct.save()
+
+    overpay_ref = reference or f"LOAN-OVERPAYMENT-{loan.id}"
+    _safe_create_savings_transaction(
+        account=acct,
+        amount=excess,
+        reference=overpay_ref,
+        narration=f"Loan overpayment moved to savings for loan #{loan.id}",
+    )
+
+    return excess
+
+
 @transaction.atomic
 def create_loan_payment_record(
     loan: Loan,
@@ -1181,16 +1312,26 @@ def create_loan_payment_record(
     method: str = "MANUAL",
     reference: Optional[str] = None,
 ) -> LoanPayment:
-    amount = q2(amount)
-    if amount <= 0:
+    """
+    Creates only the portion that actually belongs to the loan.
+    Any excess is not stored as LoanPayment; it is moved to savings separately.
+    """
+    amt = q2(amount)
+    if amt <= 0:
         raise ValidationError("Payment amount must be greater than 0.")
 
-    if loan.status not in ("APPROVED", "DEFAULTED"):
-        raise ValidationError("You can only pay an approved/defaulted loan.")
+    if loan.status not in REPAYABLE_LOAN_STATUSES:
+        raise ValidationError(
+            "You can only pay a loan that is approved, disbursed, under repayment, or defaulted."
+        )
+
+    applied_amount, _ = _split_payment_amounts(loan=loan, amount=amt)
+    if applied_amount <= 0:
+        raise ValidationError("This loan has no outstanding balance.")
 
     return LoanPayment.objects.create(
         loan=loan,
-        amount=amount,
+        amount=applied_amount,
         method=method,
         reference=reference,
     )
@@ -1213,21 +1354,27 @@ def record_loan_payment(
 
 @transaction.atomic
 def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
-    amount = q2(amount)
-    if amount <= 0:
+    amt = q2(amount)
+    if amt <= 0:
         raise ValidationError("Payment amount must be greater than 0.")
 
-    if loan.status not in ("APPROVED", "DEFAULTED"):
+    if loan.status not in REPAYABLE_LOAN_STATUSES:
         raise ValidationError(
-            "Payments can only be applied to approved/defaulted loans."
+            "Payments can only be applied to a loan that is approved, disbursed, under repayment, or defaulted."
         )
 
-    current_outstanding = q2(loan.outstanding_balance or Decimal("0.00"))
-    if current_outstanding <= 0:
-        raise ValidationError("This loan has no outstanding balance.")
+    applied_amount, excess_amount = _split_payment_amounts(loan=loan, amount=amt)
 
-    amount_to_apply = q2(min(amount, current_outstanding))
-    remaining = amount_to_apply
+    if applied_amount <= 0 and excess_amount > 0:
+        # Loan is already fully cleared; move whole amount to savings.
+        _move_excess_to_savings(
+            loan=loan,
+            excess_amount=excess_amount,
+            reference=f"LOAN-EXCESS-{loan.id}-{timezone.now().timestamp()}",
+        )
+        return loan
+
+    remaining = applied_amount
 
     installments = (
         LoanInstallment.objects.select_for_update()
@@ -1246,6 +1393,7 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
             + Decimal(inst.late_fee)
             - Decimal(inst.paid_amount)
         )
+
         if due <= 0:
             inst.is_paid = True
             inst.save(update_fields=["is_paid"])
@@ -1266,7 +1414,7 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
         inst.save(update_fields=["paid_amount", "is_paid"])
 
     previous_status = loan.status
-    loan.total_paid = q2(Decimal(loan.total_paid or Decimal("0.00")) + amount_to_apply)
+    loan.total_paid = q2(Decimal(loan.total_paid or Decimal("0.00")) + applied_amount)
     loan.recompute_balances()
     loan.save(
         update_fields=[
@@ -1282,6 +1430,13 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
         if previous_status != "COMPLETED":
             update_credit_on_completion(loan)
 
+    if excess_amount > 0:
+        _move_excess_to_savings(
+            loan=loan,
+            excess_amount=excess_amount,
+            reference=f"LOAN-OVERPAYMENT-{loan.id}-{timezone.now().timestamp()}",
+        )
+
     return loan
 
 
@@ -1292,38 +1447,32 @@ def record_and_apply_loan_payment(
     method: str = "MANUAL",
     reference: Optional[str] = None,
 ) -> Loan:
-    amount = q2(amount)
-    current_outstanding = q2(loan.outstanding_balance or Decimal("0.00"))
-    if current_outstanding <= 0:
-        raise ValidationError("This loan has no outstanding balance.")
+    amt = q2(amount)
+    if amt <= 0:
+        raise ValidationError("Payment amount must be greater than 0.")
 
-    applied_amount = q2(min(amount, current_outstanding))
-    create_loan_payment_record(
-        loan=loan,
-        amount=applied_amount,
-        method=method,
-        reference=reference,
-    )
-    return apply_payment_to_loan(loan, applied_amount)
+    applied_amount, _ = _split_payment_amounts(loan=loan, amount=amt)
+    if applied_amount > 0:
+        create_loan_payment_record(
+            loan=loan,
+            amount=amt,
+            method=method,
+            reference=reference,
+        )
+
+    return apply_payment_to_loan(loan, amt)
 
 
 @transaction.atomic
-def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
-    loan = (
-        Loan.objects.select_for_update()
-        .select_related("product", "borrower")
-        .filter(id=loan_id)
-        .first()
-    )
-    if not loan:
-        raise ValidationError("Loan not found.")
-
+def _apply_mpesa_repayment_to_loan(*, loan: Loan, amount: Decimal, mpesa_tx) -> Loan:
     amt = q2(amount)
     if amt <= 0:
         raise ValidationError("Repayment amount must be greater than 0.")
 
-    if loan.status not in ("APPROVED", "DEFAULTED"):
-        raise ValidationError("You can only repay an approved/defaulted loan.")
+    if loan.status not in REPAYABLE_LOAN_STATUSES:
+        raise ValidationError(
+            "You can only repay a loan that is approved, disbursed, under repayment, or defaulted."
+        )
 
     tx_id = getattr(mpesa_tx, "id", None)
     if not tx_id:
@@ -1331,6 +1480,7 @@ def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
 
     ref = f"MPESA_TX#{tx_id}"
 
+    # Idempotent guard
     if LoanPayment.objects.filter(
         loan=loan,
         method="MPESA",
@@ -1338,23 +1488,91 @@ def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
     ).exists():
         return loan
 
-    outstanding = q2(loan.outstanding_balance or Decimal("0.00"))
-    if outstanding <= 0:
-        raise ValidationError("This loan has no outstanding balance.")
+    applied_amount, _ = _split_payment_amounts(loan=loan, amount=amt)
 
-    amt_to_apply = q2(min(amt, outstanding))
+    if applied_amount > 0:
+        LoanPayment.objects.create(
+            loan=loan,
+            amount=applied_amount,
+            method="MPESA",
+            reference=ref,
+        )
 
-    LoanPayment.objects.create(
-        loan=loan,
-        amount=amt_to_apply,
-        method="MPESA",
-        reference=ref,
-    )
-
-    apply_payment_to_loan(loan, amt_to_apply)
+    loan = apply_payment_to_loan(loan, amt)
     return loan
 
 
+@transaction.atomic
+def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
+    """
+    Backward-compatible direct-by-loan-id repayment path.
+    """
+    loan = _repayable_loans_queryset().filter(id=loan_id).first()
+    if not loan:
+        raise ValidationError("Loan not found.")
+
+    return _apply_mpesa_repayment_to_loan(
+        loan=loan,
+        amount=amount,
+        mpesa_tx=mpesa_tx,
+    )
+
+
+@transaction.atomic
+def apply_mpesa_repayment_by_user_reference(
+    *,
+    user_id: int,
+    amount: Decimal,
+    mpesa_tx,
+    reference: Optional[str] = None,
+) -> Loan:
+    """
+    Canonical STK/C2B repayment path.
+
+    Rule:
+      loan2 => LOAN_REPAYMENT for borrower user id 2
+
+    Since borrower is allowed only one active repayable loan, the
+    repayment is applied to that single active loan.
+    """
+    loan = _get_single_repayable_loan_for_borrower(user_id=int(user_id))
+    return _apply_mpesa_repayment_to_loan(
+        loan=loan,
+        amount=amount,
+        mpesa_tx=mpesa_tx,
+    )
+
+
+@transaction.atomic
+def apply_mpesa_repayment_by_user_id(
+    *,
+    user_id: int,
+    amount: Decimal,
+    mpesa_tx,
+    reference: Optional[str] = None,
+) -> Loan:
+    return apply_mpesa_repayment_by_user_reference(
+        user_id=user_id,
+        amount=amount,
+        mpesa_tx=mpesa_tx,
+        reference=reference,
+    )
+
+
+@transaction.atomic
+def apply_mpesa_repayment_by_user(
+    *,
+    user,
+    amount: Decimal,
+    mpesa_tx,
+    reference: Optional[str] = None,
+) -> Loan:
+    return apply_mpesa_repayment_by_user_reference(
+        user_id=user.id,
+        amount=amount,
+        mpesa_tx=mpesa_tx,
+        reference=reference,
+    )
 # ==========================================================
 # Late Fees
 # ==========================================================

@@ -710,17 +710,24 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
 @transaction.atomic
 def _apply_loan_repayment(tx: MpesaTransaction) -> None:
     """
-    loan19 => USER id 19
-    Backend loan service should find that user's active loan.
+    Canonical loan repayment allocation.
+
+    Rule:
+      loan19 => LOAN_REPAYMENT for borrower USER id 19
+
+    Important:
+    - The numeric part of loan reference is always treated as borrower user id
+    - It must NOT be treated as loan record id
+    - Borrower is expected to have only one active repayable loan
     """
     parsed = _parse_reference(tx.reference or "")
-    beneficiary_user_id = (
+    borrower_user_id = (
         parsed.entity_id
         if parsed.valid and parsed.kind == "LOAN_USER"
         else _extract_id(tx.reference or "", "LOAN-")
     )
 
-    if not beneficiary_user_id:
+    if not borrower_user_id:
         _update_tx_allocation(
             tx,
             status="INVALID_REFERENCE",
@@ -747,32 +754,39 @@ def _apply_loan_repayment(tx: MpesaTransaction) -> None:
         "apply_mpesa_repayment_by_user",
     )
 
+    last_error = ""
+
     for fn_name in preferred_names:
         fn = getattr(loan_services, fn_name, None)
         if not callable(fn):
             continue
+
         try:
             if fn_name == "apply_mpesa_repayment_by_user":
-                beneficiary_user = UserModel.objects.filter(id=beneficiary_user_id).first()
-                if not beneficiary_user:
-                    raise ValueError("Beneficiary user not found for loan reference.")
+                borrower_user = UserModel.objects.filter(id=borrower_user_id).first()
+                if not borrower_user:
+                    raise ValueError("Borrower user not found for loan reference.")
+
                 fn(
-                    user=beneficiary_user,
+                    user=borrower_user,
                     amount=base_amount,
                     mpesa_tx=tx,
                     reference=tx.reference or "",
                 )
             else:
                 fn(
-                    user_id=beneficiary_user_id,
+                    user_id=borrower_user_id,
                     amount=base_amount,
                     mpesa_tx=tx,
                     reference=tx.reference or "",
                 )
 
-            note = "Loan repayment auto-applied by user reference."
-            if tx.user_id and tx.user_id != beneficiary_user_id:
-                note = "Allocated by loan user reference; payer phone/user differs from beneficiary."
+            note = "Loan repayment auto-applied by borrower user reference."
+            if tx.user_id and tx.user_id != borrower_user_id:
+                note = (
+                    "Allocated by loan borrower reference; "
+                    "payer phone/user differs from beneficiary."
+                )
 
             _update_tx_allocation(
                 tx,
@@ -780,42 +794,19 @@ def _apply_loan_repayment(tx: MpesaTransaction) -> None:
                 notes=note,
             )
             return
-        except Exception as e:
-            _update_tx_allocation(
-                tx,
-                status="MANUAL_REVIEW",
-                notes=f"Loan allocation error: {str(e)}"[:255],
-            )
-            return
 
-    fallback = getattr(loan_services, "apply_mpesa_repayment", None)
-    if callable(fallback):
-        try:
-            fallback(
-                loan_id=beneficiary_user_id,
-                amount=base_amount,
-                mpesa_tx=tx,
-            )
-            _update_tx_allocation(
-                tx,
-                status="AUTO_ALLOCATED",
-                notes="Loan repayment auto-applied by fallback logic.",
-            )
-            return
         except Exception as e:
-            _update_tx_allocation(
-                tx,
-                status="MANUAL_REVIEW",
-                notes=f"Loan allocation error: {str(e)}"[:255],
-            )
-            return
+            last_error = str(e)
 
     _update_tx_allocation(
         tx,
         status="MANUAL_REVIEW",
-        notes="Loan repayment function not found.",
+        notes=(
+            f"Loan allocation error: {last_error}"[:255]
+            if last_error
+            else "Loan repayment function not found."
+        ),
     )
-
 
 @transaction.atomic
 def _apply_savings_deposit(tx: MpesaTransaction) -> None:
