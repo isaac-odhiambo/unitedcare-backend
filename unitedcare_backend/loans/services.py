@@ -36,6 +36,23 @@ SECURITY_COVERAGE_RATIO = Decimal("1.00")
 # Guarantor policy
 GUARANTOR_MAX_EXPOSURE_RATIO = Decimal("0.70")
 
+# Loan-state rules
+REQUEST_BLOCKING_STATUSES = (
+    "PENDING",
+    "UNDER_REVIEW",
+    "APPROVED",
+    "DISBURSED",
+    "UNDER_REPAYMENT",
+    "DEFAULTED",
+)
+
+APPROVAL_BLOCKING_STATUSES = (
+    "APPROVED",
+    "DISBURSED",
+    "UNDER_REPAYMENT",
+    "DEFAULTED",
+)
+
 # Security source toggles
 ALLOW_BORROWER_SAVINGS_SECURITY = True
 ALLOW_BORROWER_MERRY_CREDIT_SECURITY = True
@@ -158,7 +175,11 @@ def get_default_loan_product() -> LoanProduct:
 # ==========================================================
 def get_primary_savings_account(user) -> SavingsAccount:
     acct = (
-        SavingsAccount.objects.filter(user=user, is_active=True, account_type="FLEXIBLE")
+        SavingsAccount.objects.filter(
+            user=user,
+            is_active=True,
+            account_type="FLEXIBLE",
+        )
         .order_by("id")
         .first()
     )
@@ -201,10 +222,27 @@ def get_missing_consecutive_deposit_months(account: SavingsAccount) -> List[str]
 # Borrower Eligibility
 # ==========================================================
 def borrower_has_active_loan(user) -> bool:
+    """
+    Used during new request creation.
+    Blocks if borrower already has any unresolved loan.
+    """
     return Loan.objects.filter(
         borrower=user,
-        status__in=["PENDING", "UNDER_REVIEW", "APPROVED", "DEFAULTED"],
+        status__in=REQUEST_BLOCKING_STATUSES,
     ).exists()
+
+
+def borrower_has_other_active_loan(*, user, exclude_loan_id: int | None = None) -> bool:
+    """
+    Used during approval so the current loan does not block itself.
+    """
+    qs = Loan.objects.filter(
+        borrower=user,
+        status__in=APPROVAL_BLOCKING_STATUSES,
+    )
+    if exclude_loan_id is not None:
+        qs = qs.exclude(id=exclude_loan_id)
+    return qs.exists()
 
 
 def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
@@ -213,10 +251,16 @@ def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
         raise ValidationError("Principal must be greater than 0.")
 
     if borrower_has_active_loan(user):
-        raise ValidationError("You already have an active loan. Clear it before requesting another loan.")
+        raise ValidationError(
+            "You already have an active loan. Clear it before requesting another loan."
+        )
 
     account = (
-        SavingsAccount.objects.filter(user=user, is_active=True, account_type="FLEXIBLE")
+        SavingsAccount.objects.filter(
+            user=user,
+            is_active=True,
+            account_type="FLEXIBLE",
+        )
         .order_by("id")
         .first()
     )
@@ -228,7 +272,9 @@ def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
     available_merry = get_total_available_merry_credit(user=user)
     available_group = get_total_available_group_share_security(user=user)
 
-    borrower_total_security = q2(available_savings + available_merry + available_group)
+    borrower_total_security = q2(
+        available_savings + available_merry + available_group
+    )
 
     return {
         "account": account,
@@ -244,7 +290,11 @@ def get_loan_eligibility_preview(*, user) -> EligibilityPreview:
     active_loan = borrower_has_active_loan(user)
 
     account = (
-        SavingsAccount.objects.filter(user=user, is_active=True, account_type="FLEXIBLE")
+        SavingsAccount.objects.filter(
+            user=user,
+            is_active=True,
+            account_type="FLEXIBLE",
+        )
         .order_by("id")
         .first()
     )
@@ -299,7 +349,11 @@ def get_guarantor_available_savings_capacity(user) -> Decimal:
     return q2(available * GUARANTOR_MAX_EXPOSURE_RATIO)
 
 
-def validate_guarantor_candidates(*, borrower, guarantor_ids: Sequence[int]) -> List:
+def validate_guarantor_candidates(
+    *,
+    borrower,
+    guarantor_ids: Sequence[int],
+) -> List:
     guarantor_ids = [int(x) for x in guarantor_ids if str(x).strip()]
     if not guarantor_ids:
         return []
@@ -312,11 +366,15 @@ def validate_guarantor_candidates(*, borrower, guarantor_ids: Sequence[int]) -> 
     found_ids = {g.id for g in guarantors}
     missing = [gid for gid in guarantor_ids if gid not in found_ids]
     if missing:
-        raise ValidationError(f"Guarantor(s) not found: {', '.join(map(str, missing))}.")
+        raise ValidationError(
+            f"Guarantor(s) not found: {', '.join(map(str, missing))}."
+        )
 
     bad = [g for g in guarantors if not _user_is_globally_eligible_guarantor(g)]
     if bad:
-        raise ValidationError("One or more selected guarantors are not eligible to guarantee a loan.")
+        raise ValidationError(
+            "One or more selected guarantors are not eligible to guarantee a loan."
+        )
 
     return guarantors
 
@@ -324,7 +382,11 @@ def validate_guarantor_candidates(*, borrower, guarantor_ids: Sequence[int]) -> 
 # ==========================================================
 # Merry Credit Helpers
 # ==========================================================
-def _active_merry_credit_allocations_total_for_user(*, user, merry_id: int) -> Decimal:
+def _active_merry_credit_allocations_total_for_user(
+    *,
+    user,
+    merry_id: int,
+) -> Decimal:
     total = (
         LoanSecurityAllocation.objects.filter(
             owner_user=user,
@@ -342,18 +404,27 @@ def _active_merry_credit_allocations_total_for_user(*, user, merry_id: int) -> D
 def get_available_merry_credit_breakdown(*, user) -> List[dict]:
     rows: List[dict] = []
 
-    memberships = MerryMember.objects.filter(user=user, is_active=True).select_related("merry")
+    memberships = (
+        MerryMember.objects.filter(user=user, is_active=True)
+        .select_related("merry")
+    )
 
     for membership in memberships:
         contrib_total = (
-            MerryContributionDue.objects.filter(seat__member=membership, seat__is_active=True)
+            MerryContributionDue.objects.filter(
+                seat__member=membership,
+                seat__is_active=True,
+            )
             .aggregate(total=Sum("paid_amount"))
             .get("total")
             or Decimal("0.00")
         )
 
         payout_total = (
-            MerryPayout.objects.filter(seat__member=membership, status="PAID")
+            MerryPayout.objects.filter(
+                seat__member=membership,
+                status="PAID",
+            )
             .aggregate(total=Sum("amount"))
             .get("total")
             or Decimal("0.00")
@@ -364,7 +435,9 @@ def get_available_merry_credit_breakdown(*, user) -> List[dict]:
             merry_id=membership.merry_id,
         )
 
-        available = q2(Decimal(contrib_total) - Decimal(payout_total) - Decimal(held_total))
+        available = q2(
+            Decimal(contrib_total) - Decimal(payout_total) - Decimal(held_total)
+        )
         if available > 0:
             rows.append(
                 {
@@ -378,14 +451,21 @@ def get_available_merry_credit_breakdown(*, user) -> List[dict]:
 
 
 def get_total_available_merry_credit(*, user) -> Decimal:
-    total = sum((row["available"] for row in get_available_merry_credit_breakdown(user=user)), Decimal("0.00"))
+    total = sum(
+        (row["available"] for row in get_available_merry_credit_breakdown(user=user)),
+        Decimal("0.00"),
+    )
     return q2(total)
 
 
 # ==========================================================
 # Group Share Security
 # ==========================================================
-def _active_group_share_allocations_total_for_user(*, user, group_id: int) -> Decimal:
+def _active_group_share_allocations_total_for_user(
+    *,
+    user,
+    group_id: int,
+) -> Decimal:
     total = (
         LoanSecurityAllocation.objects.filter(
             owner_user=user,
@@ -461,7 +541,9 @@ def reserve_group_share_security_for_loan(
             continue
 
         share = GroupMemberShare.objects.select_for_update().get(id=row["share_id"])
-        share.reserved_share = q2(Decimal(share.reserved_share or Decimal("0.00")) + use)
+        share.reserved_share = q2(
+            Decimal(share.reserved_share or Decimal("0.00")) + use
+        )
         share.full_clean()
         share.save(update_fields=["reserved_share", "updated_at"])
 
@@ -509,7 +591,8 @@ def release_group_share_security_for_loan(*, loan: Loan) -> None:
             share.reserved_share = q2(
                 max(
                     Decimal("0.00"),
-                    Decimal(share.reserved_share or Decimal("0.00")) - Decimal(alloc.amount),
+                    Decimal(share.reserved_share or Decimal("0.00"))
+                    - Decimal(alloc.amount),
                 )
             )
             share.full_clean()
@@ -567,12 +650,20 @@ def get_loan_security_preview(
         }
 
     account = (
-        SavingsAccount.objects.filter(user=borrower, is_active=True, account_type="FLEXIBLE")
+        SavingsAccount.objects.filter(
+            user=borrower,
+            is_active=True,
+            account_type="FLEXIBLE",
+        )
         .order_by("id")
         .first()
     )
 
-    borrower_savings = q2(getattr(account, "available_balance", Decimal("0.00"))) if account else Decimal("0.00")
+    borrower_savings = (
+        q2(getattr(account, "available_balance", Decimal("0.00")))
+        if account
+        else Decimal("0.00")
+    )
     borrower_merry = get_total_available_merry_credit(user=borrower)
     borrower_group = get_total_available_group_share_security(user=borrower)
     borrower_total = q2(borrower_savings + borrower_merry + borrower_group)
@@ -614,7 +705,10 @@ def get_loan_security_preview(
     if fully_secured:
         message = "Your loan is fully secured."
     elif secured_total > 0:
-        message = f"Your current security covers {secured_total}. You need {shortfall} more."
+        message = (
+            f"Your current security covers {secured_total}. "
+            f"You need {shortfall} more."
+        )
     else:
         message = "This loan is not yet secured."
 
@@ -692,7 +786,12 @@ def request_global_loan(
 # ==========================================================
 # Interest + Totals
 # ==========================================================
-def compute_total_payable(*, principal: Decimal, term_weeks: int, product: LoanProduct) -> Decimal:
+def compute_total_payable(
+    *,
+    principal: Decimal,
+    term_weeks: int,
+    product: LoanProduct,
+) -> Decimal:
     principal = q2(principal)
     annual_rate = Decimal(product.annual_interest_rate) / Decimal("100.0")
 
@@ -734,7 +833,9 @@ def generate_weekly_installments(loan: Loan) -> List[LoanInstallment]:
 
     total_payable = Decimal(loan.total_payable or Decimal("0.00"))
     if total_payable <= 0:
-        raise ValidationError("Loan total_payable must be set before generating schedule.")
+        raise ValidationError(
+            "Loan total_payable must be set before generating schedule."
+        )
 
     start_date = timezone.now().date()
     first_due = next_weekday(start_date, int(loan.product.repayment_weekday))
@@ -763,7 +864,9 @@ def generate_weekly_installments(loan: Loan) -> List[LoanInstallment]:
         )
 
     LoanInstallment.objects.bulk_create(rows)
-    return list(LoanInstallment.objects.filter(loan=loan).order_by("installment_no"))
+    return list(
+        LoanInstallment.objects.filter(loan=loan).order_by("installment_no")
+    )
 
 
 # ==========================================================
@@ -806,11 +909,14 @@ def release_reserved_security_for_loan(loan: Loan) -> None:
             continue
 
         if alloc.savings_account_id:
-            acct = SavingsAccount.objects.select_for_update().get(id=alloc.savings_account_id)
+            acct = SavingsAccount.objects.select_for_update().get(
+                id=alloc.savings_account_id
+            )
             acct.reserved_amount = q2(
                 max(
                     Decimal("0.00"),
-                    Decimal(acct.reserved_amount or Decimal("0.00")) - Decimal(alloc.amount),
+                    Decimal(acct.reserved_amount or Decimal("0.00"))
+                    - Decimal(alloc.amount),
                 )
             )
             acct.save(update_fields=["reserved_amount"])
@@ -820,7 +926,8 @@ def release_reserved_security_for_loan(loan: Loan) -> None:
             gl.reserved_amount = q2(
                 max(
                     Decimal("0.00"),
-                    Decimal(gl.reserved_amount or Decimal("0.00")) - Decimal(alloc.amount),
+                    Decimal(gl.reserved_amount or Decimal("0.00"))
+                    - Decimal(alloc.amount),
                 )
             )
             gl.save(update_fields=["reserved_amount"])
@@ -864,7 +971,9 @@ def reserve_security_for_loan(loan: Loan) -> dict:
         )
 
         if borrower_acct:
-            borrower_acct = SavingsAccount.objects.select_for_update().get(id=borrower_acct.id)
+            borrower_acct = SavingsAccount.objects.select_for_update().get(
+                id=borrower_acct.id
+            )
 
             cap = q2(getattr(borrower_acct, "available_balance", Decimal("0.00")))
             remaining_need = q2(target - covered)
@@ -1000,7 +1109,8 @@ def reserve_security_for_loan(loan: Loan) -> dict:
         short = q2(target - covered)
         raise ValidationError(
             f"Insufficient security coverage. Need additional {short}. "
-            f"Add guarantor(s), increase savings, increase merry/group security, or reduce the loan amount."
+            f"Add guarantor(s), increase savings, increase merry/group security, "
+            f"or reduce the loan amount."
         )
 
     loan.recompute_reserved_security_total()
@@ -1019,27 +1129,16 @@ def reserve_security_for_loan(loan: Loan) -> dict:
 @transaction.atomic
 def approve_loan_and_create_schedule(loan: Loan) -> Loan:
     if loan.status not in ("PENDING", "UNDER_REVIEW"):
-        raise ValidationError("Only pending/review loans can be approved.")
+        raise ValidationError("Only pending or under-review loans can be approved.")
 
-    # Prevent approving a second active loan for the same borrower.
-    # Exclude the current loan so it does not block itself.
-    blocking_statuses = [
-        "APPROVED",
-        "DISBURSED",
-        "UNDER_REPAYMENT",
-        "DEFAULTED",
-    ]
-
-    has_other_active_loan = Loan.objects.filter(
-        borrower=loan.borrower,
-        status__in=blocking_statuses,
-    ).exclude(id=loan.id).exists()
-
-    if has_other_active_loan:
+    if borrower_has_other_active_loan(
+        user=loan.borrower,
+        exclude_loan_id=loan.id,
+    ):
         raise ValidationError("Borrower already has another active loan.")
 
-    # Do NOT call request-time eligibility validation here.
-    # The loan already exists and would fail its own active-loan check.
+    if not loan.product_id:
+        loan.product = get_default_loan_product()
 
     loan.total_payable = compute_total_payable(
         principal=loan.principal,
@@ -1050,7 +1149,16 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
     loan.outstanding_balance = q2(
         Decimal(loan.total_payable) - Decimal(loan.total_paid)
     )
-    loan.save(update_fields=["total_payable", "total_paid", "outstanding_balance"])
+    loan.security_target = _security_target(loan.principal)
+    loan.save(
+        update_fields=[
+            "product",
+            "total_payable",
+            "total_paid",
+            "outstanding_balance",
+            "security_target",
+        ]
+    )
 
     reserve_security_for_loan(loan)
     generate_weekly_installments(loan)
@@ -1061,6 +1169,8 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
 
     update_credit_on_approval(loan)
     return loan
+
+
 # ==========================================================
 # Payments
 # ==========================================================
@@ -1108,7 +1218,9 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
         raise ValidationError("Payment amount must be greater than 0.")
 
     if loan.status not in ("APPROVED", "DEFAULTED"):
-        raise ValidationError("Payments can only be applied to approved/defaulted loans.")
+        raise ValidationError(
+            "Payments can only be applied to approved/defaulted loans."
+        )
 
     current_outstanding = q2(loan.outstanding_balance or Decimal("0.00"))
     if current_outstanding <= 0:
@@ -1117,7 +1229,11 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
     amount_to_apply = q2(min(amount, current_outstanding))
     remaining = amount_to_apply
 
-    installments = LoanInstallment.objects.select_for_update().filter(loan=loan).order_by("installment_no")
+    installments = (
+        LoanInstallment.objects.select_for_update()
+        .filter(loan=loan)
+        .order_by("installment_no")
+    )
 
     for inst in installments:
         if remaining <= 0:
@@ -1125,7 +1241,11 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
         if inst.is_paid:
             continue
 
-        due = q2(Decimal(inst.total_due) + Decimal(inst.late_fee) - Decimal(inst.paid_amount))
+        due = q2(
+            Decimal(inst.total_due)
+            + Decimal(inst.late_fee)
+            - Decimal(inst.paid_amount)
+        )
         if due <= 0:
             inst.is_paid = True
             inst.save(update_fields=["is_paid"])
@@ -1135,7 +1255,11 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
         inst.paid_amount = q2(Decimal(inst.paid_amount) + pay)
         remaining = q2(remaining - pay)
 
-        new_due = q2(Decimal(inst.total_due) + Decimal(inst.late_fee) - Decimal(inst.paid_amount))
+        new_due = q2(
+            Decimal(inst.total_due)
+            + Decimal(inst.late_fee)
+            - Decimal(inst.paid_amount)
+        )
         if new_due <= 0:
             inst.is_paid = True
 
@@ -1144,7 +1268,14 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
     previous_status = loan.status
     loan.total_paid = q2(Decimal(loan.total_paid or Decimal("0.00")) + amount_to_apply)
     loan.recompute_balances()
-    loan.save(update_fields=["total_paid", "outstanding_balance", "status", "completed_at"])
+    loan.save(
+        update_fields=[
+            "total_paid",
+            "outstanding_balance",
+            "status",
+            "completed_at",
+        ]
+    )
 
     if loan.status == "COMPLETED":
         release_reserved_security_for_loan(loan)
@@ -1200,7 +1331,11 @@ def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
 
     ref = f"MPESA_TX#{tx_id}"
 
-    if LoanPayment.objects.filter(loan=loan, method="MPESA", reference=ref).exists():
+    if LoanPayment.objects.filter(
+        loan=loan,
+        method="MPESA",
+        reference=ref,
+    ).exists():
         return loan
 
     outstanding = q2(loan.outstanding_balance or Decimal("0.00"))
@@ -1250,7 +1385,11 @@ def apply_weekly_late_fees(today: Optional[date] = None) -> int:
             continue
 
         rate = Decimal(product.late_fee_rate_weekly) / Decimal("100.0")
-        remaining_due = q2(Decimal(inst.total_due) + Decimal(inst.late_fee) - Decimal(inst.paid_amount))
+        remaining_due = q2(
+            Decimal(inst.total_due)
+            + Decimal(inst.late_fee)
+            - Decimal(inst.paid_amount)
+        )
 
         if remaining_due <= 0:
             inst.is_paid = True

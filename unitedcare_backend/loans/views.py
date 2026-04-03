@@ -36,9 +36,26 @@ from .services import (
 User = get_user_model()
 
 
-# ==========================
+# ==========================================================
+# Helpers
+# ==========================================================
+def _is_admin(user) -> bool:
+    return bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
+
+
+def _loan_detail_queryset():
+    return Loan.objects.select_related("product", "borrower").prefetch_related(
+        "guarantors",
+        "guarantors__guarantor",
+        "security_allocations",
+        "installments",
+        "payments",
+    )
+
+
+# ==========================================================
 # Loans: My Loans
-# ==========================
+# ==========================================================
 class MyLoansView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = LoanListSerializer
@@ -51,9 +68,9 @@ class MyLoansView(generics.ListAPIView):
         )
 
 
-# ==========================
+# ==========================================================
 # Loans: Eligibility Preview
-# ==========================
+# ==========================================================
 class LoanEligibilityPreviewView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -63,15 +80,15 @@ class LoanEligibilityPreviewView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
 
-# ==========================
+# ==========================================================
 # Loans: Security Preview
-# ==========================
+# ==========================================================
 class LoanSecurityPreviewView(APIView):
     """
-    Returns full security breakdown for a requested loan:
+    Returns current security breakdown for a requested loan:
     - borrower savings
-    - merry
-    - group
+    - borrower merry security
+    - borrower group share security
     - guarantors
     - total secured
     - shortfall
@@ -97,9 +114,9 @@ class LoanSecurityPreviewView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-# ==========================
+# ==========================================================
 # Loans: Guarantor Candidates
-# ==========================
+# ==========================================================
 class LoanGuarantorCandidatesView(generics.ListAPIView):
     """
     Platform-level guarantor list.
@@ -123,15 +140,18 @@ class LoanGuarantorCandidatesView(generics.ListAPIView):
         if hasattr(User, "is_active"):
             qs = qs.filter(is_active=True)
 
+        if hasattr(User, "is_approved"):
+            qs = qs.filter(is_approved=True)
+
         return qs.order_by("id")[:50]
 
 
-# ==========================
+# ==========================================================
 # Loans: Create (Request)
-# ==========================
+# ==========================================================
 class RequestLoanView(APIView):
     """
-    Member requests a global loan.
+    Member requests a platform loan.
 
     Member sends:
     - principal
@@ -161,50 +181,31 @@ class RequestLoanView(APIView):
             title="Loan Request Submitted",
             message="Your loan request was submitted successfully and is waiting for review.",
             notification_type="INFO",
-            action_url="/loans/my-loans",
+            action_url="/loans",
             loan_id=loan.id,
         )
 
-        loan = (
-            Loan.objects.select_related("product", "borrower")
-            .prefetch_related(
-                "guarantors",
-                "guarantors__guarantor",
-                "security_allocations",
-                "installments",
-                "payments",
-            )
-            .get(id=loan.id)
-        )
+        loan = _loan_detail_queryset().get(id=loan.id)
 
         return Response(
             {
                 "message": "Loan request submitted successfully.",
                 "loan_id": loan.id,
                 "status": loan.status,
-                "note": "Your loan will be approved once it is fully secured.",
+                "note": "Your loan can be approved once it becomes fully secured.",
                 "loan": LoanDetailSerializer(loan).data,
             },
             status=status.HTTP_201_CREATED,
         )
 
 
-# ==========================
+# ==========================================================
 # Loans: Detail
-# ==========================
+# ==========================================================
 class LoanDetailView(generics.RetrieveAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = LoanDetailSerializer
-    queryset = (
-        Loan.objects.select_related("product", "borrower")
-        .prefetch_related(
-            "guarantors",
-            "guarantors__guarantor",
-            "security_allocations",
-            "installments",
-            "payments",
-        )
-    )
+    queryset = _loan_detail_queryset()
 
     def get_object(self):
         obj = super().get_object()
@@ -215,21 +216,24 @@ class LoanDetailView(generics.RetrieveAPIView):
         if LoanGuarantor.objects.filter(loan=obj, guarantor=self.request.user).exists():
             return obj
 
-        if self.request.user.is_staff or self.request.user.is_superuser:
+        if _is_admin(self.request.user):
             return obj
 
         raise PermissionDenied("You do not have permission to view this loan.")
 
 
-# ==========================
+# ==========================================================
 # Guarantors: Add guarantor
-# ==========================
+# ==========================================================
 class AddGuarantorView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def post(self, request):
-        ser = AddLoanGuarantorSerializer(data=request.data, context={"request": request})
+        ser = AddLoanGuarantorSerializer(
+            data=request.data,
+            context={"request": request},
+        )
         ser.is_valid(raise_exception=True)
         guarantor = ser.save()
 
@@ -244,31 +248,35 @@ class AddGuarantorView(APIView):
 
         return Response(
             {
-                "message": "Guarantor added. Waiting for acceptance.",
+                "message": "Guarantor added successfully.",
+                "note": "Waiting for guarantor acceptance.",
                 "guarantor": LoanGuarantorSerializer(guarantor).data,
             },
             status=status.HTTP_201_CREATED,
         )
 
 
-# ==========================
+# ==========================================================
 # Guarantors: My pending guarantee requests
-# ==========================
+# ==========================================================
 class MyGuaranteeRequestsView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = LoanGuarantorSerializer
 
     def get_queryset(self):
         return (
-            LoanGuarantor.objects.filter(guarantor=self.request.user, accepted=False)
+            LoanGuarantor.objects.filter(
+                guarantor=self.request.user,
+                accepted=False,
+            )
             .select_related("loan", "loan__borrower", "loan__product", "guarantor")
             .order_by("-id")
         )
 
 
-# ==========================
+# ==========================================================
 # Guarantors: Accept
-# ==========================
+# ==========================================================
 class AcceptGuaranteeView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -277,7 +285,7 @@ class AcceptGuaranteeView(APIView):
         try:
             guarantor_link = (
                 LoanGuarantor.objects.select_for_update()
-                .select_related("loan", "guarantor")
+                .select_related("loan", "loan__borrower", "guarantor")
                 .get(id=guarantor_id)
             )
         except LoanGuarantor.DoesNotExist:
@@ -287,10 +295,15 @@ class AcceptGuaranteeView(APIView):
             raise PermissionDenied("This guarantee request is not yours.")
 
         if guarantor_link.accepted:
-            return Response({"message": "Already accepted."}, status=status.HTTP_200_OK)
+            return Response(
+                {"message": "Guarantee already accepted."},
+                status=status.HTTP_200_OK,
+            )
 
         if guarantor_link.loan.status not in ("PENDING", "UNDER_REVIEW"):
-            raise ValidationError("You can only accept guarantee for pending/review loans.")
+            raise ValidationError(
+                "You can only accept guarantee for pending or under-review loans."
+            )
 
         guarantor_link.accepted = True
         guarantor_link.accepted_at = timezone.now()
@@ -302,22 +315,22 @@ class AcceptGuaranteeView(APIView):
             title="Guarantee Accepted",
             message=f"Your guarantor has accepted loan #{guarantor_link.loan.id}.",
             notification_type="SUCCESS",
-            action_url="/loans/my-loans",
+            action_url="/loans",
             loan_id=guarantor_link.loan.id,
         )
 
         return Response(
             {
                 "message": "Guarantee accepted.",
-                "note": "This loan will be approved once total security reaches 100%.",
+                "note": "The loan can now move to approval once total security reaches 100%.",
             },
             status=status.HTTP_200_OK,
         )
 
 
-# ==========================
+# ==========================================================
 # Guarantors: Reject
-# ==========================
+# ==========================================================
 class RejectGuaranteeView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -326,7 +339,7 @@ class RejectGuaranteeView(APIView):
         try:
             guarantor_link = (
                 LoanGuarantor.objects.select_for_update()
-                .select_related("loan", "guarantor")
+                .select_related("loan", "loan__borrower", "guarantor")
                 .get(id=guarantor_id)
             )
         except LoanGuarantor.DoesNotExist:
@@ -336,7 +349,7 @@ class RejectGuaranteeView(APIView):
             raise PermissionDenied("This guarantee request is not yours.")
 
         if guarantor_link.accepted:
-            raise ValidationError("Cannot reject: already accepted.")
+            raise ValidationError("Cannot reject a guarantee that is already accepted.")
 
         borrower = guarantor_link.loan.borrower
         loan_id = guarantor_link.loan.id
@@ -346,27 +359,30 @@ class RejectGuaranteeView(APIView):
         create_notification(
             user=borrower,
             title="Guarantee Rejected",
-            message=f"A guarantor rejected loan #{loan_id}. Please choose another guarantor.",
+            message=f"A guarantor rejected loan #{loan_id}. Please select another guarantor if needed.",
             notification_type="WARNING",
-            action_url="/loans/my-loans",
+            action_url="/loans",
             loan_id=loan_id,
         )
 
-        return Response({"message": "Guarantee rejected."}, status=status.HTTP_200_OK)
+        return Response(
+            {"message": "Guarantee rejected."},
+            status=status.HTTP_200_OK,
+        )
 
 
-# ==========================
+# ==========================================================
 # Admin: Approve loan
-# ==========================
+# ==========================================================
 class ApproveLoanView(APIView):
     """
-    Admin marks loan as APPROVED, reserves security, and generates schedule.
+    Admin approves a loan, reserves security, and generates schedule.
     """
     permission_classes = [permissions.IsAuthenticated]
 
     @transaction.atomic
     def patch(self, request, loan_id: int):
-        if not (request.user.is_staff or request.user.is_superuser):
+        if not _is_admin(request.user):
             raise PermissionDenied("Only admin can approve loans.")
 
         try:
@@ -381,57 +397,44 @@ class ApproveLoanView(APIView):
 
         loan = approve_loan_and_create_schedule(loan)
 
+        extra_update_fields = []
         if hasattr(loan, "reviewed_by"):
             loan.reviewed_by = request.user
+            extra_update_fields.append("reviewed_by")
         if hasattr(loan, "reviewed_at"):
             loan.reviewed_at = timezone.now()
+            extra_update_fields.append("reviewed_at")
         if hasattr(loan, "rejection_reason"):
             loan.rejection_reason = None
+            extra_update_fields.append("rejection_reason")
 
-        update_fields = []
-        if hasattr(loan, "reviewed_by"):
-            update_fields.append("reviewed_by")
-        if hasattr(loan, "reviewed_at"):
-            update_fields.append("reviewed_at")
-        if hasattr(loan, "rejection_reason"):
-            update_fields.append("rejection_reason")
-        if update_fields:
-            loan.save(update_fields=update_fields)
+        if extra_update_fields:
+            loan.save(update_fields=extra_update_fields)
 
         create_notification(
             user=loan.borrower,
             created_by=request.user,
             title="Loan Approved",
-            message="Your loan request has been approved and repayment schedule generated.",
+            message="Your loan request has been approved and your repayment schedule is now ready.",
             notification_type="SUCCESS",
-            action_url="/loans/my-loans",
+            action_url="/loans",
             loan_id=loan.id,
         )
 
-        loan = (
-            Loan.objects.select_related("product", "borrower")
-            .prefetch_related(
-                "guarantors",
-                "guarantors__guarantor",
-                "security_allocations",
-                "installments",
-                "payments",
-            )
-            .get(id=loan.id)
-        )
+        loan = _loan_detail_queryset().get(id=loan.id)
 
         return Response(
             {
-                "message": "Loan approved and schedule generated.",
+                "message": "Loan approved successfully.",
                 "loan": LoanDetailSerializer(loan).data,
             },
             status=status.HTTP_200_OK,
         )
 
 
-# ==========================
+# ==========================================================
 # Admin: Reject loan
-# ==========================
+# ==========================================================
 class RejectLoanView(APIView):
     """
     Admin rejects a loan and sends rejection reason to borrower.
@@ -440,7 +443,7 @@ class RejectLoanView(APIView):
 
     @transaction.atomic
     def patch(self, request, loan_id: int):
-        if not (request.user.is_staff or request.user.is_superuser):
+        if not _is_admin(request.user):
             raise PermissionDenied("Only admin can reject loans.")
 
         rejection_reason = (request.data.get("rejection_reason") or "").strip()
@@ -457,8 +460,10 @@ class RejectLoanView(APIView):
         except Loan.DoesNotExist:
             raise ValidationError("Loan not found.")
 
-        loan.status = "REJECTED"
+        if loan.status not in ("PENDING", "UNDER_REVIEW"):
+            raise ValidationError("Only pending or under-review loans can be rejected.")
 
+        loan.status = "REJECTED"
         update_fields = ["status"]
 
         if hasattr(loan, "rejection_reason"):
@@ -481,21 +486,11 @@ class RejectLoanView(APIView):
             title="Loan Rejected",
             message=f"Your loan request has been rejected. Reason: {rejection_reason}",
             notification_type="ERROR",
-            action_url="/loans/my-loans",
+            action_url="/loans",
             loan_id=loan.id,
         )
 
-        loan = (
-            Loan.objects.select_related("product", "borrower")
-            .prefetch_related(
-                "guarantors",
-                "guarantors__guarantor",
-                "security_allocations",
-                "installments",
-                "payments",
-            )
-            .get(id=loan.id)
-        )
+        loan = _loan_detail_queryset().get(id=loan.id)
 
         return Response(
             {
@@ -507,9 +502,9 @@ class RejectLoanView(APIView):
         )
 
 
-# ==========================
+# ==========================================================
 # Payments: Pay loan
-# ==========================
+# ==========================================================
 class PayLoanView(APIView):
     """
     Records a payment and applies it to installments.
@@ -521,7 +516,7 @@ class PayLoanView(APIView):
         ser = LoanPaymentCreateSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
 
-        amount = Decimal(ser.validated_data["amount"])
+        amount = Decimal(str(ser.validated_data["amount"]))
         method = ser.validated_data.get("method", "MANUAL")
         reference = ser.validated_data.get("reference")
 
@@ -533,7 +528,12 @@ class PayLoanView(APIView):
         if loan.borrower_id != request.user.id:
             raise PermissionDenied("Only the borrower can pay this loan.")
 
-        record_loan_payment(loan, amount, method=method, reference=reference)
+        record_loan_payment(
+            loan,
+            amount,
+            method=method,
+            reference=reference,
+        )
         loan = apply_payment_to_loan(loan, amount)
 
         create_notification(
@@ -541,9 +541,11 @@ class PayLoanView(APIView):
             title="Loan Payment Received",
             message=f"Your payment of {amount} has been received successfully.",
             notification_type="SUCCESS",
-            action_url="/loans/my-loans",
+            action_url="/loans",
             loan_id=loan.id,
         )
+
+        loan = _loan_detail_queryset().get(id=loan.id)
 
         return Response(
             {
@@ -551,7 +553,8 @@ class PayLoanView(APIView):
                 "loan_status": loan.status,
                 "total_paid": str(loan.total_paid),
                 "outstanding_balance": str(loan.outstanding_balance),
-                "note": "Your loan will be closed automatically once fully paid.",
+                "note": "Your loan will be marked complete automatically once fully paid.",
+                "loan": LoanDetailSerializer(loan).data,
             },
             status=status.HTTP_200_OK,
         )
