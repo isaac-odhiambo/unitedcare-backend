@@ -26,6 +26,7 @@ class GroupSerializer(serializers.ModelSerializer):
         fields = (
             "id",
             "name",
+            "payment_code",
             "group_type",
             "group_type_display",
             "description",
@@ -70,6 +71,17 @@ class GroupSerializer(serializers.ModelSerializer):
             return 0
         if value < 0:
             raise serializers.ValidationError("max_members cannot be negative.")
+        return value
+
+    def validate_payment_code(self, value):
+        value = (value or "").strip().upper()
+        if not value:
+            return value
+
+        if not value.isalpha():
+            raise serializers.ValidationError(
+                "payment_code must contain letters only, e.g. UN, WF, MG."
+            )
         return value
 
     def validate(self, attrs):

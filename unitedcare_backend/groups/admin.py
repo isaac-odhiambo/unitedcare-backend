@@ -272,6 +272,7 @@ class GroupAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "name",
+        "payment_code",
         "group_type",
         "join_policy",
         "visibility",
@@ -293,6 +294,7 @@ class GroupAdmin(admin.ModelAdmin):
     )
     search_fields = (
         "name",
+        "payment_code",
         "description",
         "objective",
         "created_by__username",
@@ -313,6 +315,7 @@ class GroupAdmin(admin.ModelAdmin):
         ("Core", {
             "fields": (
                 "name",
+                "payment_code",
                 "group_type",
                 "description",
                 "objective",
