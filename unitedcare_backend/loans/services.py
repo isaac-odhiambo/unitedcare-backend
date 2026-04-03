@@ -1021,7 +1021,25 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
     if loan.status not in ("PENDING", "UNDER_REVIEW"):
         raise ValidationError("Only pending/review loans can be approved.")
 
-    validate_platform_loan_eligibility(user=loan.borrower, principal=loan.principal)
+    # Prevent approving a second active loan for the same borrower.
+    # Exclude the current loan so it does not block itself.
+    blocking_statuses = [
+        "APPROVED",
+        "DISBURSED",
+        "UNDER_REPAYMENT",
+        "DEFAULTED",
+    ]
+
+    has_other_active_loan = Loan.objects.filter(
+        borrower=loan.borrower,
+        status__in=blocking_statuses,
+    ).exclude(id=loan.id).exists()
+
+    if has_other_active_loan:
+        raise ValidationError("Borrower already has another active loan.")
+
+    # Do NOT call request-time eligibility validation here.
+    # The loan already exists and would fail its own active-loan check.
 
     loan.total_payable = compute_total_payable(
         principal=loan.principal,
@@ -1029,7 +1047,9 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
         product=loan.product,
     )
     loan.total_paid = q2(loan.total_paid or Decimal("0.00"))
-    loan.outstanding_balance = q2(Decimal(loan.total_payable) - Decimal(loan.total_paid))
+    loan.outstanding_balance = q2(
+        Decimal(loan.total_payable) - Decimal(loan.total_paid)
+    )
     loan.save(update_fields=["total_payable", "total_paid", "outstanding_balance"])
 
     reserve_security_for_loan(loan)
@@ -1041,8 +1061,6 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
 
     update_credit_on_approval(loan)
     return loan
-
-
 # ==========================================================
 # Payments
 # ==========================================================
