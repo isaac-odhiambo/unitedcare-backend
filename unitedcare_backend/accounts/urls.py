@@ -9,6 +9,7 @@ from .views import (
     MeView,
     KYCSubmitView,
     DeleteAccountView,
+    child_safety_page,   # ✅ FIXED
     account_deletion_page,
 )
 
@@ -26,4 +27,7 @@ urlpatterns = [
     # Account deletion
     path("delete-account/", DeleteAccountView.as_view(), name="delete_account"),
     path("account-deletion/", account_deletion_page, name="account_deletion_page"),
+
+    # Child safety
+    path("child-safety/", child_safety_page, name="child_safety_page"),
 ]

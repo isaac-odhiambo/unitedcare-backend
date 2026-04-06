@@ -601,6 +601,9 @@ class DeleteAccountView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+    def child_safety_page(request):
+        return render(request, "accounts/child_safety.html")
+
 # from datetime import timedelta
 
 # from django.contrib.auth import get_user_model
