@@ -8,6 +8,8 @@ from .views import (
     ResendOTPView,
     MeView,
     KYCSubmitView,
+    DeleteAccountView,
+    account_deletion_page,
 )
 
 urlpatterns = [
@@ -16,8 +18,12 @@ urlpatterns = [
     path("login/", LoginView.as_view(), name="login"),
     path("forgot-password/", ForgotPasswordView.as_view(), name="forgot-password"),
     path("reset-password/", ResetPasswordView.as_view(), name="reset-password"),
-    path("resend-otp/", ResendOTPView.as_view(), name="resend-otp"),  # ✅ add
+    path("resend-otp/", ResendOTPView.as_view(), name="resend-otp"),
 
     path("me/", MeView.as_view(), name="me"),
     path("kyc/", KYCSubmitView.as_view(), name="kyc-submit"),
+
+    # Account deletion
+    path("delete-account/", DeleteAccountView.as_view(), name="delete_account"),
+    path("account-deletion/", account_deletion_page, name="account_deletion_page"),
 ]

@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
+from django.shortcuts import render
 from django.utils import timezone
 
 from rest_framework import status
@@ -568,6 +569,38 @@ class KYCSubmitView(APIView):
             status=status.HTTP_200_OK,
         )
 
+
+# =========================
+# ACCOUNT DELETION PUBLIC PAGE
+# =========================
+def account_deletion_page(request):
+    return render(request, "accounts/account_deletion.html")
+
+
+# =========================
+# ACCOUNT DELETION (REQUEST)
+# =========================
+class DeleteAccountView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+
+        if not user.is_active:
+            return Response(
+                {"detail": "Account already inactive or deletion in progress."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user.is_active = False
+        user.save(update_fields=["is_active"])
+
+        return Response(
+            {
+                "detail": "Your account deletion request has been received. Your account has been deactivated."
+            },
+            status=status.HTTP_200_OK,
+        )
 # from datetime import timedelta
 
 # from django.contrib.auth import get_user_model
