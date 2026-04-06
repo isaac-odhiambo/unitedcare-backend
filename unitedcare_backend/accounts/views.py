@@ -578,6 +578,21 @@ def account_deletion_page(request):
 
 
 # =========================
+# =========================
+# ACCOUNT DELETION PUBLIC PAGE
+# =========================
+def account_deletion_page(request):
+    return render(request, "accounts/account_deletion.html")
+
+
+# =========================
+# CHILD SAFETY PUBLIC PAGE
+# =========================
+def child_safety_page(request):
+    return render(request, "accounts/child_safety.html")
+
+
+# =========================
 # ACCOUNT DELETION (REQUEST)
 # =========================
 class DeleteAccountView(APIView):
@@ -601,8 +616,6 @@ class DeleteAccountView(APIView):
             },
             status=status.HTTP_200_OK,
         )
-    def child_safety_page(request):
-        return render(request, "accounts/child_safety.html")
 
 # from datetime import timedelta
 
