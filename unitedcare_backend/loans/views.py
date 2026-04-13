@@ -152,7 +152,7 @@ class LoanGuarantorCandidatesView(generics.ListAPIView):
         if "is_approved" in fields:
             qs = qs.filter(is_approved=True)
         elif "status" in fields:
-            qs = qs.filter(status="APPROVED")
+            qqs = qs.filter(status="approved")
 
         return qs.order_by("id")[:50]
 
