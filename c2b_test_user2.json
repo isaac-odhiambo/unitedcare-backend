@@ -1,0 +1,15 @@
+{
+  "TransactionType": "Pay Bill",
+  "TransID": "TESTC2B004",
+  "TransTime": "20260401204500",
+  "TransAmount": "10",
+  "BusinessShortCode": "4049695",
+  "BillRefNumber": "MUS2",
+  "InvoiceNumber": "",
+  "OrgAccountBalance": "1000.00",
+  "ThirdPartyTransID": "",
+  "MSISDN": "254106289975",
+  "FirstName": "Isaac",
+  "MiddleName": "",
+  "LastName": "Odiwuor"
+}

@@ -40,7 +40,9 @@ User = get_user_model()
 # Helpers
 # ==========================================================
 def _is_admin(user) -> bool:
-    return bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
+    return bool(
+        getattr(user, "is_staff", False) or getattr(user, "is_superuser", False)
+    )
 
 
 def _loan_detail_queryset():
@@ -51,6 +53,10 @@ def _loan_detail_queryset():
         "installments",
         "payments",
     )
+
+
+def _user_field_names() -> set[str]:
+    return {f.name for f in User._meta.get_fields()}
 
 
 # ==========================================================
@@ -122,6 +128,7 @@ class LoanGuarantorCandidatesView(generics.ListAPIView):
     Platform-level guarantor list.
     Excludes the current user.
     Supports simple search.
+    Only returns active/approved users based on the actual User model fields.
     """
     permission_classes = [permissions.IsAuthenticated]
     serializer_class = GuarantorCandidateSerializer
@@ -137,11 +144,15 @@ class LoanGuarantorCandidatesView(generics.ListAPIView):
                 | Q(username__icontains=q)
             )
 
-        if hasattr(User, "is_active"):
+        fields = _user_field_names()
+
+        if "is_active" in fields:
             qs = qs.filter(is_active=True)
 
-        if hasattr(User, "is_approved"):
+        if "is_approved" in fields:
             qs = qs.filter(is_approved=True)
+        elif "status" in fields:
+            qs = qs.filter(status="APPROVED")
 
         return qs.order_by("id")[:50]
 
@@ -213,7 +224,9 @@ class LoanDetailView(generics.RetrieveAPIView):
         if obj.borrower_id == self.request.user.id:
             return obj
 
-        if LoanGuarantor.objects.filter(loan=obj, guarantor=self.request.user).exists():
+        if LoanGuarantor.objects.filter(
+            loan=obj, guarantor=self.request.user
+        ).exists():
             return obj
 
         if _is_admin(self.request.user):
