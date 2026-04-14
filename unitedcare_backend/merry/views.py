@@ -1308,3 +1308,28 @@ class MarkPayoutPaidView(APIView):
             raise _service_error(e)
 
         return Response({"message": "Payout marked PAID."}, status=status.HTTP_200_OK)
+class MerryMemberDashboardView(APIView):
+    """
+    GET /api/merry/<merry_id>/dashboard/
+    
+    Full detailed member dashboard:
+    - overdue / current / next dues
+    - required_now / pay_with_next
+    - current turn
+    - my turn
+    - payout expectations
+    - loan offset (if payout used for loan)
+    - wallet balance
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, merry_id: int):
+        try:
+            data = merry_services.get_member_merry_dashboard(
+                user=request.user,
+                merry_id=merry_id,
+            )
+        except Exception as e:
+            raise _service_error(e)
+
+        return Response(data, status=status.HTTP_200_OK)

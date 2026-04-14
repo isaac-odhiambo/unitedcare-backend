@@ -245,10 +245,129 @@ def borrower_has_other_active_loan(*, user, exclude_loan_id: int | None = None) 
     return qs.exists()
 
 
+# ==========================================================
+# Merry Credit Helpers
+# ==========================================================
+def borrower_blocked_by_paid_merry_turn(*, user) -> bool:
+    """
+    Hard rule:
+    If a member still has an active merry membership and has already received
+    a PAID merry turn, they should not qualify for a new loan request.
+    """
+    active_memberships = MerryMember.objects.filter(user=user, is_active=True)
+
+    if not active_memberships.exists():
+        return False
+
+    return MerryPayout.objects.filter(
+        seat__member__in=active_memberships,
+        status="PAID",
+    ).exists()
+
+
+def membership_has_paid_merry_turn(*, membership: MerryMember) -> bool:
+    """
+    Returns True if this specific merry membership has already received a paid turn.
+    """
+    return MerryPayout.objects.filter(
+        seat__member=membership,
+        status="PAID",
+    ).exists()
+
+
+def _active_merry_credit_allocations_total_for_user(
+    *,
+    user,
+    merry_id: int,
+) -> Decimal:
+    total = (
+        LoanSecurityAllocation.objects.filter(
+            owner_user=user,
+            merry_id=merry_id,
+            is_active=True,
+            source_type__in=["BORROWER_MERRY_CREDIT", "GUARANTOR_MERRY_CREDIT"],
+        )
+        .aggregate(total=Sum("amount"))
+        .get("total")
+        or Decimal("0.00")
+    )
+    return q2(total)
+
+
+def get_available_merry_credit_breakdown(*, user) -> List[dict]:
+    rows: List[dict] = []
+
+    memberships = (
+        MerryMember.objects.filter(user=user, is_active=True)
+        .select_related("merry")
+    )
+
+    for membership in memberships:
+        # Once member has already received merry payout/turn for this active merry,
+        # that merry should no longer count as available loan security.
+        if membership_has_paid_merry_turn(membership=membership):
+            continue
+
+        contrib_total = (
+            MerryContributionDue.objects.filter(
+                seat__member=membership,
+                seat__is_active=True,
+            )
+            .aggregate(total=Sum("paid_amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+
+        payout_total = (
+            MerryPayout.objects.filter(
+                seat__member=membership,
+                status="PAID",
+            )
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+
+        held_total = _active_merry_credit_allocations_total_for_user(
+            user=user,
+            merry_id=membership.merry_id,
+        )
+
+        available = q2(
+            Decimal(contrib_total) - Decimal(payout_total) - Decimal(held_total)
+        )
+        if available > 0:
+            rows.append(
+                {
+                    "merry": membership.merry,
+                    "merry_id": membership.merry_id,
+                    "available": available,
+                }
+            )
+
+    return rows
+
+
+def get_total_available_merry_credit(*, user) -> Decimal:
+    total = sum(
+        (row["available"] for row in get_available_merry_credit_breakdown(user=user)),
+        Decimal("0.00"),
+    )
+    return q2(total)
+
+
 def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
     principal = q2(principal)
     if principal <= 0:
         raise ValidationError("Principal must be greater than 0.")
+
+    # Hard merry block:
+    # if member has active merry and has already received their turn,
+    # they should not request another loan.
+    if borrower_blocked_by_paid_merry_turn(user=user):
+        raise ValidationError(
+            "You cannot request a loan because you have already received your merry turn."
+        )
 
     if borrower_has_active_loan(user):
         raise ValidationError(
@@ -267,6 +386,7 @@ def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
 
     available_savings = Decimal("0.00")
     if account:
+        # available_balance should already reflect reserved/locked savings
         available_savings = q2(getattr(account, "available_balance", Decimal("0.00")))
 
     available_merry = get_total_available_merry_credit(user=user)
@@ -311,7 +431,10 @@ def get_loan_eligibility_preview(*, user) -> EligibilityPreview:
     reason = ""
     eligible = True
 
-    if active_loan:
+    if borrower_blocked_by_paid_merry_turn(user=user):
+        eligible = False
+        reason = "You have already received your merry turn and cannot request a new loan."
+    elif active_loan:
         eligible = False
         reason = "You already have an active loan."
 
@@ -377,85 +500,6 @@ def validate_guarantor_candidates(
         )
 
     return guarantors
-
-
-# ==========================================================
-# Merry Credit Helpers
-# ==========================================================
-def _active_merry_credit_allocations_total_for_user(
-    *,
-    user,
-    merry_id: int,
-) -> Decimal:
-    total = (
-        LoanSecurityAllocation.objects.filter(
-            owner_user=user,
-            merry_id=merry_id,
-            is_active=True,
-            source_type__in=["BORROWER_MERRY_CREDIT", "GUARANTOR_MERRY_CREDIT"],
-        )
-        .aggregate(total=Sum("amount"))
-        .get("total")
-        or Decimal("0.00")
-    )
-    return q2(total)
-
-
-def get_available_merry_credit_breakdown(*, user) -> List[dict]:
-    rows: List[dict] = []
-
-    memberships = (
-        MerryMember.objects.filter(user=user, is_active=True)
-        .select_related("merry")
-    )
-
-    for membership in memberships:
-        contrib_total = (
-            MerryContributionDue.objects.filter(
-                seat__member=membership,
-                seat__is_active=True,
-            )
-            .aggregate(total=Sum("paid_amount"))
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        payout_total = (
-            MerryPayout.objects.filter(
-                seat__member=membership,
-                status="PAID",
-            )
-            .aggregate(total=Sum("amount"))
-            .get("total")
-            or Decimal("0.00")
-        )
-
-        held_total = _active_merry_credit_allocations_total_for_user(
-            user=user,
-            merry_id=membership.merry_id,
-        )
-
-        available = q2(
-            Decimal(contrib_total) - Decimal(payout_total) - Decimal(held_total)
-        )
-        if available > 0:
-            rows.append(
-                {
-                    "merry": membership.merry,
-                    "merry_id": membership.merry_id,
-                    "available": available,
-                }
-            )
-
-    return rows
-
-
-def get_total_available_merry_credit(*, user) -> Decimal:
-    total = sum(
-        (row["available"] for row in get_available_merry_credit_breakdown(user=user)),
-        Decimal("0.00"),
-    )
-    return q2(total)
 
 
 # ==========================================================
@@ -632,6 +676,22 @@ def get_loan_security_preview(
     principal = q2(principal)
     if principal <= 0:
         raise ValidationError("Principal must be greater than 0.")
+
+    if borrower_blocked_by_paid_merry_turn(user=borrower):
+        return {
+            "eligible": False,
+            "principal": principal,
+            "borrower_savings": Decimal("0.00"),
+            "borrower_merry": Decimal("0.00"),
+            "borrower_group": Decimal("0.00"),
+            "borrower_total": Decimal("0.00"),
+            "guarantor_total": Decimal("0.00"),
+            "secured_total": Decimal("0.00"),
+            "shortfall": principal,
+            "fully_secured": False,
+            "message": "You cannot request a loan because you have already received your merry turn.",
+            "guarantors": [],
+        }
 
     if borrower_has_active_loan(borrower):
         return {
@@ -1131,6 +1191,11 @@ def approve_loan_and_create_schedule(loan: Loan) -> Loan:
     if loan.status not in ("PENDING", "UNDER_REVIEW"):
         raise ValidationError("Only pending or under-review loans can be approved.")
 
+    if borrower_blocked_by_paid_merry_turn(user=loan.borrower):
+        raise ValidationError(
+            "This borrower cannot be approved for a loan because they have already received their merry turn."
+        )
+
     if borrower_has_other_active_loan(
         user=loan.borrower,
         exclude_loan_id=loan.id,
@@ -1261,7 +1326,6 @@ def _safe_create_savings_transaction(
         if "account" in payload and "txn_type" in payload and "amount" in payload:
             SavingsTransaction.objects.create(**payload)
     except Exception:
-        # Do not break repayment success if only savings transaction logging fails.
         pass
 
 
@@ -1366,7 +1430,6 @@ def apply_payment_to_loan(loan: Loan, amount: Decimal) -> Loan:
     applied_amount, excess_amount = _split_payment_amounts(loan=loan, amount=amt)
 
     if applied_amount <= 0 and excess_amount > 0:
-        # Loan is already fully cleared; move whole amount to savings.
         _move_excess_to_savings(
             loan=loan,
             excess_amount=excess_amount,
@@ -1480,7 +1543,6 @@ def _apply_mpesa_repayment_to_loan(*, loan: Loan, amount: Decimal, mpesa_tx) -> 
 
     ref = f"MPESA_TX#{tx_id}"
 
-    # Idempotent guard
     if LoanPayment.objects.filter(
         loan=loan,
         method="MPESA",
@@ -1573,6 +1635,97 @@ def apply_mpesa_repayment_by_user(
         mpesa_tx=mpesa_tx,
         reference=reference,
     )
+
+
+# ==========================================================
+# Merry payout -> loan offset
+# ==========================================================
+@transaction.atomic
+def apply_merry_payout_to_active_loan(*, payout: MerryPayout) -> dict:
+    """
+    When merry payout is reached and marked PAID, redirect the payout amount
+    to the borrower's active loan first if that loan is secured by merry.
+    Any remainder can be handled by the merry flow outside this function.
+    """
+    payout_amount = q2(getattr(payout, "amount", Decimal("0.00")))
+    if payout_amount <= 0:
+        return {
+            "applied_to_loan": Decimal("0.00"),
+            "remaining_amount": Decimal("0.00"),
+            "loan_ids": [],
+        }
+
+    seat = getattr(payout, "seat", None)
+    member = getattr(seat, "member", None)
+    borrower = getattr(member, "user", None)
+    merry = getattr(member, "merry", None)
+
+    if not borrower or not merry:
+        raise ValidationError("Payout is not linked to a valid merry member.")
+
+    active_loans = (
+        Loan.objects.select_for_update()
+        .filter(
+            borrower=borrower,
+            status__in=REPAYABLE_LOAN_STATUSES,
+            security_allocations__is_active=True,
+            security_allocations__source_type="BORROWER_MERRY_CREDIT",
+            security_allocations__merry=merry,
+        )
+        .distinct()
+        .order_by("id")
+    )
+
+    remaining = payout_amount
+    applied_total = Decimal("0.00")
+    touched_loan_ids = []
+
+    for loan in active_loans:
+        if remaining <= 0:
+            break
+
+        locked_merry_for_loan = (
+            LoanSecurityAllocation.objects.filter(
+                loan=loan,
+                is_active=True,
+                source_type="BORROWER_MERRY_CREDIT",
+                owner_user=borrower,
+                merry=merry,
+            )
+            .aggregate(total=Sum("amount"))
+            .get("total")
+            or Decimal("0.00")
+        )
+        locked_merry_for_loan = q2(locked_merry_for_loan)
+
+        if locked_merry_for_loan <= 0:
+            continue
+
+        outstanding = q2(getattr(loan, "outstanding_balance", Decimal("0.00")))
+        use = q2(min(remaining, locked_merry_for_loan, outstanding))
+
+        if use <= 0:
+            continue
+
+        create_loan_payment_record(
+            loan=loan,
+            amount=use,
+            method="MERRY_OFFSET",
+            reference=f"MERRY-PAYOUT-{payout.id}",
+        )
+        apply_payment_to_loan(loan, use)
+
+        remaining = q2(remaining - use)
+        applied_total = q2(applied_total + use)
+        touched_loan_ids.append(loan.id)
+
+    return {
+        "applied_to_loan": applied_total,
+        "remaining_amount": remaining,
+        "loan_ids": touched_loan_ids,
+    }
+
+
 # ==========================================================
 # Late Fees
 # ==========================================================

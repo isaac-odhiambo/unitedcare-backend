@@ -28,6 +28,7 @@ from .views import (
     MerryPayoutScheduleView,
     CreatePayoutView,
     MarkPayoutPaidView,
+    MerryMemberDashboardView, 
 )
 
 urlpatterns = [
@@ -136,6 +137,7 @@ urlpatterns = [
     ),
     path("<int:merry_id>/dues/my/", MyMerryDuesView.as_view(), name="merry-dues-my"),
     path("<int:merry_id>/dues/", AdminDuesView.as_view(), name="merry-dues-admin"),
+    path("merry/<int:merry_id>/dashboard/", MerryMemberDashboardView.as_view()),
 
     # =========================
     # Payments
