@@ -529,6 +529,8 @@ class MerrySeatInline(admin.TabularInline):
 class MerryJoinRequestInline(admin.TabularInline):
     model = MerryJoinRequest
     extra = 0
+    can_delete = False
+    show_change_link = True
     fields = (
         "user",
         "requested_seats",
@@ -538,7 +540,18 @@ class MerryJoinRequestInline(admin.TabularInline):
         "reviewed_by",
         "reviewed_at",
     )
-    readonly_fields = ("created_at", "reviewed_by", "reviewed_at")
+    readonly_fields = (
+        "user",
+        "requested_seats",
+        "status",
+        "note",
+        "created_at",
+        "reviewed_by",
+        "reviewed_at",
+    )
+
+    def has_add_permission(self, request, obj=None):
+        return False
 
 
 class MerryContributionDueInline(admin.TabularInline):
