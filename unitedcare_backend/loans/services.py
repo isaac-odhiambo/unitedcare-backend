@@ -303,8 +303,6 @@ def get_available_merry_credit_breakdown(*, user) -> List[dict]:
     )
 
     for membership in memberships:
-        # Once member has already received merry payout/turn for this active merry,
-        # that merry should no longer count as available loan security.
         if membership_has_paid_merry_turn(membership=membership):
             continue
 
@@ -361,9 +359,6 @@ def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
     if principal <= 0:
         raise ValidationError("Principal must be greater than 0.")
 
-    # Hard merry block:
-    # if member has active merry and has already received their turn,
-    # they should not request another loan.
     if borrower_blocked_by_paid_merry_turn(user=user):
         raise ValidationError(
             "You cannot request a loan because you have already received your merry turn."
@@ -386,7 +381,6 @@ def validate_platform_loan_eligibility(*, user, principal: Decimal) -> dict:
 
     available_savings = Decimal("0.00")
     if account:
-        # available_balance should already reflect reserved/locked savings
         available_savings = q2(getattr(account, "available_balance", Decimal("0.00")))
 
     available_merry = get_total_available_merry_credit(user=user)
@@ -616,19 +610,19 @@ def reserve_group_share_security_for_loan(
 @transaction.atomic
 def release_group_share_security_for_loan(*, loan: Loan) -> None:
     allocations = (
-        LoanSecurityAllocation.objects.select_for_update()
+        LoanSecurityAllocation.objects
+        .select_for_update(of=("self",))
         .filter(
             loan=loan,
             is_active=True,
             source_type__in=["BORROWER_GROUP_SHARE", "GUARANTOR_GROUP_SHARE"],
         )
-        .select_related("group", "owner_user")
     )
 
     for alloc in allocations:
         share = (
             GroupMemberShare.objects.select_for_update()
-            .filter(group=alloc.group, user=alloc.owner_user)
+            .filter(group_id=alloc.group_id, user_id=alloc.owner_user_id)
             .first()
         )
         if share:
@@ -644,8 +638,8 @@ def release_group_share_security_for_loan(*, loan: Loan) -> None:
 
         holds = GroupShareHold.objects.select_for_update().filter(
             loan_id=loan.id,
-            group=alloc.group,
-            user=alloc.owner_user,
+            group_id=alloc.group_id,
+            user_id=alloc.owner_user_id,
             is_active=True,
         )
 
@@ -959,9 +953,9 @@ def _create_security_allocation(
 @transaction.atomic
 def release_reserved_security_for_loan(loan: Loan) -> None:
     allocations = (
-        LoanSecurityAllocation.objects.select_for_update()
+        LoanSecurityAllocation.objects
+        .select_for_update(of=("self",))
         .filter(loan=loan, is_active=True)
-        .select_related("savings_account", "guarantor_link")
     )
 
     for alloc in allocations:
@@ -982,7 +976,9 @@ def release_reserved_security_for_loan(loan: Loan) -> None:
             acct.save(update_fields=["reserved_amount"])
 
         if alloc.guarantor_link_id and alloc.source_type.startswith("GUARANTOR_"):
-            gl = LoanGuarantor.objects.select_for_update().get(id=alloc.guarantor_link_id)
+            gl = LoanGuarantor.objects.select_for_update().get(
+                id=alloc.guarantor_link_id
+            )
             gl.reserved_amount = q2(
                 max(
                     Decimal("0.00"),
@@ -1016,9 +1012,6 @@ def reserve_security_for_loan(loan: Loan) -> dict:
     target = q2(loan.security_target)
     covered = Decimal("0.00")
 
-    # ------------------------------------------------------
-    # 1) Borrower savings
-    # ------------------------------------------------------
     if ALLOW_BORROWER_SAVINGS_SECURITY:
         borrower_acct = (
             SavingsAccount.objects.filter(
@@ -1055,9 +1048,6 @@ def reserve_security_for_loan(loan: Loan) -> dict:
                 )
                 covered = q2(covered + use)
 
-    # ------------------------------------------------------
-    # 2) Borrower merry credit
-    # ------------------------------------------------------
     if ALLOW_BORROWER_MERRY_CREDIT_SECURITY and covered < target:
         merry_rows = get_available_merry_credit_breakdown(user=loan.borrower)
 
@@ -1079,9 +1069,6 @@ def reserve_security_for_loan(loan: Loan) -> dict:
             )
             covered = q2(covered + use)
 
-    # ------------------------------------------------------
-    # 3) Borrower group share
-    # ------------------------------------------------------
     if ALLOW_BORROWER_GROUP_SHARE_SECURITY and covered < target:
         remaining_need = q2(target - covered)
         reserved_group_amt = q2(
@@ -1095,9 +1082,6 @@ def reserve_security_for_loan(loan: Loan) -> dict:
         if reserved_group_amt > 0:
             covered = q2(covered + reserved_group_amt)
 
-    # ------------------------------------------------------
-    # 4) Accepted guarantor savings
-    # ------------------------------------------------------
     accepted = list(
         LoanGuarantor.objects.select_related("guarantor")
         .select_for_update()
@@ -1144,9 +1128,6 @@ def reserve_security_for_loan(loan: Loan) -> dict:
 
             covered = q2(covered + use)
 
-    # ------------------------------------------------------
-    # 5) Accepted guarantor group share
-    # ------------------------------------------------------
     if ALLOW_GUARANTOR_GROUP_SHARE_SECURITY and covered < target:
         for g in accepted:
             remaining_need = q2(target - covered)
@@ -1295,11 +1276,6 @@ def _safe_create_savings_transaction(
     reference: str,
     narration: str,
 ) -> None:
-    """
-    Best-effort transaction logging for overpayment moved to savings.
-    This avoids breaking if your SavingsTransaction model has slightly
-    different optional fields across environments.
-    """
     try:
         field_names = {f.name for f in SavingsTransaction._meta.get_fields()}
         payload = {}
@@ -1376,10 +1352,6 @@ def create_loan_payment_record(
     method: str = "MANUAL",
     reference: Optional[str] = None,
 ) -> LoanPayment:
-    """
-    Creates only the portion that actually belongs to the loan.
-    Any excess is not stored as LoanPayment; it is moved to savings separately.
-    """
     amt = q2(amount)
     if amt <= 0:
         raise ValidationError("Payment amount must be greater than 0.")
@@ -1566,9 +1538,6 @@ def _apply_mpesa_repayment_to_loan(*, loan: Loan, amount: Decimal, mpesa_tx) -> 
 
 @transaction.atomic
 def apply_mpesa_repayment(*, loan_id: int, amount: Decimal, mpesa_tx) -> Loan:
-    """
-    Backward-compatible direct-by-loan-id repayment path.
-    """
     loan = _repayable_loans_queryset().filter(id=loan_id).first()
     if not loan:
         raise ValidationError("Loan not found.")
@@ -1588,15 +1557,6 @@ def apply_mpesa_repayment_by_user_reference(
     mpesa_tx,
     reference: Optional[str] = None,
 ) -> Loan:
-    """
-    Canonical STK/C2B repayment path.
-
-    Rule:
-      loan2 => LOAN_REPAYMENT for borrower user id 2
-
-    Since borrower is allowed only one active repayable loan, the
-    repayment is applied to that single active loan.
-    """
     loan = _get_single_repayable_loan_for_borrower(user_id=int(user_id))
     return _apply_mpesa_repayment_to_loan(
         loan=loan,
@@ -1642,11 +1602,6 @@ def apply_mpesa_repayment_by_user(
 # ==========================================================
 @transaction.atomic
 def apply_merry_payout_to_active_loan(*, payout: MerryPayout) -> dict:
-    """
-    When merry payout is reached and marked PAID, redirect the payout amount
-    to the borrower's active loan first if that loan is secured by merry.
-    Any remainder can be handled by the merry flow outside this function.
-    """
     payout_amount = q2(getattr(payout, "amount", Decimal("0.00")))
     if payout_amount <= 0:
         return {
