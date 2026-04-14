@@ -595,12 +595,17 @@ class MerryJoinRequest(models.Model):
                 raise ValidationError(reason)
 
         if self.merry_id and self.user_id:
-            if MerryMember.objects.filter(
-                merry_id=self.merry_id,
-                user_id=self.user_id,
-                is_active=True,
-            ).exists():
-                raise ValidationError("You are already a member of this merry.")
+            # Only block duplicate active membership when creating a new request.
+            # This avoids admin save failures when historical APPROVED rows are
+            # revalidated while editing the parent merry object.
+            if not self.pk:
+                existing_member = MerryMember.objects.filter(
+                    merry_id=self.merry_id,
+                    user_id=self.user_id,
+                    is_active=True,
+                ).exists()
+                if existing_member:
+                    raise ValidationError("You are already a member of this merry.")
 
             pending_qs = MerryJoinRequest.objects.filter(
                 merry_id=self.merry_id,
