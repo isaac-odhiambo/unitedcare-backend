@@ -24,6 +24,8 @@ from .serializers import (
     MpesaTransactionSerializer,
     PaymentLedgerSerializer,
     TransactionFeeConfigSerializer,
+    TransactionFeePreviewRequestSerializer,
+    TransactionFeePreviewResponseSerializer,
     WithdrawalApproveSerializer,
     WithdrawalCreateSerializer,
     WithdrawalRejectSerializer,
@@ -32,6 +34,9 @@ from .serializers import (
 from .throttles import StkPushPhoneThrottle, StkPushUserThrottle
 from .services import (
     get_active_mpesa_config,
+    get_fee_config,
+    calculate_transaction_fee,
+    calculate_total_charge,
     initiate_stk_push,
     handle_stk_callback,
     handle_c2b_validation_callback,
@@ -339,6 +344,43 @@ class AdminFeeConfigDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 # =========================================================
+# Fee Preview View
+# =========================================================
+class TransactionFeePreviewView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = TransactionFeePreviewRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        purpose = serializer.validated_data["purpose"]
+        amount = serializer.validated_data["amount"]
+
+        cfg = get_fee_config(purpose)
+        fee = calculate_transaction_fee(
+            purpose=purpose,
+            base_amount=amount,
+        )
+        total = calculate_total_charge(
+            purpose=purpose,
+            base_amount=amount,
+        )
+
+        payload = {
+            "purpose": purpose,
+            "base_amount": amount,
+            "fixed_fee": getattr(cfg, "fixed_fee", Decimal("0.00")) if cfg else Decimal("0.00"),
+            "percentage_fee": getattr(cfg, "percentage_fee", Decimal("0.00")) if cfg else Decimal("0.00"),
+            "fee": fee,
+            "total": total,
+            "is_configured": bool(cfg),
+        }
+
+        response_serializer = TransactionFeePreviewResponseSerializer(payload)
+        return Response(response_serializer.data, status=status.HTTP_200_OK)
+
+
+# =========================================================
 # Ledger Views
 # =========================================================
 class MyLedgerHistoryView(generics.ListAPIView):
@@ -530,57 +572,6 @@ class MpesaStkCallbackView(APIView):
         return _accepted_callback_response()
 
 
-# # =========================================================
-# # C2B Validation
-# # =========================================================
-# class MpesaC2BValidationView(APIView):
-#     permission_classes = [permissions.AllowAny]
-
-#     def post(self, request):
-#         try:
-#             _require_callback_token(request)
-#             _require_safaricom_ip(request)
-#             return Response(
-#                 handle_c2b_validation_callback(callback_payload=request.data),
-#                 status=status.HTTP_200_OK,
-#             )
-#         except Exception as e:
-#             logger.exception("C2B validation handling error: %s", str(e))
-#             return Response(
-#                 {"ResultCode": 1, "ResultDesc": "Rejected"},
-#                 status=status.HTTP_200_OK,
-#             )
-
-
-# # =========================================================
-# # C2B Confirmation
-# # =========================================================
-# class MpesaC2BConfirmationView(APIView):
-#     permission_classes = [permissions.AllowAny]
-
-#     @transaction.atomic
-#     def post(self, request):
-#         try:
-#             _require_callback_token(request)
-#             _require_safaricom_ip(request)
-
-#             tx = handle_c2b_confirmation_callback(callback_payload=request.data)
-
-#             logger.info(
-#                 "C2B confirmation processed successfully | tx_id=%s | receipt=%s | status=%s | purpose=%s | allocation_status=%s | reference=%s | user_id=%s",
-#                 getattr(tx, "id", None),
-#                 getattr(tx, "mpesa_receipt_number", None),
-#                 getattr(tx, "status", None),
-#                 getattr(tx, "purpose", None),
-#                 getattr(tx, "allocation_status", None),
-#                 getattr(tx, "reference", None),
-#                 getattr(tx, "user_id", None),
-#             )
-#         except Exception as e:
-#             logger.exception("C2B confirmation handling error: %s", str(e))
-
-#         return _accepted_callback_response()
-
 # =========================================================
 # C2B Validation
 # =========================================================
@@ -652,43 +643,8 @@ class MpesaC2BConfirmationView(APIView):
 
         return _accepted_callback_response()
 
-# class MpesaC2BConfirmationView(APIView):
-#     permission_classes = [permissions.AllowAny]
 
-#     @transaction.atomic
-#     def post(self, request):
-#         try:
-#             logger.info("========== C2B CONFIRMATION HIT ==========")
-#             logger.info("C2B confirmation query params: %s", dict(request.query_params))
-#             logger.info("C2B confirmation headers token: %s", request.headers.get("X-Callback-Token"))
-#             logger.info("C2B confirmation content type: %s", request.content_type)
-#             logger.info("C2B confirmation raw body: %s", request.body.decode("utf-8", errors="ignore"))
-#             logger.info("C2B confirmation parsed data: %s", request.data)
-#             print("C2B CONFIRMATION RAW BODY:", request.body)
-#             print("C2B CONFIRMATION DATA:", request.data)
-
-#             _require_callback_token(request)
-#             _require_safaricom_ip(request)
-
-#             tx = handle_c2b_confirmation_callback(callback_payload=request.data)
-
-#             logger.info(
-#                 "C2B confirmation processed successfully | tx_id=%s | receipt=%s | status=%s | purpose=%s | allocation_status=%s | reference=%s | user_id=%s",
-#                 getattr(tx, "id", None),
-#                 getattr(tx, "mpesa_receipt_number", None),
-#                 getattr(tx, "status", None),
-#                 getattr(tx, "purpose", None),
-#                 getattr(tx, "allocation_status", None),
-#                 getattr(tx, "reference", None),
-#                 getattr(tx, "user_id", None),
-#             )
-#             logger.info("========== C2B CONFIRMATION SUCCESS ==========")
-
-#         except Exception as e:
-#             logger.exception("C2B confirmation handling error: %s", str(e))
-
-#         return _accepted_callback_response()
-# # =========================================================
+# =========================================================
 # Withdrawals
 # =========================================================
 class MyWithdrawalsView(generics.ListAPIView):

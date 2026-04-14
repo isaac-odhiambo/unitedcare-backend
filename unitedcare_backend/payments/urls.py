@@ -25,6 +25,9 @@ from .views import (
     MpesaC2BConfirmationView,
     MpesaB2CResultView,
     MpesaB2CTimeoutView,
+
+    # ✅ NEW (Fee Preview)
+    TransactionFeePreviewView,
 )
 
 urlpatterns = [
@@ -59,6 +62,15 @@ urlpatterns = [
         "fees/admin/<int:pk>/",
         AdminFeeConfigDetailView.as_view(),
         name="payments-admin-fee-config-detail",
+    ),
+
+    # =========================================================
+    # ✅ Fee Preview (NEW)
+    # =========================================================
+    path(
+        "fees/preview/",
+        TransactionFeePreviewView.as_view(),
+        name="payments-fee-preview",
     ),
 
     # =========================================================

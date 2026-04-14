@@ -129,6 +129,25 @@ class TransactionFeeConfigSerializer(serializers.ModelSerializer):
         return value
 
 
+class TransactionFeePreviewRequestSerializer(serializers.Serializer):
+    purpose = serializers.ChoiceField(choices=TransactionFeeConfig.PURPOSE_CHOICES)
+    amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+
+
+class TransactionFeePreviewResponseSerializer(serializers.Serializer):
+    purpose = serializers.CharField()
+    base_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    fixed_fee = serializers.DecimalField(max_digits=12, decimal_places=2)
+    percentage_fee = serializers.DecimalField(max_digits=7, decimal_places=2)
+    fee = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    is_configured = serializers.BooleanField()
+
+
 # =========================================================
 # Mpesa Transaction (STK / C2B / B2C)
 # =========================================================
