@@ -2647,6 +2647,7 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "status": due.status,
             "due_amount": q2(due.due_amount or Decimal("0.00")),
             "paid_amount": q2(due.paid_amount or Decimal("0.00")),
+            "balance": outstanding,   # frontend DueLine expects balance
             "outstanding": outstanding,
             "bucket": bucket,
         }
@@ -2664,9 +2665,12 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
                 next_total += outstanding
                 next_items.append(row)
 
+    overdue_total = q2(overdue_total)
+    current_total = q2(current_total)
+    next_total = q2(next_total)
     required_now = q2(overdue_total + current_total)
     pay_with_next = q2(required_now + next_total)
-    wallet_balance = get_user_merry_wallet_balance(user=user)
+    wallet_balance = q2(get_user_merry_wallet_balance(user=user))
 
     next_turn = _get_member_next_turn(merry=merry, member=member)
     loan_offset = _get_member_merry_loan_offset_summary(merry=merry, member=member)
@@ -2700,32 +2704,54 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
         readiness = None
 
     return {
-        "merry_id": merry.id,
-        "merry_name": merry.name,
-        "period_key": current_pk,
-        "period_label": period_meta["label"],
-        "period_start_date": period_meta["start_date"],
-        "period_end_date": period_meta["end_date"],
-        "seat_count": len(seat_numbers),
-        "seat_numbers": seat_numbers,
-        "amount_per_seat": q2(merry.contribution_amount or Decimal("0.00")),
-        "wallet_balance": wallet_balance,
-        "overdue_total": q2(overdue_total),
-        "current_total": q2(current_total),
-        "next_total": q2(next_total),
-        "required_now": required_now,
-        "pay_with_next": pay_with_next,
-        "net_required_now_after_wallet": (
-            q2(required_now - wallet_balance)
-            if required_now > wallet_balance
-            else Decimal("0.00")
-        ),
-        "next_due_date": next_due_date,
-        "overdue_items": overdue_items,
-        "current_items": current_items,
-        "next_items": next_items,
-        "next_turn": next_turn,
+        "merry": {
+            "id": merry.id,
+            "name": merry.name,
+            "contribution_amount": q2(merry.contribution_amount or Decimal("0.00")),
+            "members_count": merry.members.filter(is_active=True).count(),
+            "seats_count": merry.seats.filter(is_active=True).count(),
+            "my_seat_count": len(seat_numbers),
+            "my_seat_numbers": seat_numbers,
+            "payout_frequency": merry.payout_frequency,
+            "payouts_per_period": merry.payouts_per_period,
+            "total_pool_per_slot": q2(
+                merry.total_pool_per_slot()
+                if hasattr(merry, "total_pool_per_slot")
+                else Decimal("0.00")
+            ),
+            "total_pool_per_period": q2(
+                merry.total_pool_per_period()
+                if hasattr(merry, "total_pool_per_period")
+                else Decimal("0.00")
+            ),
+            "payout_formula": (
+                f"{merry.payouts_per_period} slot(s) per period"
+                if getattr(merry, "payouts_per_period", 1)
+                else "Standard merry payout"
+            ),
+        },
+        "period": {
+            "period_key": current_pk,
+            "label": period_meta["label"],
+            "start_date": period_meta["start_date"],
+            "end_date": period_meta["end_date"],
+            "frequency": period_meta["frequency"],
+        },
+        "dues": {
+            "overdue_total": overdue_total,
+            "current_total": current_total,
+            "next_total": next_total,
+            "required_now": required_now,
+            "pay_with_next": pay_with_next,
+            "next_due_date": next_due_date,
+            "has_overdue": bool(overdue_total > 0),
+            "overdue_items": overdue_items,
+            "current_items": current_items,
+            "next_items": next_items,
+        },
+        "current_turn": payout_summary,
+        "my_turn": next_turn,
         "loan_offset": loan_offset,
-        "payout_summary": payout_summary,
+        "wallet_balance": wallet_balance,
         "readiness": readiness,
     }
