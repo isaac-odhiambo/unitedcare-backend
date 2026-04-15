@@ -21,6 +21,7 @@ from .services import (
     add_seats_to_existing_member,
     reassign_existing_clean_seat,
     confirm_payment_and_allocate,
+    mark_payout_paid,  # ADDED: ensures payout cycle logic is preserved
 )
 
 
@@ -470,12 +471,16 @@ def mark_payouts_paid(modeladmin, request, queryset):
     count = 0
 
     for payout in queryset:
-        if payout.status in ("SCHEDULED", "PROCESSING", "FAILED"):
-            payout.status = "PAID"
-            if not payout.paid_at:
-                payout.paid_at = timezone.now()
-            payout.save(update_fields=["status", "paid_at"])
-            count += 1
+        try:
+            if payout.status in ("SCHEDULED", "PROCESSING", "FAILED"):
+                mark_payout_paid(payout_id=payout.id, paid_at=payout.paid_at or timezone.now())
+                count += 1
+        except Exception as e:
+            modeladmin.message_user(
+                request,
+                f"Payout #{payout.id} failed: {e}",
+                level=messages.ERROR,
+            )
 
     modeladmin.message_user(
         request,

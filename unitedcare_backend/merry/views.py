@@ -7,6 +7,7 @@
 # + added merry payment breakdown (required now + optional next)
 # + dues now include due_date / advance-pay support / overdue support
 # + added merry wallet balance and wallet history endpoints
+# + UPDATED payout flow to support automatic cycle turn creation
 
 from __future__ import annotations
 
@@ -393,6 +394,12 @@ class MerryDetailView(APIView):
             .first()
         )
 
+        next_turn = None
+        try:
+            next_turn = merry_services.get_next_payout_turn(merry_id=merry.id)
+        except Exception:
+            next_turn = None
+
         return Response(
             {
                 "id": merry.id,
@@ -436,6 +443,7 @@ class MerryDetailView(APIView):
                         or merry.available_seats() > 0
                     )
                 ),
+                "next_turn": next_turn,
             },
             status=status.HTTP_200_OK,
         )
@@ -1146,7 +1154,7 @@ class AdminMarkPaymentConfirmedView(APIView):
 class MerryPayoutScheduleView(APIView):
     """
     GET /api/merry/<merry_id>/payouts/schedule/
-    Shows current period + used slots + seats list.
+    Shows current period + used slots + seats list + computed next turn.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1182,6 +1190,19 @@ class MerryPayoutScheduleView(APIView):
             for s in seats_qs
         ]
 
+        next_turn = None
+        try:
+            next_turn = merry_services.get_next_payout_turn(merry_id=merry.id)
+        except Exception:
+            next_turn = None
+
+        # Added only this readiness block
+        readiness = None
+        try:
+            readiness = merry_services.get_payout_readiness_status(merry_id=merry.id)
+        except Exception:
+            readiness = None
+
         return Response(
             {
                 "merry": {
@@ -1196,28 +1217,102 @@ class MerryPayoutScheduleView(APIView):
                     "is_open": getattr(merry, "is_open", True),
                     "max_seats": getattr(merry, "max_seats", 0),
                     "available_seats": merry.available_seats() if hasattr(merry, "available_seats") else None,
+                    "next_payout_date": merry.next_payout_date,
                 },
                 "current_period_key": period_key,
                 "used_slots_in_period": used_slots,
+                "next_turn": next_turn,
+                "readiness": readiness,
                 "seats": seats,
             },
             status=status.HTTP_200_OK,
         )
 
 
+class NextPayoutTurnView(APIView):
+    """
+    GET /api/merry/<merry_id>/payouts/next-turn/
+    Returns the computed next payout turn from services.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, merry_id: int):
+        merry = get_merry_or_404(merry_id)
+        if not user_can_view_merry(request.user, merry):
+            raise PermissionDenied("Not allowed.")
+
+        try:
+            data = merry_services.get_next_payout_turn(merry_id=merry_id)
+        except Exception as e:
+            raise _service_error(e)
+
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class PayoutReadinessView(APIView):
+    """
+    GET /api/merry/<merry_id>/payouts/readiness/?period_key=...&slot_no=...
+    Returns slot funding/readiness data without changing other payout logic.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, merry_id: int):
+        merry = get_merry_or_404(merry_id)
+        if not user_can_view_merry(request.user, merry):
+            raise PermissionDenied("Not allowed.")
+
+        period_key = (request.query_params.get("period_key") or "").strip() or None
+        slot_no_raw = request.query_params.get("slot_no")
+        slot_no = None
+        if slot_no_raw is not None and str(slot_no_raw).strip() != "":
+            slot_no = parse_int(slot_no_raw, "slot_no", min_value=1)
+
+        try:
+            data = merry_services.get_payout_readiness_status(
+                merry_id=merry_id,
+                period_key=period_key,
+                slot_no=slot_no,
+            )
+        except Exception as e:
+            raise _service_error(e)
+
+        return Response(data, status=status.HTTP_200_OK)
+
+
 class CreatePayoutView(APIView):
     """
     POST /api/merry/<merry_id>/payouts/create/
-    body:
-      - seat_id (required)
-      - period_key (optional, default current)
-      - slot_no (optional, default next available)
-      - amount (optional, default computed as total collected per slot or custom)
-      - compute_amount (optional bool):
-          if true => amount = total paid allocations for this (period_key, slot_no)
-      - notes (optional)
 
-    NOTE: payout is seat-based now (fair for multi-seat members).
+    Supported modes:
+
+    1) Automatic next-turn payout:
+       body:
+         {
+           "auto_select_next_turn": true,
+           "compute_amount": false,
+           "notes": "..."
+         }
+
+    2) Manual seat payout:
+       body:
+         {
+           "seat_id": 12,
+           "period_key": "2026-W16",
+           "slot_no": 1,
+           "amount": "5000",
+           "compute_amount": false,
+           "notes": "..."
+         }
+
+    3) Automatic next-turn with computed amount:
+       body:
+         {
+           "auto_select_next_turn": true,
+           "compute_amount": true,
+           "notes": "..."
+         }
+
+    If auto_select_next_turn=true, seat_id is not required.
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1227,31 +1322,46 @@ class CreatePayoutView(APIView):
             raise PermissionDenied("Admin only.")
 
         compute_amount = parse_bool(request.data.get("compute_amount"), default=False)
+        auto_select_next_turn = parse_bool(request.data.get("auto_select_next_turn"), default=False)
         period_key = (request.data.get("period_key") or "").strip() or None
         slot_no_raw = request.data.get("slot_no")
         notes = (request.data.get("notes") or "")[:255]
 
         merry = get_merry_or_404(merry_id)
 
-        if not request.data.get("seat_id"):
-            raise ValidationError("seat_id is required.")
-        seat_id = parse_int(request.data.get("seat_id"), "seat_id", min_value=1)
+        if auto_select_next_turn:
+            try:
+                preview = merry_services.get_next_payout_turn(merry_id=merry_id)
+            except Exception as e:
+                raise _service_error(e)
 
-        if slot_no_raw is not None and str(slot_no_raw).strip() != "":
-            slot_no = parse_int(slot_no_raw, "slot_no", min_value=1)
+            resolved_period_key = preview["period_key"]
+            resolved_slot_no = preview["slot_no"]
+            resolved_seat_id = preview["seat_id"]
         else:
-            slot_no = None
+            if not request.data.get("seat_id"):
+                raise ValidationError("seat_id is required unless auto_select_next_turn=true.")
+            resolved_seat_id = parse_int(request.data.get("seat_id"), "seat_id", min_value=1)
+
+            resolved_period_key = period_key or current_period_key(merry)
+
+            if slot_no_raw is not None and str(slot_no_raw).strip() != "":
+                resolved_slot_no = parse_int(slot_no_raw, "slot_no", min_value=1)
+            else:
+                resolved_slot_no = None
 
         if compute_amount:
-            target_period = period_key or current_period_key(merry)
-            if slot_no is None:
-                slot_no = next_available_slot(merry, target_period)
+            target_period = resolved_period_key
+            target_slot = resolved_slot_no
+
+            if target_slot is None:
+                target_slot = next_available_slot(merry, target_period)
 
             try:
                 amount = merry_services.compute_payout_amount_for_slot(
                     merry_id=merry_id,
                     period_key=target_period,
-                    slot_no=slot_no,
+                    slot_no=target_slot,
                 )
             except Exception as e:
                 raise _service_error(e)
@@ -1259,20 +1369,30 @@ class CreatePayoutView(APIView):
             if amount <= 0:
                 raise ValidationError("No funds allocated for this slot yet. Cannot compute payout amount.")
         else:
-            amount = parse_decimal(request.data.get("amount"), "amount")
+            if auto_select_next_turn and (request.data.get("amount") in [None, ""]):
+                amount = None
+            else:
+                amount = parse_decimal(request.data.get("amount"), "amount")
 
         try:
             payout = merry_services.create_payout_record(
                 admin_user=request.user,
                 merry_id=merry_id,
-                seat_id=seat_id,
+                seat_id=resolved_seat_id if not auto_select_next_turn else None,
                 amount=amount,
-                period_key=period_key,
-                slot_no=slot_no,
+                period_key=resolved_period_key if not auto_select_next_turn else None,
+                slot_no=resolved_slot_no,
                 notes=notes,
+                auto_select_next_turn=auto_select_next_turn,
             )
         except Exception as e:
             raise _service_error(e)
+
+        refreshed_next_turn = None
+        try:
+            refreshed_next_turn = merry_services.get_next_payout_turn(merry_id=merry_id)
+        except Exception:
+            refreshed_next_turn = None
 
         return Response(
             {
@@ -1286,6 +1406,58 @@ class CreatePayoutView(APIView):
                 "amount": str(payout.amount),
                 "period_key": payout.period_key,
                 "slot_no": payout.slot_no,
+                "next_turn": refreshed_next_turn,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class CreateNextPayoutView(APIView):
+    """
+    POST /api/merry/<merry_id>/payouts/create-next/
+    Admin convenience endpoint for automatic next-turn payout creation.
+    body:
+      {
+        "notes": "optional"
+      }
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, merry_id: int):
+        if not is_admin(request.user):
+            raise PermissionDenied("Admin only.")
+
+        notes = (request.data.get("notes") or "")[:255]
+
+        try:
+            payout = merry_services.create_next_cycle_payout_record(
+                admin_user=request.user,
+                merry_id=merry_id,
+                notes=notes,
+            )
+        except Exception as e:
+            raise _service_error(e)
+
+        next_turn = None
+        try:
+            next_turn = merry_services.get_next_payout_turn(merry_id=merry_id)
+        except Exception:
+            next_turn = None
+
+        return Response(
+            {
+                "message": "Next payout record created.",
+                "payout_id": payout.id,
+                "status": payout.status,
+                "merry_id": payout.merry_id,
+                "seat_id": payout.seat_id,
+                "member_id": payout.seat.member_id,
+                "user_id": payout.seat.member.user_id,
+                "amount": str(payout.amount),
+                "period_key": payout.period_key,
+                "slot_no": payout.slot_no,
+                "next_turn": next_turn,
             },
             status=status.HTTP_201_CREATED,
         )
@@ -1300,18 +1472,34 @@ class MarkPayoutPaidView(APIView):
             raise PermissionDenied("Admin only.")
 
         try:
-            merry_services.mark_payout_paid(
+            payout = merry_services.mark_payout_paid(
                 payout_id=payout_id,
                 paid_at=timezone.now(),
             )
         except Exception as e:
             raise _service_error(e)
 
-        return Response({"message": "Payout marked PAID."}, status=status.HTTP_200_OK)
+        next_turn = None
+        try:
+            next_turn = merry_services.get_next_payout_turn(merry_id=payout.merry_id)
+        except Exception:
+            next_turn = None
+
+        return Response(
+            {
+                "message": "Payout marked PAID.",
+                "payout_id": payout.id,
+                "merry_id": payout.merry_id,
+                "next_turn": next_turn,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 class MerryMemberDashboardView(APIView):
     """
     GET /api/merry/<merry_id>/dashboard/
-    
+
     Full detailed member dashboard:
     - overdue / current / next dues
     - required_now / pay_with_next

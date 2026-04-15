@@ -26,9 +26,12 @@ from .views import (
     MyPaymentsView,
     AdminMarkPaymentConfirmedView,
     MerryPayoutScheduleView,
+    NextPayoutTurnView,
     CreatePayoutView,
+    CreateNextPayoutView,
     MarkPayoutPaidView,
-    MerryMemberDashboardView, 
+    MerryMemberDashboardView,
+    PayoutReadinessView,  # ✅ ADDED
 )
 
 urlpatterns = [
@@ -58,134 +61,61 @@ urlpatterns = [
     # =========================
     # Join requests
     # =========================
-    # Canonical route
-    path(
-        "<int:merry_id>/join/request/",
-        RequestToJoinMerryView.as_view(),
-        name="merry-join-request",
-    ),
-    # Alias for frontend compatibility
-    path(
-        "<int:merry_id>/join-request/",
-        RequestToJoinMerryView.as_view(),
-        name="merry-join-request-alias",
-    ),
+    path("<int:merry_id>/join/request/", RequestToJoinMerryView.as_view(), name="merry-join-request"),
+    path("<int:merry_id>/join-request/", RequestToJoinMerryView.as_view(), name="merry-join-request-alias"),
 
     path("join/requests/my/", MyJoinRequestsView.as_view(), name="merry-join-requests-my"),
-    # Alias for frontend compatibility
     path("join-requests/my/", MyJoinRequestsView.as_view(), name="merry-join-requests-my-alias"),
 
-    path(
-        "join/requests/<int:request_id>/cancel/",
-        CancelJoinRequestView.as_view(),
-        name="merry-join-request-cancel",
-    ),
-    # Alias for frontend compatibility
-    path(
-        "join-requests/<int:request_id>/cancel/",
-        CancelJoinRequestView.as_view(),
-        name="merry-join-request-cancel-alias",
-    ),
+    path("join/requests/<int:request_id>/cancel/", CancelJoinRequestView.as_view(), name="merry-join-request-cancel"),
+    path("join-requests/<int:request_id>/cancel/", CancelJoinRequestView.as_view(), name="merry-join-request-cancel-alias"),
 
     # =========================
     # Admin join moderation
     # =========================
-    path(
-        "<int:merry_id>/join/requests/",
-        AdminListJoinRequestsView.as_view(),
-        name="merry-join-requests-admin",
-    ),
-    # Alias for frontend compatibility
-    path(
-        "<int:merry_id>/join-requests/",
-        AdminListJoinRequestsView.as_view(),
-        name="merry-join-requests-admin-alias",
-    ),
+    path("<int:merry_id>/join/requests/", AdminListJoinRequestsView.as_view(), name="merry-join-requests-admin"),
+    path("<int:merry_id>/join-requests/", AdminListJoinRequestsView.as_view(), name="merry-join-requests-admin-alias"),
 
-    path(
-        "join/requests/<int:request_id>/approve/",
-        AdminApproveJoinRequestView.as_view(),
-        name="merry-join-request-approve",
-    ),
-    # Alias for frontend compatibility
-    path(
-        "join-requests/<int:request_id>/approve/",
-        AdminApproveJoinRequestView.as_view(),
-        name="merry-join-request-approve-alias",
-    ),
+    path("join/requests/<int:request_id>/approve/", AdminApproveJoinRequestView.as_view(), name="merry-join-request-approve"),
+    path("join-requests/<int:request_id>/approve/", AdminApproveJoinRequestView.as_view(), name="merry-join-request-approve-alias"),
 
-    path(
-        "join/requests/<int:request_id>/reject/",
-        AdminRejectJoinRequestView.as_view(),
-        name="merry-join-request-reject",
-    ),
-    # Alias for frontend compatibility
-    path(
-        "join-requests/<int:request_id>/reject/",
-        AdminRejectJoinRequestView.as_view(),
-        name="merry-join-request-reject-alias",
-    ),
+    path("join/requests/<int:request_id>/reject/", AdminRejectJoinRequestView.as_view(), name="merry-join-request-reject"),
+    path("join-requests/<int:request_id>/reject/", AdminRejectJoinRequestView.as_view(), name="merry-join-request-reject-alias"),
 
     # =========================
     # Dues
     # =========================
     path("dues/summary/", MyAllMerryDueSummaryView.as_view(), name="merry-dues-summary"),
-    path(
-        "<int:merry_id>/dues/ensure/",
-        EnsureDuesForCurrentPeriodView.as_view(),
-        name="merry-dues-ensure",
-    ),
+    path("<int:merry_id>/dues/ensure/", EnsureDuesForCurrentPeriodView.as_view(), name="merry-dues-ensure"),
     path("<int:merry_id>/dues/my/", MyMerryDuesView.as_view(), name="merry-dues-my"),
     path("<int:merry_id>/dues/", AdminDuesView.as_view(), name="merry-dues-admin"),
-    path("merry/<int:merry_id>/dashboard/", MerryMemberDashboardView.as_view()),
+    path("<int:merry_id>/dashboard/", MerryMemberDashboardView.as_view(), name="merry-member-dashboard"),
 
     # =========================
     # Payments
     # =========================
-    path(
-        "<int:merry_id>/payments/breakdown/",
-        MerryPaymentBreakdownView.as_view(),
-        name="merry-payment-breakdown",
-    ),
-    path(
-        "<int:merry_id>/payments/intent/",
-        CreatePaymentIntentView.as_view(),
-        name="merry-payment-intent",
-    ),
+    path("<int:merry_id>/payments/breakdown/", MerryPaymentBreakdownView.as_view(), name="merry-payment-breakdown"),
+    path("<int:merry_id>/payments/intent/", CreatePaymentIntentView.as_view(), name="merry-payment-intent"),
     path("payments/my/", MyPaymentsView.as_view(), name="merry-payments-my"),
-    path(
-        "payments/<int:payment_id>/confirm/",
-        AdminMarkPaymentConfirmedView.as_view(),
-        name="merry-payment-confirm",
-    ),
+    path("payments/<int:payment_id>/confirm/", AdminMarkPaymentConfirmedView.as_view(), name="merry-payment-confirm"),
 
     # =========================
     # Merry wallet
     # =========================
     path("wallet/my/", MyMerryWalletView.as_view(), name="merry-wallet-my"),
-    path(
-        "wallet/my/transactions/",
-        MyMerryWalletTransactionsView.as_view(),
-        name="merry-wallet-my-transactions",
-    ),
-    path(
-        "admin/users/<int:user_id>/wallet/",
-        AdminUserMerryWalletView.as_view(),
-        name="merry-wallet-admin-user",
-    ),
+    path("wallet/my/transactions/", MyMerryWalletTransactionsView.as_view(), name="merry-wallet-my-transactions"),
+    path("admin/users/<int:user_id>/wallet/", AdminUserMerryWalletView.as_view(), name="merry-wallet-admin-user"),
 
     # =========================
     # Payouts
     # =========================
-    path(
-        "<int:merry_id>/payouts/schedule/",
-        MerryPayoutScheduleView.as_view(),
-        name="merry-payout-schedule",
-    ),
-    path(
-        "<int:merry_id>/payouts/create/",
-        CreatePayoutView.as_view(),
-        name="merry-payout-create",
-    ),
+    path("<int:merry_id>/payouts/schedule/", MerryPayoutScheduleView.as_view(), name="merry-payout-schedule"),
+    path("<int:merry_id>/payouts/next-turn/", NextPayoutTurnView.as_view(), name="merry-payout-next-turn"),
+
+    # ✅ NEW ENDPOINT
+    path("<int:merry_id>/payouts/readiness/", PayoutReadinessView.as_view(), name="merry-payout-readiness"),
+
+    path("<int:merry_id>/payouts/create/", CreatePayoutView.as_view(), name="merry-payout-create"),
+    path("<int:merry_id>/payouts/create-next/", CreateNextPayoutView.as_view(), name="merry-payout-create-next"),
     path("payouts/<int:payout_id>/paid/", MarkPayoutPaidView.as_view(), name="merry-payout-paid"),
 ]
