@@ -2738,6 +2738,39 @@ def _resolve_due_target_seat(
     return None
 
 
+def _bucket_priority(bucket: str) -> int:
+    b = (bucket or "").lower()
+    if b == "overdue":
+        return 3
+    if b == "current":
+        return 2
+    if b == "future":
+        return 1
+    return 0
+
+
+def _member_breakdown_unit_amount(
+    *,
+    merry: MerryGoRound,
+    outstanding: Decimal,
+) -> Decimal:
+    """
+    Member-friendly amount:
+    - normally one contribution_amount per unpaid member/seat
+    - if remaining outstanding is smaller than contribution_amount,
+      show the smaller balance
+    """
+    contribution_amount = q2(merry.contribution_amount or Decimal("0.00"))
+    outstanding = q2(outstanding or Decimal("0.00"))
+
+    if outstanding <= 0:
+        return Decimal("0.00")
+    if contribution_amount <= 0:
+        return outstanding
+
+    return q2(min(outstanding, contribution_amount))
+
+
 def _append_member_breakdown(
     bucket_map: Dict[str, Dict[str, Any]],
     *,
@@ -2748,7 +2781,10 @@ def _append_member_breakdown(
     member = getattr(seat, "member", None)
     user = getattr(member, "user", None)
 
-    key = f"{getattr(member, 'id', 'none')}::{getattr(seat, 'id', 'none')}::{bucket}"
+    # Group by visible target seat/member only.
+    # Do NOT include bucket in the key, otherwise the same person can repeat.
+    key = f"{getattr(member, 'id', 'none')}::{getattr(seat, 'id', 'none')}"
+
     if key not in bucket_map:
         bucket_map[key] = {
             "target_member_id": getattr(member, "id", None),
@@ -2760,6 +2796,10 @@ def _append_member_breakdown(
             "amount": Decimal("0.00"),
             "count": 0,
         }
+    else:
+        existing_bucket = bucket_map[key].get("bucket")
+        if _bucket_priority(bucket) > _bucket_priority(str(existing_bucket or "")):
+            bucket_map[key]["bucket"] = bucket
 
     bucket_map[key]["amount"] = q2(bucket_map[key]["amount"] + q2(amount))
     bucket_map[key]["count"] += 1
@@ -2814,6 +2854,7 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
         .order_by("due_date", "period_key", "slot_no", "seat__seat_no", "id")
     )
 
+    # Raw accounting rows (keep for admin/debug compatibility)
     overdue_items: List[Dict[str, Any]] = []
     current_items: List[Dict[str, Any]] = []
     next_items: List[Dict[str, Any]] = []
@@ -2823,6 +2864,7 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
     next_total = Decimal("0.00")
     next_due_date = None
 
+    # Member-friendly rows
     required_now_member_map: Dict[str, Dict[str, Any]] = {}
     advance_member_map: Dict[str, Dict[str, Any]] = {}
 
@@ -2844,32 +2886,43 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "status": due.status,
             "due_amount": q2(due.due_amount or Decimal("0.00")),
             "paid_amount": q2(due.paid_amount or Decimal("0.00")),
-            "balance": outstanding,
-            "outstanding": outstanding,
+            "balance": q2(outstanding),
+            "outstanding": q2(outstanding),
             "bucket": bucket,
         }
 
         target_seat = _resolve_due_target_seat(merry=merry, due=due)
 
+        # For MEMBER screen use one contribution unit per unpaid target,
+        # not the full payout row outstanding.
+        member_amount = _member_breakdown_unit_amount(
+            merry=merry,
+            outstanding=outstanding,
+        )
+
         if bucket == "overdue":
             overdue_total += outstanding
             overdue_items.append(raw_row)
-            _append_member_breakdown(
-                required_now_member_map,
-                seat=target_seat,
-                amount=outstanding,
-                bucket="overdue",
-            )
+
+            if member_amount > 0:
+                _append_member_breakdown(
+                    required_now_member_map,
+                    seat=target_seat,
+                    amount=member_amount,
+                    bucket="overdue",
+                )
 
         elif bucket == "current":
             current_total += outstanding
             current_items.append(raw_row)
-            _append_member_breakdown(
-                required_now_member_map,
-                seat=target_seat,
-                amount=outstanding,
-                bucket="current",
-            )
+
+            if member_amount > 0:
+                _append_member_breakdown(
+                    required_now_member_map,
+                    seat=target_seat,
+                    amount=member_amount,
+                    bucket="current",
+                )
 
         elif bucket == "future" and getattr(due, "is_advance_payable", True):
             if next_due_date is None:
@@ -2878,22 +2931,35 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             if due.due_date == next_due_date:
                 next_total += outstanding
                 next_items.append(raw_row)
-                _append_member_breakdown(
-                    advance_member_map,
-                    seat=target_seat,
-                    amount=outstanding,
-                    bucket="future",
-                )
+
+                if member_amount > 0:
+                    _append_member_breakdown(
+                        advance_member_map,
+                        seat=target_seat,
+                        amount=member_amount,
+                        bucket="future",
+                    )
 
     overdue_total = q2(overdue_total)
     current_total = q2(current_total)
     next_total = q2(next_total)
+
+    # Accounting totals remain from real dues
     required_now = q2(overdue_total + current_total)
     pay_with_next = q2(required_now + next_total)
     wallet_balance = q2(get_user_merry_wallet_balance(user=user))
 
+    # Member-friendly totals now come from grouped people list
     required_now_members = _sorted_member_breakdown_rows(required_now_member_map)
     advance_members = _sorted_member_breakdown_rows(advance_member_map)
+
+    member_required_now_total = q2(
+        sum((row["amount"] for row in required_now_members), Decimal("0.00"))
+    )
+    member_advance_total = q2(
+        sum((row["amount"] for row in advance_members), Decimal("0.00"))
+    )
+    member_pay_with_next = q2(member_required_now_total + member_advance_total)
 
     next_turn = _get_member_next_turn(merry=merry, member=member)
     loan_offset = _get_member_merry_loan_offset_summary(merry=merry, member=member)
@@ -2963,6 +3029,7 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "frequency": period_meta["frequency"],
         },
         "dues": {
+            # Raw accounting totals
             "overdue_total": overdue_total,
             "current_total": current_total,
             "next_total": next_total,
@@ -2970,11 +3037,20 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "pay_with_next": pay_with_next,
             "next_due_date": next_due_date,
             "has_overdue": bool(overdue_total > 0),
+
+            # Raw accounting rows (admin/debug)
             "overdue_items": overdue_items,
             "current_items": current_items,
             "next_items": next_items,
+
+            # Member-friendly rows
             "required_now_members": required_now_members,
             "advance_members": advance_members,
+
+            # Member-friendly totals
+            "member_required_now_total": member_required_now_total,
+            "member_advance_total": member_advance_total,
+            "member_pay_with_next": member_pay_with_next,
         },
         "current_turn": payout_summary,
         "my_turn": next_turn,
