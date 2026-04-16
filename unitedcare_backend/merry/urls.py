@@ -7,7 +7,6 @@ from .views import (
     MerryDetailView,
     MerryMembersView,
     MerrySeatsView,
-    SlotConfigView,
     RequestToJoinMerryView,
     CancelJoinRequestView,
     MyJoinRequestsView,
@@ -31,7 +30,7 @@ from .views import (
     CreateNextPayoutView,
     MarkPayoutPaidView,
     MerryMemberDashboardView,
-    PayoutReadinessView,  # ✅ ADDED
+    PayoutReadinessView,
 )
 
 urlpatterns = [
@@ -54,36 +53,21 @@ urlpatterns = [
     path("<int:merry_id>/seats/", MerrySeatsView.as_view(), name="merry-seats"),
 
     # =========================
-    # Slot config
-    # =========================
-    path("<int:merry_id>/slots/", SlotConfigView.as_view(), name="merry-slots"),
-
-    # =========================
     # Join requests
     # =========================
     path("<int:merry_id>/join/request/", RequestToJoinMerryView.as_view(), name="merry-join-request"),
-    path("<int:merry_id>/join-request/", RequestToJoinMerryView.as_view(), name="merry-join-request-alias"),
-
     path("join/requests/my/", MyJoinRequestsView.as_view(), name="merry-join-requests-my"),
-    path("join-requests/my/", MyJoinRequestsView.as_view(), name="merry-join-requests-my-alias"),
-
     path("join/requests/<int:request_id>/cancel/", CancelJoinRequestView.as_view(), name="merry-join-request-cancel"),
-    path("join-requests/<int:request_id>/cancel/", CancelJoinRequestView.as_view(), name="merry-join-request-cancel-alias"),
 
     # =========================
     # Admin join moderation
     # =========================
     path("<int:merry_id>/join/requests/", AdminListJoinRequestsView.as_view(), name="merry-join-requests-admin"),
-    path("<int:merry_id>/join-requests/", AdminListJoinRequestsView.as_view(), name="merry-join-requests-admin-alias"),
-
     path("join/requests/<int:request_id>/approve/", AdminApproveJoinRequestView.as_view(), name="merry-join-request-approve"),
-    path("join-requests/<int:request_id>/approve/", AdminApproveJoinRequestView.as_view(), name="merry-join-request-approve-alias"),
-
     path("join/requests/<int:request_id>/reject/", AdminRejectJoinRequestView.as_view(), name="merry-join-request-reject"),
-    path("join-requests/<int:request_id>/reject/", AdminRejectJoinRequestView.as_view(), name="merry-join-request-reject-alias"),
 
     # =========================
-    # Dues
+    # Dues / Dashboard
     # =========================
     path("dues/summary/", MyAllMerryDueSummaryView.as_view(), name="merry-dues-summary"),
     path("<int:merry_id>/dues/ensure/", EnsureDuesForCurrentPeriodView.as_view(), name="merry-dues-ensure"),
@@ -111,10 +95,7 @@ urlpatterns = [
     # =========================
     path("<int:merry_id>/payouts/schedule/", MerryPayoutScheduleView.as_view(), name="merry-payout-schedule"),
     path("<int:merry_id>/payouts/next-turn/", NextPayoutTurnView.as_view(), name="merry-payout-next-turn"),
-
-    # ✅ NEW ENDPOINT
     path("<int:merry_id>/payouts/readiness/", PayoutReadinessView.as_view(), name="merry-payout-readiness"),
-
     path("<int:merry_id>/payouts/create/", CreatePayoutView.as_view(), name="merry-payout-create"),
     path("<int:merry_id>/payouts/create-next/", CreateNextPayoutView.as_view(), name="merry-payout-create-next"),
     path("payouts/<int:payout_id>/paid/", MarkPayoutPaidView.as_view(), name="merry-payout-paid"),
