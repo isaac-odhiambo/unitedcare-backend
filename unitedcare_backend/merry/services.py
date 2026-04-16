@@ -2617,7 +2617,7 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             seat_id__in=seat_ids,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
         )
-        .select_related("seat")
+        .select_related("seat", "seat__member", "seat__member__user")
         .order_by("due_date", "period_key", "slot_no", "seat__seat_no", "id")
     )
 
@@ -2636,6 +2636,17 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             continue
 
         bucket = _due_bucket(due, today=today)
+
+        seat_member = due.seat.member
+        seat_user = getattr(seat_member, "user", None)
+
+        target_member_name = (
+            getattr(seat_user, "username", None)
+            or getattr(seat_user, "full_name", None)
+            or getattr(seat_user, "phone", None)
+            or f"Seat {due.seat.seat_no}"
+        )
+
         row = {
             "due_id": due.id,
             "seat_id": due.seat_id,
@@ -2647,9 +2658,12 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "status": due.status,
             "due_amount": q2(due.due_amount or Decimal("0.00")),
             "paid_amount": q2(due.paid_amount or Decimal("0.00")),
-            "balance": outstanding,   # frontend DueLine expects balance
+            "balance": outstanding,
             "outstanding": outstanding,
             "bucket": bucket,
+            "target_member_id": seat_member.id if seat_member else None,
+            "target_user_id": seat_user.id if seat_user else None,
+            "target_member_name": target_member_name,
         }
 
         if bucket == "overdue":
