@@ -1,22 +1,14 @@
 # merry/models.py
-# UPDATED — Practical & realistic:
-# ✅ Slot-based contributions (e.g., Monday + Friday)
-# ✅ Partial payments per slot
-# ✅ Overpayments roll into NEXT SLOT (same period) then future periods
-# ✅ "Seats/Shares": a user can buy 2+ memberships (e.g., 3 seats => contributes 3000 when due=1000)
-# ✅ Admin can generate scheduled dues per period/slot for all seats
-# ✅ Clean admin reporting helpers
-# ✅ Join requests support merry open/closed state
-# ✅ Optional seat capacity limit
-# ✅ Less strict join-request history (only one active pending request at a time)
-# ✅ Seat numbers are now GLOBAL per merry (e.g. seat 2, 5, 19)
-# ✅ Admin can manually assign seat numbers on approval
-# ✅ Added overdue support
-# ✅ Added next-due / advance-pay support
-# ✅ Added due-date generation from slot config
-# ✅ Added merry wallet for excess manual/outside-app payments
-# ✅ Added merry wallet transaction history
-# ✅ FIXED wallet transaction inline support in admin
+# ROSCA compatibility version
+# ---------------------------------------------------------
+# Goals:
+# - Keep existing tables/fields as compatible as possible
+# - Align helpers and validation with queue-based ROSCA flow
+# - Allow DAILY / WEEKLY / MONTHLY payout frequency
+# - Keep slot_no / payouts_per_period for migration safety,
+#   but treat the active business flow as one payout at a time
+# - Keep seat, join request, wallet, payment, payout models intact
+# ---------------------------------------------------------
 
 from __future__ import annotations
 
@@ -56,10 +48,12 @@ def _month_period_key(d=None) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
+def _day_period_key(d=None) -> str:
+    d = d or timezone.localdate()
+    return d.isoformat()
+
+
 def _parse_week_period_key(period_key: str) -> tuple[int, int]:
-    """
-    Example: 2026-W12 -> (2026, 12)
-    """
     try:
         year_part, week_part = period_key.split("-W")
         return int(year_part), int(week_part)
@@ -68,9 +62,6 @@ def _parse_week_period_key(period_key: str) -> tuple[int, int]:
 
 
 def _parse_month_period_key(period_key: str) -> tuple[int, int]:
-    """
-    Example: 2026-03 -> (2026, 3)
-    """
     try:
         year_part, month_part = period_key.split("-")
         return int(year_part), int(month_part)
@@ -78,21 +69,20 @@ def _parse_month_period_key(period_key: str) -> tuple[int, int]:
         raise ValidationError(f"Invalid month period_key format: {period_key}") from exc
 
 
+def _parse_day_period_key(period_key: str) -> date:
+    try:
+        return date.fromisoformat(period_key)
+    except Exception as exc:
+        raise ValidationError(f"Invalid day period_key format: {period_key}") from exc
+
+
 def _first_weekday_in_month(year: int, month: int, weekday: int) -> date:
-    """
-    Returns first occurrence of weekday in given month.
-    weekday: Monday=0 ... Sunday=6
-    """
     first_day = date(year, month, 1)
     days_ahead = (weekday - first_day.weekday()) % 7
     return first_day + timedelta(days=days_ahead)
 
 
 def _nth_weekday_in_month(year: int, month: int, weekday: int, n: int) -> Optional[date]:
-    """
-    Returns nth occurrence of weekday in given month, or None if not present.
-    n starts at 1.
-    """
     if n < 1:
         return None
 
@@ -120,21 +110,22 @@ class MerryGoRound(models.Model):
     )
 
     PAYOUT_FREQUENCY = (
+        ("DAILY", "Daily"),
         ("WEEKLY", "Weekly"),
         ("MONTHLY", "Monthly"),
     )
 
     name = models.CharField(max_length=255)
-    contribution_amount = models.DecimalField(max_digits=12, decimal_places=2)  # per seat per slot
+    contribution_amount = models.DecimalField(max_digits=12, decimal_places=2)  # per seat per payout
     cycle_duration_weeks = models.PositiveIntegerField(default=1)
 
     payout_order_type = models.CharField(max_length=10, choices=ORDER_TYPES, default="manual")
     payout_frequency = models.CharField(max_length=10, choices=PAYOUT_FREQUENCY, default="WEEKLY")
 
-    # If WEEKLY and payouts_per_period=2 => e.g. Monday + Friday
+    # Legacy compatibility field.
+    # Queue-based ROSCA now uses one payout at a time, so active logic should treat this as 1.
     payouts_per_period = models.PositiveIntegerField(default=1)
 
-    # New members can request to join
     is_open = models.BooleanField(default=True)
 
     # 0 means unlimited
@@ -169,57 +160,85 @@ class MerryGoRound(models.Model):
         if self.max_seats < 0:
             raise ValidationError("max_seats cannot be negative.")
 
-    # -------- period helpers --------
+    # -------- queue-based payout helpers --------
+    def effective_payouts_per_period(self) -> int:
+        """
+        Compatibility helper:
+        keep the field in the model, but active ROSCA flow should use one payout at a time.
+        """
+        return 1
+
     def current_period_key(self, dt=None) -> str:
         dt = dt or timezone.localdate()
+
+        if self.payout_frequency == "DAILY":
+            return _day_period_key(dt)
+
         if self.payout_frequency == "MONTHLY":
             return _month_period_key(dt)
+
         return _week_period_key(dt)
 
     def required_amount_per_seat_per_period(self) -> Decimal:
-        return (self.contribution_amount or Decimal("0")) * Decimal(self.payouts_per_period or 0)
+        """
+        Compatibility helper. In ROSCA queue mode this is one contribution per payout event.
+        """
+        return self.contribution_amount or Decimal("0")
 
     def total_pool_per_slot(self) -> Decimal:
         seats_count = self.seats.filter(is_active=True).count()
         return Decimal(seats_count) * (self.contribution_amount or Decimal("0"))
 
     def total_pool_per_period(self) -> Decimal:
-        return self.total_pool_per_slot() * Decimal(self.payouts_per_period or 0)
+        """
+        Compatibility helper. In queue mode period ~= one active payout.
+        """
+        return self.total_pool_per_slot()
 
     def period_start_date(self, period_key: Optional[str] = None) -> Optional[date]:
         period_key = period_key or self.current_period_key()
+
+        if self.payout_frequency == "DAILY":
+            return _parse_day_period_key(period_key)
 
         if self.payout_frequency == "MONTHLY":
             year, month = _parse_month_period_key(period_key)
             return date(year, month, 1)
 
         year, week = _parse_week_period_key(period_key)
-        return date.fromisocalendar(year, week, 1)  # Monday
+        return date.fromisocalendar(year, week, 1)
 
     def period_end_date(self, period_key: Optional[str] = None) -> Optional[date]:
         period_key = period_key or self.current_period_key()
+
+        if self.payout_frequency == "DAILY":
+            return _parse_day_period_key(period_key)
 
         if self.payout_frequency == "MONTHLY":
             year, month = _parse_month_period_key(period_key)
             return _last_day_of_month(year, month)
 
         year, week = _parse_week_period_key(period_key)
-        return date.fromisocalendar(year, week, 7)  # Sunday
+        return date.fromisocalendar(year, week, 7)
 
     def get_slot_due_date(self, period_key: str, slot_no: int) -> Optional[date]:
         """
-        Uses MerrySlotConfig when available.
+        Compatibility helper.
 
-        WEEKLY:
-          - due date is the configured weekday inside that ISO week.
+        Queue-based ROSCA does not rely on multi-slot config anymore.
+        We keep this method because older code/admin may still call it.
 
-        MONTHLY:
-          - due date is the nth occurrence of configured weekday in that month,
-            where n == slot_no. If nth occurrence doesn't exist, falls back to
-            the last occurrence within the month.
+        Active expectation:
+          - slot_no should be 1
+          - due date should resolve to the period date / start date
 
-        If no slot config exists for the slot, returns None.
+        Legacy slot-config support is kept as a fallback.
         """
+        if slot_no == 1:
+            start = self.period_start_date(period_key)
+            return start
+
+        # Legacy fallback path only
         slot_cfg = self.slot_configs.filter(slot_no=slot_no).first()
         if not slot_cfg:
             return None
@@ -242,6 +261,9 @@ class MerryGoRound(models.Model):
                 last_valid = candidate
                 n += 1
             return last_valid
+
+        if self.payout_frequency == "DAILY":
+            return _parse_day_period_key(period_key)
 
         year, week = _parse_week_period_key(period_key)
         monday = date.fromisocalendar(year, week, 1)
@@ -305,14 +327,16 @@ class MerryGoRound(models.Model):
             n += 1
         return picked
 
-    # -------- admin schedule generation --------
+    # -------- compatibility schedule generation --------
     @transaction.atomic
     def ensure_dues_for_period(self, period_key: Optional[str] = None) -> int:
+        """
+        Compatibility helper for older admin/actions.
+
+        Queue-based ROSCA now prepares only one payout event at a time.
+        So even if older code calls this, we generate only slot_no=1 rows.
+        """
         period_key = period_key or self.current_period_key()
-
-        if (self.payouts_per_period or 0) < 1:
-            raise ValidationError("payouts_per_period must be >= 1")
-
         created = 0
         due_amt = self.contribution_amount or Decimal("0")
 
@@ -321,24 +345,23 @@ class MerryGoRound(models.Model):
         )
 
         for seat in active_seats:
-            for slot_no in range(1, self.payouts_per_period + 1):
-                due_date = self.get_slot_due_date(period_key, slot_no)
+            due_date = self.get_slot_due_date(period_key, 1)
 
-                _, was_created = MerryContributionDue.objects.get_or_create(
-                    merry=self,
-                    seat=seat,
-                    period_key=period_key,
-                    slot_no=slot_no,
-                    defaults={
-                        "due_amount": due_amt,
-                        "paid_amount": Decimal("0"),
-                        "status": "PENDING",
-                        "due_date": due_date,
-                        "is_advance_payable": True,
-                    },
-                )
-                if was_created:
-                    created += 1
+            _, was_created = MerryContributionDue.objects.get_or_create(
+                merry=self,
+                seat=seat,
+                period_key=period_key,
+                slot_no=1,
+                defaults={
+                    "due_amount": due_amt,
+                    "paid_amount": Decimal("0"),
+                    "status": "PENDING",
+                    "due_date": due_date,
+                    "is_advance_payable": False,
+                },
+            )
+            if was_created:
+                created += 1
 
         return created
 
@@ -432,9 +455,10 @@ class MerryGoRound(models.Model):
 
 class MerrySlotConfig(models.Model):
     """
-    Example:
-      slot 1 => Monday
-      slot 2 => Friday
+    Legacy compatibility model.
+
+    Queue-based ROSCA does not actively need multi-slot config anymore,
+    but we keep the table/model to avoid destructive migrations right now.
     """
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="slot_configs")
     slot_no = models.PositiveIntegerField()
@@ -449,8 +473,7 @@ class MerrySlotConfig(models.Model):
     def clean(self):
         if self.slot_no < 1:
             raise ValidationError("slot_no must be >= 1")
-        if self.merry and self.slot_no > (self.merry.payouts_per_period or 0):
-            raise ValidationError("slot_no cannot exceed merry.payouts_per_period")
+        # Compatibility: allow legacy rows, but active queue mode should not depend on >1 slots.
 
     def __str__(self):
         return f"{self.merry_id} slot {self.slot_no} => {self.get_weekday_display()}"
@@ -488,13 +511,6 @@ class MerryMember(models.Model):
 # Seats/Shares
 # ----------------------------
 class MerrySeat(models.Model):
-    """
-    Each seat behaves like a separate participation unit:
-      - owes contribution_amount per slot
-      - gets its own payout turn
-
-    seat_no is now GLOBAL inside the merry.
-    """
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="seats")
     member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="seats")
 
@@ -595,9 +611,6 @@ class MerryJoinRequest(models.Model):
                 raise ValidationError(reason)
 
         if self.merry_id and self.user_id:
-            # Only block duplicate active membership when creating a new request.
-            # This avoids admin save failures when historical APPROVED rows are
-            # revalidated while editing the parent merry object.
             if not self.pk:
                 existing_member = MerryMember.objects.filter(
                     merry_id=self.merry_id,
@@ -730,7 +743,7 @@ class MerryJoinRequest(models.Model):
 
 
 # ----------------------------
-# Scheduled slot dues (per seat)
+# Scheduled dues (per seat, compatibility-safe)
 # ----------------------------
 class MerryContributionDue(models.Model):
     STATUS_CHOICES = (
@@ -745,7 +758,7 @@ class MerryContributionDue(models.Model):
     seat = models.ForeignKey(MerrySeat, on_delete=models.CASCADE, related_name="dues")
 
     period_key = models.CharField(max_length=20, db_index=True)
-    slot_no = models.PositiveIntegerField()
+    slot_no = models.PositiveIntegerField(default=1)
 
     due_amount = models.DecimalField(max_digits=12, decimal_places=2)
     paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
@@ -753,7 +766,7 @@ class MerryContributionDue(models.Model):
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="PENDING")
     due_date = models.DateField(null=True, blank=True)
 
-    is_advance_payable = models.BooleanField(default=True)
+    is_advance_payable = models.BooleanField(default=False)
 
     created_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
@@ -775,8 +788,6 @@ class MerryContributionDue(models.Model):
     def clean(self):
         if self.slot_no < 1:
             raise ValidationError("slot_no must be >= 1")
-        if self.seat and self.seat.merry and self.slot_no > (self.seat.merry.payouts_per_period or 0):
-            raise ValidationError("slot_no cannot exceed merry.payouts_per_period")
         if self.merry_id and self.seat_id and self.seat.merry_id != self.merry_id:
             raise ValidationError("Due.merry must match seat.merry")
         if self.due_amount is not None and self.due_amount <= 0:
@@ -920,13 +931,6 @@ class MerryPaymentAllocation(models.Model):
 # Merry Wallet
 # ----------------------------
 class MerryWallet(models.Model):
-    """
-    Stores excess merry money for a user.
-    Example:
-      - user pays 5000 via mus11
-      - 4000 clears active merry dues
-      - 1000 remains here for future merry dues
-    """
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -954,13 +958,6 @@ class MerryWallet(models.Model):
 
 
 class MerryWalletTransaction(models.Model):
-    """
-    Wallet audit trail.
-    CREDIT:
-      - excess payment moved into wallet
-    DEBIT:
-      - wallet used to settle future merry dues
-    """
     TX_TYPES = (
         ("CREDIT", "Credit"),
         ("DEBIT", "Debit"),
@@ -1018,7 +1015,7 @@ class MerryWalletTransaction(models.Model):
 
 
 # ----------------------------
-# Payouts (seat-based)
+# Payouts (seat-based, one active payout at a time)
 # ----------------------------
 class MerryPayout(models.Model):
     STATUS_CHOICES = (
@@ -1065,8 +1062,6 @@ class MerryPayout(models.Model):
             raise ValidationError("Payout.merry must match seat.merry")
         if self.slot_no < 1:
             raise ValidationError("slot_no must be >= 1")
-        if self.merry and self.slot_no > (self.merry.payouts_per_period or 0):
-            raise ValidationError("slot_no cannot exceed merry.payouts_per_period")
         if self.amount is not None and self.amount <= 0:
             raise ValidationError("amount must be > 0")
 

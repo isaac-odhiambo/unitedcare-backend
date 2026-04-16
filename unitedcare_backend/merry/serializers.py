@@ -48,20 +48,31 @@ def parse_bool(v) -> bool:
 def current_period_key_for_merry(merry: MerryGoRound) -> str:
     """
     Must match MerryGoRound.current_period_key():
+      - DAILY   => "YYYY-MM-DD"
       - WEEKLY  => "YYYY-Www"
       - MONTHLY => "YYYY-MM"
     """
-    today = timezone.now().date()
+    today = timezone.localdate()
     freq = (getattr(merry, "payout_frequency", None) or "WEEKLY").upper()
+
+    if freq == "DAILY":
+        return today.isoformat()
+
     if freq == "MONTHLY":
         return f"{today.year}-{today.month:02d}"
+
     iso_year, iso_week, _ = today.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
 
 
 def payouts_per_period(merry: MerryGoRound) -> int:
-    n = int(getattr(merry, "payouts_per_period", 1) or 1)
-    return max(1, n)
+    """
+    Compatibility helper.
+    Active ROSCA flow uses one payout at a time.
+    """
+    if hasattr(merry, "effective_payouts_per_period"):
+        return max(1, int(merry.effective_payouts_per_period() or 1))
+    return 1
 
 
 # -----------------------------
@@ -119,14 +130,11 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
         return str(Decimal(seats) * (obj.contribution_amount or Decimal("0")))
 
     def get_total_pool_per_period(self, obj: MerryGoRound) -> str:
+        # Compatibility: in queue-based ROSCA, one active payout event == one current pool
         if hasattr(obj, "total_pool_per_period"):
             return str(obj.total_pool_per_period())
         seats = obj.seats.filter(is_active=True).count()
-        return str(
-            Decimal(seats)
-            * (obj.contribution_amount or Decimal("0"))
-            * Decimal(obj.payouts_per_period or 1)
-        )
+        return str(Decimal(seats) * (obj.contribution_amount or Decimal("0")))
 
     def get_available_seats(self, obj: MerryGoRound):
         if hasattr(obj, "available_seats"):
@@ -204,6 +212,9 @@ class MerryJoinRequestSerializer(serializers.ModelSerializer):
 
 
 class MerrySlotConfigSerializer(serializers.ModelSerializer):
+    """
+    Legacy compatibility serializer.
+    """
     weekday_name = serializers.CharField(source="get_weekday_display", read_only=True)
 
     class Meta:
@@ -489,14 +500,15 @@ class CreateMerrySerializer(serializers.ModelSerializer):
 
     def validate_payout_frequency(self, value: str):
         v = (value or "WEEKLY").upper()
-        if v not in ("WEEKLY", "MONTHLY"):
-            raise serializers.ValidationError("payout_frequency must be 'WEEKLY' or 'MONTHLY'.")
+        if v not in ("DAILY", "WEEKLY", "MONTHLY"):
+            raise serializers.ValidationError("payout_frequency must be 'DAILY', 'WEEKLY' or 'MONTHLY'.")
         return v
 
     def validate_payouts_per_period(self, value: int):
-        if value < 1 or value > 14:
-            raise serializers.ValidationError("payouts_per_period must be between 1 and 14.")
-        return value
+        # Compatibility: accept the field, but queue-based ROSCA uses one payout at a time.
+        if value < 1:
+            raise serializers.ValidationError("payouts_per_period must be at least 1.")
+        return 1
 
     def validate_max_seats(self, value: int):
         if value < 0:
@@ -506,6 +518,7 @@ class CreateMerrySerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         user = self.context["request"].user
         validated_data["created_by"] = user
+        validated_data["payouts_per_period"] = 1
         return super().create(validated_data)
 
 
@@ -696,7 +709,9 @@ class MerryPaymentBreakdownQuerySerializer(serializers.Serializer):
 
 class CreatePayoutSerializer(serializers.Serializer):
     """
-    Seat-based payout creation
+    Compatibility-safe payout creation.
+
+    Queue-based ROSCA uses one current payout event at a time, so slot_no is fixed to 1.
     """
     seat_id = serializers.IntegerField(min_value=1)
     period_key = serializers.CharField(required=False, allow_blank=True, max_length=50)
@@ -716,36 +731,18 @@ class CreatePayoutSerializer(serializers.Serializer):
         if not period_key:
             period_key = current_period_key_for_merry(merry)
 
-        limit = payouts_per_period(merry)
-
-        slot_no = attrs.get("slot_no")
-        if slot_no is None:
-            used = set(
-                MerryPayout.objects.filter(merry=merry, period_key=period_key)
-                .values_list("slot_no", flat=True)
-            )
-            chosen = None
-            for s in range(1, limit + 1):
-                if s not in used:
-                    chosen = s
-                    break
-            if chosen is None:
-                raise serializers.ValidationError({"slot_no": f"Payout slots full for {period_key}. Max {limit}."})
-            slot_no = chosen
-        else:
-            if slot_no < 1 or slot_no > limit:
-                raise serializers.ValidationError({"slot_no": f"slot_no must be between 1 and {limit}."})
+        slot_no = attrs.get("slot_no", 1)
+        if slot_no != 1:
+            raise serializers.ValidationError({"slot_no": "Queue-based ROSCA uses slot_no = 1 only."})
 
         if MerryPayout.objects.filter(merry=merry, period_key=period_key, slot_no=slot_no).exists():
-            raise serializers.ValidationError("A payout already exists for this period slot.")
+            raise serializers.ValidationError("A payout already exists for this current payout event.")
 
         if MerryPayout.objects.filter(merry=merry, seat=seat, period_key=period_key).exists():
-            raise serializers.ValidationError("This seat already has a payout in this period.")
+            raise serializers.ValidationError("This seat already has a payout in this current payout event.")
 
         compute_amount = parse_bool(attrs.get("compute_amount"))
-        if compute_amount:
-            pass
-        else:
+        if not compute_amount:
             if attrs.get("amount") is None:
                 raise serializers.ValidationError({"amount": "amount is required (or set compute_amount=true)."})
             amt = q2(attrs["amount"])
@@ -755,7 +752,7 @@ class CreatePayoutSerializer(serializers.Serializer):
 
         attrs["seat"] = seat
         attrs["period_key"] = period_key
-        attrs["slot_no"] = slot_no
+        attrs["slot_no"] = 1
         attrs["notes"] = (attrs.get("notes") or "").strip()[:255]
         attrs["compute_amount"] = compute_amount
         return attrs
@@ -772,7 +769,7 @@ class CreatePayoutSerializer(serializers.Serializer):
             merry=merry,
             seat=seat,
             period_key=validated_data["period_key"],
-            slot_no=validated_data["slot_no"],
+            slot_no=1,
             amount=amount,
             status="SCHEDULED",
             notes=validated_data["notes"],

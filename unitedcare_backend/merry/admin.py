@@ -6,7 +6,6 @@ from django.utils.html import format_html
 
 from .models import (
     MerryGoRound,
-    MerrySlotConfig,
     MerryMember,
     MerrySeat,
     MerryJoinRequest,
@@ -21,7 +20,10 @@ from .services import (
     add_seats_to_existing_member,
     reassign_existing_clean_seat,
     confirm_payment_and_allocate,
-    mark_payout_paid,  # ADDED: ensures payout cycle logic is preserved
+    mark_payout_paid,
+    ensure_current_payout_exists,
+    ensure_dues_for_current_payout,
+    get_next_payout_turn,
 )
 
 
@@ -133,7 +135,7 @@ def build_seat_status_table_html(merry):
                                 <th style="border:1px solid #ddd; padding:6px;">Status</th>
                                 <th style="border:1px solid #ddd; padding:6px;">Current / Last Member</th>
                                 <th style="border:1px solid #ddd; padding:6px;">Seat Active</th>
-                                <th style="border:1px solid #ddd; padding:6px;">Payout Position</th>
+                                <th style="border:1px solid #ddd; padding:6px;">Queue Position</th>
                                 <th style="border:1px solid #ddd; padding:6px;">Selection</th>
                             </tr>
                         </thead>
@@ -186,7 +188,7 @@ def build_seat_status_table_html(merry):
                             <th style="border:1px solid #ddd; padding:6px;">Status</th>
                             <th style="border:1px solid #ddd; padding:6px;">Current / Last Member</th>
                             <th style="border:1px solid #ddd; padding:6px;">Seat Active</th>
-                            <th style="border:1px solid #ddd; padding:6px;">Payout Position</th>
+                            <th style="border:1px solid #ddd; padding:6px;">Queue Position</th>
                             <th style="border:1px solid #ddd; padding:6px;">Selection</th>
                         </tr>
                     </thead>
@@ -335,26 +337,37 @@ class MerrySeatAdminForm(forms.ModelForm):
 # =========================================================
 # ACTIONS: MERRY
 # =========================================================
-@admin.action(description="Generate dues for current period")
-def generate_current_period_dues(modeladmin, request, queryset):
-    total_created = 0
+@admin.action(description="Prepare current payout and dues")
+def prepare_current_payout_and_dues(modeladmin, request, queryset):
+    prepared_count = 0
 
     for merry in queryset:
         try:
-            created = merry.ensure_dues_for_period()
-            total_created += created
+            payout = ensure_current_payout_exists(merry_id=merry.id)
+            created = ensure_dues_for_current_payout(merry_id=merry.id)
+            prepared_count += 1
+            modeladmin.message_user(
+                request,
+                (
+                    f"{merry.name}: current payout ready for seat "
+                    f"{payout.seat.seat_no} ({payout.seat.member.user}); "
+                    f"{created} due row(s) prepared."
+                ),
+                level=messages.SUCCESS,
+            )
         except Exception as e:
             modeladmin.message_user(
                 request,
-                f"{merry.name}: failed to generate dues - {e}",
+                f"{merry.name}: failed to prepare current payout - {e}",
                 level=messages.ERROR,
             )
 
-    modeladmin.message_user(
-        request,
-        f"{total_created} due record(s) created for selected merry groups.",
-        level=messages.SUCCESS,
-    )
+    if prepared_count:
+        modeladmin.message_user(
+            request,
+            f"{prepared_count} merry group(s) prepared for the current payout.",
+            level=messages.SUCCESS,
+        )
 
 
 # =========================================================
@@ -512,11 +525,6 @@ def cancel_payouts(modeladmin, request, queryset):
 # =========================================================
 # INLINES
 # =========================================================
-class MerrySlotConfigInline(admin.TabularInline):
-    model = MerrySlotConfig
-    extra = 0
-
-
 class MerryMemberInline(admin.TabularInline):
     model = MerryMember
     extra = 0
@@ -619,23 +627,22 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "created_by",
         "contribution_amount",
         "payout_frequency",
-        "payouts_per_period",
         "payout_order_type",
         "is_open",
         "max_seats",
         "available_seats_display",
+        "current_target_display",
+        "current_due_date_display",
         "next_payout_date",
         "active_members_count",
         "active_seats_count",
-        "total_pool_per_slot_display",
-        "total_pool_per_period_display",
+        "current_pool_display",
         "created_at",
     )
     list_filter = (
         "is_open",
         "payout_order_type",
         "payout_frequency",
-        "payouts_per_period",
         "created_at",
     )
     search_fields = (
@@ -647,15 +654,14 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
     list_select_related = ("created_by",)
     readonly_fields = (
         "created_at",
-        "current_period_key_display",
-        "required_amount_per_seat_per_period_display",
-        "total_pool_per_slot_display",
-        "total_pool_per_period_display",
         "available_seats_display",
+        "current_target_display",
+        "current_due_date_display",
+        "current_pool_display",
+        "queue_summary_display",
     )
-    actions = [generate_current_period_dues]
+    actions = [prepare_current_payout_and_dues]
     inlines = [
-        MerrySlotConfigInline,
         MerryMemberInline,
         MerrySeatInline,
         MerryJoinRequestInline,
@@ -675,7 +681,6 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
             "fields": (
                 "payout_order_type",
                 "payout_frequency",
-                "payouts_per_period",
                 "next_payout_date",
             )
         }),
@@ -686,12 +691,12 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "available_seats_display",
             )
         }),
-        ("Admin Summary", {
+        ("Current Queue Summary", {
             "fields": (
-                "current_period_key_display",
-                "required_amount_per_seat_per_period_display",
-                "total_pool_per_slot_display",
-                "total_pool_per_period_display",
+                "current_target_display",
+                "current_due_date_display",
+                "current_pool_display",
+                "queue_summary_display",
                 "created_at",
             )
         }),
@@ -707,48 +712,60 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
 
     active_seats_count.short_description = "Active Seats"
 
-    def current_period_key_display(self, obj):
-        return obj.current_period_key()
+    def current_target_display(self, obj):
+        try:
+            preview = get_next_payout_turn(merry_id=obj.id)
+            seat_no = preview.get("seat_no")
+            username = preview.get("username") or "-"
+            return f"{username} (Seat {seat_no})"
+        except Exception:
+            return "—"
 
-    current_period_key_display.short_description = "Current Period"
+    current_target_display.short_description = "Current Payout Target"
 
-    def required_amount_per_seat_per_period_display(self, obj):
-        return obj.required_amount_per_seat_per_period()
+    def current_due_date_display(self, obj):
+        try:
+            preview = get_next_payout_turn(merry_id=obj.id)
+            return preview.get("due_date") or preview.get("period_key") or "—"
+        except Exception:
+            return "—"
 
-    required_amount_per_seat_per_period_display.short_description = "Required / Seat / Period"
+    current_due_date_display.short_description = "Current Payout Date"
 
-    def total_pool_per_slot_display(self, obj):
-        return obj.total_pool_per_slot()
+    def current_pool_display(self, obj):
+        try:
+            preview = get_next_payout_turn(merry_id=obj.id)
+            return preview.get("expected_amount") or 0
+        except Exception:
+            try:
+                return obj.total_pool_per_slot()
+            except Exception:
+                return "—"
 
-    total_pool_per_slot_display.short_description = "Pool / Slot"
+    current_pool_display.short_description = "Current Payout Pool"
 
-    def total_pool_per_period_display(self, obj):
-        return obj.total_pool_per_period()
+    def queue_summary_display(self, obj):
+        seats = list(
+            obj.seats.filter(is_active=True)
+            .select_related("member", "member__user")
+            .order_by("payout_position", "seat_no", "id")
+        )
+        if not seats:
+            return "No active seats."
 
-    total_pool_per_period_display.short_description = "Pool / Period"
+        parts = [
+            f"{seat.payout_position or '-'}: {seat.member.user} (Seat {seat.seat_no})"
+            for seat in seats
+        ]
+        return format_html("<br>".join(parts))
+
+    queue_summary_display.short_description = "Queue Order"
 
     def available_seats_display(self, obj):
         v = obj.available_seats()
         return "Unlimited" if v is None else v
 
     available_seats_display.short_description = "Available Seats"
-
-
-# =========================================================
-# SLOT CONFIG ADMIN
-# =========================================================
-@admin.register(MerrySlotConfig)
-class MerrySlotConfigAdmin(admin.ModelAdmin):
-    list_display = (
-        "id",
-        "merry",
-        "slot_no",
-        "weekday",
-    )
-    list_filter = ("weekday", "merry")
-    search_fields = ("merry__name",)
-    ordering = ("merry", "slot_no")
-    list_select_related = ("merry",)
 
 
 # =========================================================
