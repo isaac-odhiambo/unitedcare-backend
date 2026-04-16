@@ -2598,6 +2598,199 @@ def _get_member_merry_loan_offset_summary(*, merry: MerryGoRound, member: MerryM
     }
 
 
+
+def _member_display_name_for_seat(seat: Optional[MerrySeat]) -> str:
+    if not seat:
+        return "Member"
+
+    member = getattr(seat, "member", None)
+    user = getattr(member, "user", None)
+
+    return (
+        getattr(user, "username", None)
+        or getattr(user, "full_name", None)
+        or getattr(user, "phone", None)
+        or f"Seat {getattr(seat, 'seat_no', '—')}"
+    )
+
+
+def _resolve_due_target_seat(
+    *,
+    merry: MerryGoRound,
+    due: MerryContributionDue,
+) -> Optional[MerrySeat]:
+    """
+    Best-effort resolver for: who is this due paying for?
+
+    Priority:
+    1. Exact payout record for (merry, period_key, slot_no)
+    2. Active seat whose payout_position matches slot_no
+    3. None
+    """
+    payout = (
+        MerryPayout.objects.filter(
+            merry=merry,
+            period_key=due.period_key,
+            slot_no=due.slot_no,
+        )
+        .select_related("seat", "seat__member", "seat__member__user")
+        .first()
+    )
+    if payout and getattr(payout, "seat", None):
+        return payout.seat
+
+    fallback_seat = (
+        MerrySeat.objects.filter(
+            merry=merry,
+            is_active=True,
+            payout_position=due.slot_no,
+        )
+        .select_related("member", "member__user")
+        .order_by("seat_no", "id")
+        .first()
+    )
+    if fallback_seat:
+        return fallback_seat
+
+    return None
+
+
+def _append_member_breakdown(
+    bucket_map: Dict[str, Dict[str, Any]],
+    *,
+    seat: Optional[MerrySeat],
+    amount: Decimal,
+    bucket: str,
+) -> None:
+    member = getattr(seat, "member", None)
+    user = getattr(member, "user", None)
+
+    key = f"{getattr(member, 'id', 'none')}::{getattr(seat, 'id', 'none')}::{bucket}"
+    if key not in bucket_map:
+        bucket_map[key] = {
+            "target_member_id": getattr(member, "id", None),
+            "target_user_id": getattr(user, "id", None),
+            "target_member_name": _member_display_name_for_seat(seat),
+            "seat_id": getattr(seat, "id", None),
+            "seat_no": getattr(seat, "seat_no", None),
+            "bucket": bucket,
+            "amount": Decimal("0.00"),
+            "count": 0,
+        }
+
+    bucket_map[key]["amount"] = q2(bucket_map[key]["amount"] + q2(amount))
+    bucket_map[key]["count"] += 1
+
+
+def _member_display_name_for_seat(seat: Optional[MerrySeat]) -> str:
+    if not seat:
+        return "Member"
+
+    member = getattr(seat, "member", None)
+    user = getattr(member, "user", None)
+
+    return (
+        getattr(user, "username", None)
+        or getattr(user, "full_name", None)
+        or getattr(user, "phone", None)
+        or f"Seat {getattr(seat, 'seat_no', '—')}"
+    )
+
+
+def _resolve_due_target_seat(
+    *,
+    merry: MerryGoRound,
+    due: MerryContributionDue,
+) -> Optional[MerrySeat]:
+    """
+    Resolve who this due is paying for.
+
+    Priority:
+    1. Exact payout record for (merry, period_key, slot_no)
+    2. Active seat whose payout_position matches slot_no
+    3. None
+    """
+    payout = (
+        MerryPayout.objects.filter(
+            merry=merry,
+            period_key=due.period_key,
+            slot_no=due.slot_no,
+        )
+        .select_related("seat", "seat__member", "seat__member__user")
+        .first()
+    )
+    if payout and getattr(payout, "seat", None):
+        return payout.seat
+
+    fallback_seat = (
+        MerrySeat.objects.filter(
+            merry=merry,
+            is_active=True,
+            payout_position=due.slot_no,
+        )
+        .select_related("member", "member__user")
+        .order_by("seat_no", "id")
+        .first()
+    )
+    if fallback_seat:
+        return fallback_seat
+
+    return None
+
+
+def _append_member_breakdown(
+    bucket_map: Dict[str, Dict[str, Any]],
+    *,
+    seat: Optional[MerrySeat],
+    amount: Decimal,
+    bucket: str,
+) -> None:
+    member = getattr(seat, "member", None)
+    user = getattr(member, "user", None)
+
+    key = f"{getattr(member, 'id', 'none')}::{getattr(seat, 'id', 'none')}::{bucket}"
+    if key not in bucket_map:
+        bucket_map[key] = {
+            "target_member_id": getattr(member, "id", None),
+            "target_user_id": getattr(user, "id", None),
+            "target_member_name": _member_display_name_for_seat(seat),
+            "seat_id": getattr(seat, "id", None),
+            "seat_no": getattr(seat, "seat_no", None),
+            "bucket": bucket,
+            "amount": Decimal("0.00"),
+            "count": 0,
+        }
+
+    bucket_map[key]["amount"] = q2(bucket_map[key]["amount"] + q2(amount))
+    bucket_map[key]["count"] += 1
+
+
+def _sorted_member_breakdown_rows(
+    rows_map: Dict[str, Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    rows = list(rows_map.values())
+    rows.sort(
+        key=lambda row: (
+            str(row.get("target_member_name") or "").lower(),
+            row.get("seat_no") or 0,
+        )
+    )
+
+    return [
+        {
+            "target_member_id": row.get("target_member_id"),
+            "target_user_id": row.get("target_user_id"),
+            "target_member_name": row.get("target_member_name"),
+            "seat_id": row.get("seat_id"),
+            "seat_no": row.get("seat_no"),
+            "bucket": row.get("bucket"),
+            "amount": q2(row.get("amount") or Decimal("0.00")),
+            "count": row.get("count", 0),
+        }
+        for row in rows
+    ]
+
+
 def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
     merry = get_merry(merry_id)
     member = get_active_member(merry, user)
@@ -2630,6 +2823,9 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
     next_total = Decimal("0.00")
     next_due_date = None
 
+    required_now_member_map: Dict[str, Dict[str, Any]] = {}
+    advance_member_map: Dict[str, Dict[str, Any]] = {}
+
     for due in selected_dues:
         outstanding = _outstanding_amount(due)
         if outstanding <= 0:
@@ -2637,17 +2833,7 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
 
         bucket = _due_bucket(due, today=today)
 
-        seat_member = due.seat.member
-        seat_user = getattr(seat_member, "user", None)
-
-        target_member_name = (
-            getattr(seat_user, "username", None)
-            or getattr(seat_user, "full_name", None)
-            or getattr(seat_user, "phone", None)
-            or f"Seat {due.seat.seat_no}"
-        )
-
-        row = {
+        raw_row = {
             "due_id": due.id,
             "seat_id": due.seat_id,
             "seat_no": due.seat.seat_no,
@@ -2661,23 +2847,43 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "balance": outstanding,
             "outstanding": outstanding,
             "bucket": bucket,
-            "target_member_id": seat_member.id if seat_member else None,
-            "target_user_id": seat_user.id if seat_user else None,
-            "target_member_name": target_member_name,
         }
+
+        target_seat = _resolve_due_target_seat(merry=merry, due=due)
 
         if bucket == "overdue":
             overdue_total += outstanding
-            overdue_items.append(row)
+            overdue_items.append(raw_row)
+            _append_member_breakdown(
+                required_now_member_map,
+                seat=target_seat,
+                amount=outstanding,
+                bucket="overdue",
+            )
+
         elif bucket == "current":
             current_total += outstanding
-            current_items.append(row)
+            current_items.append(raw_row)
+            _append_member_breakdown(
+                required_now_member_map,
+                seat=target_seat,
+                amount=outstanding,
+                bucket="current",
+            )
+
         elif bucket == "future" and getattr(due, "is_advance_payable", True):
             if next_due_date is None:
                 next_due_date = due.due_date
+
             if due.due_date == next_due_date:
                 next_total += outstanding
-                next_items.append(row)
+                next_items.append(raw_row)
+                _append_member_breakdown(
+                    advance_member_map,
+                    seat=target_seat,
+                    amount=outstanding,
+                    bucket="future",
+                )
 
     overdue_total = q2(overdue_total)
     current_total = q2(current_total)
@@ -2685,6 +2891,9 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
     required_now = q2(overdue_total + current_total)
     pay_with_next = q2(required_now + next_total)
     wallet_balance = q2(get_user_merry_wallet_balance(user=user))
+
+    required_now_members = _sorted_member_breakdown_rows(required_now_member_map)
+    advance_members = _sorted_member_breakdown_rows(advance_member_map)
 
     next_turn = _get_member_next_turn(merry=merry, member=member)
     loan_offset = _get_member_merry_loan_offset_summary(merry=merry, member=member)
@@ -2702,7 +2911,9 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "seat_no": current_or_next_payout.seat.seat_no,
             "member_id": current_or_next_payout.seat.member_id,
             "user_id": current_or_next_payout.seat.member.user_id,
-            "username": getattr(current_or_next_payout.seat.member.user, "username", None),
+            "username": getattr(
+                current_or_next_payout.seat.member.user, "username", None
+            ),
             "period_key": current_or_next_payout.period_key,
             "period_label": payout_period_meta["label"],
             "slot_no": current_or_next_payout.slot_no,
@@ -2762,6 +2973,8 @@ def get_member_merry_dashboard(*, user, merry_id: int) -> Dict[str, Any]:
             "overdue_items": overdue_items,
             "current_items": current_items,
             "next_items": next_items,
+            "required_now_members": required_now_members,
+            "advance_members": advance_members,
         },
         "current_turn": payout_summary,
         "my_turn": next_turn,
