@@ -553,7 +553,35 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
     - reference is authoritative
     - phone mismatch should not block allocation
     """
+        # Prevent re-processing if already allocated
+    if tx.allocation_status in ("AUTO_ALLOCATED", "MANUALLY_ALLOCATED"):
+        return
+
+    # Prevent duplicate merry allocation for the same Mpesa receipt
+    try:
+        from merry.models import MerryPayment
+    except Exception:
+        MerryPayment = None
+
+    receipt = (tx.mpesa_receipt_number or "").strip()
+    if receipt and MerryPayment is not None:
+        existing_payment = (
+            MerryPayment.objects.select_for_update()
+            .filter(mpesa_receipt_number=receipt)
+            .order_by("-id")
+            .first()
+        )
+        if existing_payment:
+            _update_tx_allocation(
+                tx,
+                status="AUTO_ALLOCATED",
+                notes="Merry contribution already allocated earlier for this receipt.",
+            )
+            return
+
+    
     parsed = _parse_reference(tx.reference or "")
+
 
     if parsed.valid and parsed.kind == "MERRY_USER" and parsed.entity_id:
         try:

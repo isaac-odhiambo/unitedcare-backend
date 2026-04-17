@@ -839,7 +839,7 @@ class MyMerryDuesView(APIView):
             )
             .exclude(status__in=["PAID", "CANCELLED"])
             .select_related("seat", "payout")
-            .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+            .order_by("due_date", "seat__seat_no", "id")
         )
 
         data = [

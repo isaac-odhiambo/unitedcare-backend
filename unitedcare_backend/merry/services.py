@@ -681,8 +681,8 @@ def _get_member_next_future_dues(member: MerryMember) -> List[MerryContributionD
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
             due_date__gt=timezone.localdate(),
         )
-        .select_related("seat", "merry", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+        .select_related("seat", "merry")
+        .order_by("due_date", "seat__seat_no", "id")
     )
 
 
@@ -704,8 +704,8 @@ def _select_member_dues_for_breakdown(
             payout__isnull=True,
             due_date__isnull=True,
         )
-        .select_related("seat", "merry", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+        .select_related("seat", "merry")
+        .order_by("due_date", "seat__seat_no", "id")
     )
 
     if not include_next:
@@ -736,8 +736,8 @@ def _select_member_dues_for_payment(
             payout__isnull=True,
             due_date__isnull=True,
         )
-        .select_related("seat", "merry", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+        .select_related("seat", "merry")
+        .order_by("due_date", "seat__seat_no", "id")
     )
 
     if not include_next:
@@ -1242,8 +1242,8 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
             payout__isnull=True,
             due_date__isnull=True,
         )
-        .select_related("seat", "merry", "seat__member", "seat__member__user", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+        .select_related("seat", "merry", "seat__member", "seat__member__user")
+        .order_by("due_date", "seat__seat_no", "id")
     )
     _refresh_penalties_for_queryset(dues)
     return dues
@@ -1265,8 +1265,8 @@ def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContribution
             payout__isnull=True,
             due_date__isnull=True,
         )
-        .select_related("seat", "merry", "seat__member", "seat__member__user", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+        .select_related("seat", "merry", "seat__member", "seat__member__user")
+        .order_by("due_date", "seat__seat_no", "id")
     )
     _refresh_penalties_for_queryset(dues)
     return dues
@@ -2150,17 +2150,20 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
         raise BadState("Payment amount must be > 0.")
 
     dues = list(
-        MerryContributionDue.objects.select_for_update()
-        .filter(
-            merry=merry,
-            seat__member=member,
-            seat__is_active=True,
-            status__in=["PENDING", "PARTIAL", "OVERDUE"],
-        )
-        .select_related("seat", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+    MerryContributionDue.objects.select_for_update()
+    .filter(
+        merry=merry,
+        seat__member=member,
+        seat__is_active=True,
+        status__in=["PENDING", "PARTIAL", "OVERDUE"],
     )
-
+    .exclude(
+        payout__isnull=True,
+        due_date__isnull=True,
+    )
+    .select_related("seat")
+    .order_by("due_date", "seat__seat_no", "id")
+)
     _refresh_penalties_for_queryset(dues)
 
     for due in dues:
@@ -2543,7 +2546,7 @@ def list_dues_for_member(*, user, merry_id: int, period_key: Optional[str] = Non
         )
         .exclude(status__in=["PAID", "CANCELLED"])
         .select_related("seat", "payout")
-        .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+        .order_by("due_date", "seat__seat_no", "id")
     )
     _refresh_penalties_for_queryset(dues)
     return dues
@@ -2597,7 +2600,7 @@ def get_user_merry_due_summary(*, user) -> Dict[str, Any]:
             )
             .exclude(status__in=["PAID", "CANCELLED"])
             .select_related("seat", "payout")
-            .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
+            .order_by("due_date", "seat__seat_no", "id")
         )
 
         _refresh_penalties_for_queryset(dues)
