@@ -660,6 +660,10 @@ def _select_member_dues_for_breakdown(
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
         )
+        .exclude(
+            payout__isnull=True,
+            due_date__isnull=True,
+        )
         .select_related("seat", "merry", "payout")
         .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
     )
@@ -687,6 +691,10 @@ def _select_member_dues_for_payment(
             seat__member=member,
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
+        )
+        .exclude(
+            payout__isnull=True,
+            due_date__isnull=True,
         )
         .select_related("seat", "merry", "payout")
         .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
@@ -1167,6 +1175,10 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
         )
+        .exclude(
+            payout__isnull=True,
+            due_date__isnull=True,
+        )
         .select_related("seat", "merry", "seat__member", "seat__member__user", "payout")
         .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
     )
@@ -1185,6 +1197,10 @@ def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContribution
             seat__member=member,
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
+        )
+        .exclude(
+            payout__isnull=True,
+            due_date__isnull=True,
         )
         .select_related("seat", "merry", "seat__member", "seat__member__user", "payout")
         .order_by("due_date", "payout__turn_no", "seat__seat_no", "id")
