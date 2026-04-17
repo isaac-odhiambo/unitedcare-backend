@@ -572,12 +572,16 @@ class MerryContributionDueInline(admin.TabularInline):
     extra = 0
     fields = (
         "seat",
+        "payout",
         "period_key",
         "slot_no",
+        "base_amount",
+        "penalty_amount",
         "due_amount",
         "paid_amount",
         "status",
         "due_date",
+        "days_overdue",
         "is_advance_payable",
         "updated_at",
     )
@@ -587,7 +591,17 @@ class MerryContributionDueInline(admin.TabularInline):
 class MerryPayoutInline(admin.TabularInline):
     model = MerryPayout
     extra = 0
-    fields = ("seat", "period_key", "slot_no", "amount", "status", "paid_at")
+    fields = (
+        "seat",
+        "turn_no",
+        "cycle_no",
+        "scheduled_date",
+        "period_key",
+        "slot_no",
+        "amount",
+        "status",
+        "paid_at",
+    )
     readonly_fields = ("paid_at",)
 
 
@@ -628,6 +642,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "contribution_amount",
         "payout_frequency",
         "payout_order_type",
+        "penalty_mode",
         "is_open",
         "max_seats",
         "available_seats_display",
@@ -643,6 +658,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "is_open",
         "payout_order_type",
         "payout_frequency",
+        "penalty_mode",
         "created_at",
     )
     search_fields = (
@@ -682,6 +698,15 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "payout_order_type",
                 "payout_frequency",
                 "next_payout_date",
+            )
+        }),
+        ("Penalty Policy", {
+            "fields": (
+                "penalty_mode",
+                "flat_penalty_amount",
+                "daily_penalty_amount",
+                "penalty_grace_days",
+                "penalty_cap_amount",
             )
         }),
         ("Joining / Capacity", {
@@ -1142,13 +1167,19 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "merry",
+        "payout",
+        "turn_no_display",
+        "cycle_no_display",
         "seat",
         "seat_user_display",
         "period_key",
         "slot_no",
+        "base_amount",
+        "penalty_amount",
         "due_amount",
         "paid_amount",
         "outstanding_display",
+        "days_overdue",
         "status",
         "due_date",
         "is_advance_payable",
@@ -1161,6 +1192,7 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "merry",
         "due_date",
         "is_advance_payable",
+        "days_overdue",
     )
     search_fields = (
         "merry__name",
@@ -1169,9 +1201,39 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "period_key",
     )
     ordering = ("due_date", "slot_no", "id")
-    list_select_related = ("merry", "seat", "seat__member", "seat__member__user")
+    list_select_related = ("merry", "seat", "seat__member", "seat__member__user", "payout")
     readonly_fields = ("created_at", "updated_at")
     actions = [cancel_dues, recalc_due_statuses]
+
+    fieldsets = (
+        ("Core", {
+            "fields": (
+                "merry",
+                "seat",
+                "payout",
+                "period_key",
+                "slot_no",
+                "due_date",
+                "status",
+            )
+        }),
+        ("Amounts", {
+            "fields": (
+                "base_amount",
+                "penalty_amount",
+                "due_amount",
+                "paid_amount",
+                "days_overdue",
+                "is_advance_payable",
+            )
+        }),
+        ("Meta", {
+            "fields": (
+                "created_at",
+                "updated_at",
+            )
+        }),
+    )
 
     def seat_user_display(self, obj):
         return obj.seat.member.user
@@ -1182,6 +1244,16 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         return obj.outstanding()
 
     outstanding_display.short_description = "Outstanding"
+
+    def turn_no_display(self, obj):
+        return getattr(obj.payout, "turn_no", None)
+
+    turn_no_display.short_description = "Turn No"
+
+    def cycle_no_display(self, obj):
+        return getattr(obj.payout, "cycle_no", None)
+
+    cycle_no_display.short_description = "Cycle No"
 
 
 # =========================================================
@@ -1378,6 +1450,9 @@ class MerryPayoutAdmin(admin.ModelAdmin):
         "merry",
         "seat",
         "seat_user_display",
+        "turn_no",
+        "cycle_no",
+        "scheduled_date",
         "period_key",
         "slot_no",
         "amount",
@@ -1392,6 +1467,8 @@ class MerryPayoutAdmin(admin.ModelAdmin):
         "paid_at",
         "created_at",
         "merry",
+        "turn_no",
+        "cycle_no",
     )
     search_fields = (
         "merry__name",
@@ -1400,7 +1477,7 @@ class MerryPayoutAdmin(admin.ModelAdmin):
         "period_key",
         "notes",
     )
-    ordering = ("-id",)
+    ordering = ("-turn_no", "-id")
     list_select_related = ("merry", "seat", "seat__member", "seat__member__user")
     readonly_fields = ("created_at", "paid_at")
     actions = [
@@ -1415,6 +1492,9 @@ class MerryPayoutAdmin(admin.ModelAdmin):
             "fields": (
                 "merry",
                 "seat",
+                "turn_no",
+                "cycle_no",
+                "scheduled_date",
                 "period_key",
                 "slot_no",
                 "amount",

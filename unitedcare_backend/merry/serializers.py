@@ -25,7 +25,7 @@ from .models import (
 # Small utilities
 # -----------------------------
 def q2(value: Decimal) -> Decimal:
-    return value.quantize(Decimal("0.01"))
+    return Decimal(str(value or "0")).quantize(Decimal("0.01"))
 
 
 def parse_decimal(value, field_name: str) -> Decimal:
@@ -99,6 +99,11 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
             "is_open",
             "max_seats",
             "available_seats",
+            "penalty_mode",
+            "flat_penalty_amount",
+            "daily_penalty_amount",
+            "penalty_grace_days",
+            "penalty_cap_amount",
             "created_by",
             "created_at",
             "members_count",
@@ -130,7 +135,6 @@ class MerryGoRoundSerializer(serializers.ModelSerializer):
         return str(Decimal(seats) * (obj.contribution_amount or Decimal("0")))
 
     def get_total_pool_per_period(self, obj: MerryGoRound) -> str:
-        # Compatibility: in queue-based ROSCA, one active payout event == one current pool
         if hasattr(obj, "total_pool_per_period"):
             return str(obj.total_pool_per_period())
         seats = obj.seats.filter(is_active=True).count()
@@ -174,6 +178,7 @@ class MerryMemberSerializer(serializers.ModelSerializer):
 class MerrySeatSerializer(serializers.ModelSerializer):
     username = serializers.CharField(source="member.user.username", read_only=True)
     phone = serializers.CharField(source="member.user.phone", read_only=True)
+    joined_at = serializers.DateTimeField(source="member.joined_at", read_only=True)
 
     class Meta:
         model = MerrySeat
@@ -187,12 +192,15 @@ class MerrySeatSerializer(serializers.ModelSerializer):
             "created_at",
             "username",
             "phone",
+            "joined_at",
         ]
         read_only_fields = fields
 
 
 class MerryJoinRequestSerializer(serializers.ModelSerializer):
     merry_name = serializers.CharField(source="merry.name", read_only=True)
+    username = serializers.CharField(source="user.username", read_only=True)
+    phone = serializers.CharField(source="user.phone", read_only=True)
 
     class Meta:
         model = MerryJoinRequest
@@ -201,6 +209,8 @@ class MerryJoinRequestSerializer(serializers.ModelSerializer):
             "merry",
             "merry_name",
             "user",
+            "username",
+            "phone",
             "status",
             "note",
             "requested_seats",
@@ -229,6 +239,16 @@ class MerryContributionDueSerializer(serializers.ModelSerializer):
     user_id = serializers.IntegerField(source="seat.member.user_id", read_only=True)
     username = serializers.CharField(source="seat.member.user.username", read_only=True)
     phone = serializers.CharField(source="seat.member.user.phone", read_only=True)
+
+    payout_id = serializers.IntegerField(source="payout.id", read_only=True)
+    turn_no = serializers.IntegerField(source="payout.turn_no", read_only=True)
+    cycle_no = serializers.IntegerField(source="payout.cycle_no", read_only=True)
+    scheduled_date = serializers.DateField(source="payout.scheduled_date", read_only=True)
+
+    base_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    penalty_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    days_overdue = serializers.IntegerField(read_only=True)
+
     outstanding = serializers.SerializerMethodField()
 
     class Meta:
@@ -242,13 +262,21 @@ class MerryContributionDueSerializer(serializers.ModelSerializer):
             "user_id",
             "username",
             "phone",
+            "payout",
+            "payout_id",
+            "turn_no",
+            "cycle_no",
+            "scheduled_date",
             "period_key",
             "slot_no",
+            "base_amount",
+            "penalty_amount",
             "due_amount",
             "paid_amount",
             "outstanding",
             "status",
             "due_date",
+            "days_overdue",
             "is_advance_payable",
             "updated_at",
             "created_at",
@@ -300,6 +328,8 @@ class MerryPaymentAllocationSerializer(serializers.ModelSerializer):
     due_period_key = serializers.CharField(source="due.period_key", read_only=True)
     due_slot_no = serializers.IntegerField(source="due.slot_no", read_only=True)
     due_seat_no = serializers.IntegerField(source="due.seat.seat_no", read_only=True)
+    due_turn_no = serializers.IntegerField(source="due.payout.turn_no", read_only=True)
+    due_cycle_no = serializers.IntegerField(source="due.payout.cycle_no", read_only=True)
 
     class Meta:
         model = MerryPaymentAllocation
@@ -311,6 +341,8 @@ class MerryPaymentAllocationSerializer(serializers.ModelSerializer):
             "due_period_key",
             "due_slot_no",
             "due_seat_no",
+            "due_turn_no",
+            "due_cycle_no",
             "amount_allocated",
             "created_at",
         ]
@@ -338,6 +370,9 @@ class MerryPayoutSerializer(serializers.ModelSerializer):
             "user_id",
             "username",
             "phone",
+            "turn_no",
+            "cycle_no",
+            "scheduled_date",
             "period_key",
             "slot_no",
             "amount",
@@ -396,16 +431,20 @@ class MerryWalletTransactionSerializer(serializers.ModelSerializer):
 # -----------------------------
 class MerryDueItemBreakdownSerializer(serializers.Serializer):
     due_id = serializers.IntegerField()
-    seat_id = serializers.IntegerField()
+    payout_id = serializers.IntegerField(required=False, allow_null=True)
+    turn_no = serializers.IntegerField(required=False, allow_null=True)
+    cycle_no = serializers.IntegerField(required=False, allow_null=True)
     seat_no = serializers.IntegerField()
     period_key = serializers.CharField()
-    slot_no = serializers.IntegerField()
     due_date = serializers.DateField(allow_null=True)
     status = serializers.CharField()
+    base_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
+    penalty_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     due_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     paid_amount = serializers.DecimalField(max_digits=12, decimal_places=2)
     outstanding = serializers.DecimalField(max_digits=12, decimal_places=2)
-    bucket = serializers.CharField()
+    days_overdue = serializers.IntegerField(required=False)
+    bucket = serializers.CharField(required=False)
 
 
 class MerryPerGroupSummarySerializer(serializers.Serializer):
@@ -414,23 +453,29 @@ class MerryPerGroupSummarySerializer(serializers.Serializer):
     seat_count = serializers.IntegerField()
     seat_numbers = serializers.ListField(child=serializers.IntegerField())
     amount_per_seat = serializers.DecimalField(max_digits=12, decimal_places=2)
-    overdue = serializers.DecimalField(max_digits=12, decimal_places=2)
-    current_due = serializers.DecimalField(max_digits=12, decimal_places=2)
-    next_due = serializers.DecimalField(max_digits=12, decimal_places=2)
+
+    current_turn = serializers.DictField(required=False)
+
+    overdue_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    current_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    next_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_due_now = serializers.DecimalField(max_digits=12, decimal_places=2)
+
     next_due_date = serializers.DateField(allow_null=True)
-    required_now = serializers.DecimalField(max_digits=12, decimal_places=2)
-    pay_with_next = serializers.DecimalField(max_digits=12, decimal_places=2)
+    next_due_rows_count = serializers.IntegerField(required=False)
+    wallet_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+    breakdown = MerryDueItemBreakdownSerializer(many=True, required=False)
 
 
 class MyAllMerryDueSummarySerializer(serializers.Serializer):
     active_merries = serializers.IntegerField()
     total_seats = serializers.IntegerField()
-    total_overdue = serializers.DecimalField(max_digits=12, decimal_places=2)
-    total_current_due = serializers.DecimalField(max_digits=12, decimal_places=2)
-    total_next_due = serializers.DecimalField(max_digits=12, decimal_places=2)
-    total_required_now = serializers.DecimalField(max_digits=12, decimal_places=2)
-    total_pay_with_next = serializers.DecimalField(max_digits=12, decimal_places=2)
-    total_wallet_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
+    overdue_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    current_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    next_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_due_now = serializers.DecimalField(max_digits=12, decimal_places=2)
+    wallet_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
     items = MerryPerGroupSummarySerializer(many=True)
 
 
@@ -441,15 +486,14 @@ class MerryPaymentBreakdownSerializer(serializers.Serializer):
     seat_numbers = serializers.ListField(child=serializers.IntegerField())
     amount_per_seat = serializers.DecimalField(max_digits=12, decimal_places=2)
     include_next = serializers.BooleanField()
-    overdue = serializers.DecimalField(max_digits=12, decimal_places=2)
-    current_due = serializers.DecimalField(max_digits=12, decimal_places=2)
-    next_due = serializers.DecimalField(max_digits=12, decimal_places=2)
+    overdue_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    current_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    next_total = serializers.DecimalField(max_digits=12, decimal_places=2)
     next_due_date = serializers.DateField(allow_null=True)
-    required_now = serializers.DecimalField(max_digits=12, decimal_places=2)
-    pay_with_next = serializers.DecimalField(max_digits=12, decimal_places=2)
+    total_due_now = serializers.DecimalField(max_digits=12, decimal_places=2)
     wallet_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
-    net_required_now_after_wallet = serializers.DecimalField(max_digits=14, decimal_places=2)
-    selected_total = serializers.DecimalField(max_digits=12, decimal_places=2)
+    net_required_now_after_wallet = serializers.DecimalField(max_digits=14, decimal_places=2, required=False)
+    selected_total = serializers.DecimalField(max_digits=12, decimal_places=2, required=False)
     items = MerryDueItemBreakdownSerializer(many=True)
 
 
@@ -459,6 +503,31 @@ class MerryPaymentBreakdownSerializer(serializers.Serializer):
 class CreateMerrySerializer(serializers.ModelSerializer):
     is_open = serializers.BooleanField(required=False, default=True)
     max_seats = serializers.IntegerField(required=False, min_value=0, default=0)
+
+    penalty_mode = serializers.ChoiceField(
+        choices=["NONE", "FLAT", "DAILY"],
+        required=False,
+        default="NONE",
+    )
+    flat_penalty_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        default=Decimal("0.00"),
+    )
+    daily_penalty_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        default=Decimal("0.00"),
+    )
+    penalty_grace_days = serializers.IntegerField(required=False, min_value=0, default=0)
+    penalty_cap_amount = serializers.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = MerryGoRound
@@ -472,6 +541,11 @@ class CreateMerrySerializer(serializers.ModelSerializer):
             "payouts_per_period",
             "is_open",
             "max_seats",
+            "penalty_mode",
+            "flat_penalty_amount",
+            "daily_penalty_amount",
+            "penalty_grace_days",
+            "penalty_cap_amount",
         ]
 
     def validate_name(self, value: str):
@@ -505,7 +579,6 @@ class CreateMerrySerializer(serializers.ModelSerializer):
         return v
 
     def validate_payouts_per_period(self, value: int):
-        # Compatibility: accept the field, but queue-based ROSCA uses one payout at a time.
         if value < 1:
             raise serializers.ValidationError("payouts_per_period must be at least 1.")
         return 1
@@ -514,6 +587,43 @@ class CreateMerrySerializer(serializers.ModelSerializer):
         if value < 0:
             raise serializers.ValidationError("max_seats cannot be negative.")
         return value
+
+    def validate_flat_penalty_amount(self, value: Decimal):
+        v = q2(value)
+        if v < 0:
+            raise serializers.ValidationError("flat_penalty_amount cannot be negative.")
+        return v
+
+    def validate_daily_penalty_amount(self, value: Decimal):
+        v = q2(value)
+        if v < 0:
+            raise serializers.ValidationError("daily_penalty_amount cannot be negative.")
+        return v
+
+    def validate_penalty_cap_amount(self, value):
+        if value in (None, ""):
+            return None
+        v = q2(value)
+        if v < 0:
+            raise serializers.ValidationError("penalty_cap_amount cannot be negative.")
+        return v
+
+    def validate(self, attrs):
+        penalty_mode = (attrs.get("penalty_mode") or "NONE").upper()
+        flat_penalty_amount = q2(attrs.get("flat_penalty_amount") or Decimal("0.00"))
+        daily_penalty_amount = q2(attrs.get("daily_penalty_amount") or Decimal("0.00"))
+
+        if penalty_mode == "FLAT" and flat_penalty_amount <= 0:
+            raise serializers.ValidationError(
+                {"flat_penalty_amount": "flat_penalty_amount must be greater than 0 when penalty_mode is FLAT."}
+            )
+
+        if penalty_mode == "DAILY" and daily_penalty_amount <= 0:
+            raise serializers.ValidationError(
+                {"daily_penalty_amount": "daily_penalty_amount must be greater than 0 when penalty_mode is DAILY."}
+            )
+
+        return attrs
 
     def create(self, validated_data):
         user = self.context["request"].user

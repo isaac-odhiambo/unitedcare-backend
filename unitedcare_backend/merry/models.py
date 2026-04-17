@@ -1,18 +1,19 @@
 # merry/models.py
-# ROSCA compatibility version
+# ROSCA turn-linked compatibility version
 # ---------------------------------------------------------
 # Goals:
 # - Keep existing tables/fields as compatible as possible
-# - Align helpers and validation with queue-based ROSCA flow
+# - Preserve unrelated wallet / payment / join-request logic
+# - Add turn-linked payout structure for true ROSCA history
+# - Add penalty policy on merry creation
 # - Allow DAILY / WEEKLY / MONTHLY payout frequency
-# - Keep slot_no / payouts_per_period for migration safety,
-#   but treat the active business flow as one payout at a time
-# - Keep seat, join request, wallet, payment, payout models intact
+# - Keep period_key / slot_no / payouts_per_period for migration safety
+# - Support full migration of old dues/payouts into turn-linked structure
 # ---------------------------------------------------------
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -35,6 +36,10 @@ WEEKDAY_CHOICES = (
     (5, "Saturday"),
     (6, "Sunday"),
 )
+
+
+def q2(value) -> Decimal:
+    return Decimal(str(value or "0")).quantize(Decimal("0.01"))
 
 
 def _week_period_key(d=None) -> str:
@@ -100,6 +105,16 @@ def _last_day_of_month(year: int, month: int) -> date:
     return date(year, month + 1, 1) - timedelta(days=1)
 
 
+def _date_only(value) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    return None
+
+
 # ----------------------------
 # Core Merry
 # ----------------------------
@@ -115,6 +130,12 @@ class MerryGoRound(models.Model):
         ("MONTHLY", "Monthly"),
     )
 
+    PENALTY_MODES = (
+        ("NONE", "None"),
+        ("FLAT", "Flat"),
+        ("DAILY", "Daily"),
+    )
+
     name = models.CharField(max_length=255)
     contribution_amount = models.DecimalField(max_digits=12, decimal_places=2)  # per seat per payout
     cycle_duration_weeks = models.PositiveIntegerField(default=1)
@@ -123,7 +144,7 @@ class MerryGoRound(models.Model):
     payout_frequency = models.CharField(max_length=10, choices=PAYOUT_FREQUENCY, default="WEEKLY")
 
     # Legacy compatibility field.
-    # Queue-based ROSCA now uses one payout at a time, so active logic should treat this as 1.
+    # Queue-based ROSCA uses one payout event at a time.
     payouts_per_period = models.PositiveIntegerField(default=1)
 
     is_open = models.BooleanField(default=True)
@@ -132,6 +153,26 @@ class MerryGoRound(models.Model):
     max_seats = models.PositiveIntegerField(default=0, help_text="0 means unlimited seats")
 
     next_payout_date = models.DateField(null=True, blank=True)
+
+    # ----------------------------
+    # Penalty policy
+    # ----------------------------
+    penalty_mode = models.CharField(
+        max_length=10,
+        choices=PENALTY_MODES,
+        default="NONE",
+        help_text="NONE, FLAT, or DAILY",
+    )
+    flat_penalty_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    daily_penalty_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    penalty_grace_days = models.PositiveIntegerField(default=0)
+    penalty_cap_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Optional max total penalty per due.",
+    )
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -145,6 +186,7 @@ class MerryGoRound(models.Model):
         indexes = [
             models.Index(fields=["is_open", "created_at"]),
             models.Index(fields=["payout_frequency", "created_at"]),
+            models.Index(fields=["penalty_mode", "created_at"]),
         ]
 
     def clean(self):
@@ -159,6 +201,24 @@ class MerryGoRound(models.Model):
 
         if self.max_seats < 0:
             raise ValidationError("max_seats cannot be negative.")
+
+        if self.penalty_mode not in {"NONE", "FLAT", "DAILY"}:
+            raise ValidationError("penalty_mode must be NONE, FLAT or DAILY.")
+
+        if self.flat_penalty_amount is not None and self.flat_penalty_amount < 0:
+            raise ValidationError("flat_penalty_amount cannot be negative.")
+
+        if self.daily_penalty_amount is not None and self.daily_penalty_amount < 0:
+            raise ValidationError("daily_penalty_amount cannot be negative.")
+
+        if self.penalty_cap_amount is not None and self.penalty_cap_amount < 0:
+            raise ValidationError("penalty_cap_amount cannot be negative.")
+
+        if self.penalty_mode == "FLAT" and q2(self.flat_penalty_amount) <= Decimal("0.00"):
+            raise ValidationError("flat_penalty_amount must be > 0 when penalty_mode is FLAT.")
+
+        if self.penalty_mode == "DAILY" and q2(self.daily_penalty_amount) <= Decimal("0.00"):
+            raise ValidationError("daily_penalty_amount must be > 0 when penalty_mode is DAILY.")
 
     # -------- queue-based payout helpers --------
     def effective_payouts_per_period(self) -> int:
@@ -181,17 +241,17 @@ class MerryGoRound(models.Model):
 
     def required_amount_per_seat_per_period(self) -> Decimal:
         """
-        Compatibility helper. In ROSCA queue mode this is one contribution per payout event.
+        Compatibility helper. In queue-based ROSCA this is one contribution per payout event.
         """
-        return self.contribution_amount or Decimal("0")
+        return q2(self.contribution_amount or Decimal("0"))
 
     def total_pool_per_slot(self) -> Decimal:
         seats_count = self.seats.filter(is_active=True).count()
-        return Decimal(seats_count) * (self.contribution_amount or Decimal("0"))
+        return q2(Decimal(seats_count) * (self.contribution_amount or Decimal("0")))
 
     def total_pool_per_period(self) -> Decimal:
         """
-        Compatibility helper. In queue mode period ~= one active payout.
+        Compatibility helper. In queue mode current period ~= one active payout.
         """
         return self.total_pool_per_slot()
 
@@ -269,6 +329,86 @@ class MerryGoRound(models.Model):
         monday = date.fromisocalendar(year, week, 1)
         return monday + timedelta(days=weekday)
 
+    def add_schedule_step(self, base_date: date) -> date:
+        if self.payout_frequency == "DAILY":
+            return base_date + timedelta(days=1)
+
+        if self.payout_frequency == "MONTHLY":
+            year = base_date.year
+            month = base_date.month + 1
+            if month > 12:
+                month = 1
+                year += 1
+            day = min(base_date.day, _last_day_of_month(year, month).day)
+            return date(year, month, day)
+
+        weeks = max(1, int(self.cycle_duration_weeks or 1))
+        return base_date + timedelta(weeks=weeks)
+
+    def active_cycle_seat_count(self) -> int:
+        return self.seats.filter(is_active=True).count()
+
+    def cycle_number_for_turn(self, turn_no: int) -> int:
+        seats_count = self.active_cycle_seat_count()
+        if seats_count <= 0:
+            return 1
+        return ((int(turn_no) - 1) // seats_count) + 1
+
+    # -------- penalty helpers --------
+    def penalty_starts_on(self, due_date: Optional[date]) -> Optional[date]:
+        if not due_date:
+            return None
+        return due_date + timedelta(days=int(self.penalty_grace_days or 0) + 1)
+
+    def calculate_penalty_for_due(
+        self,
+        *,
+        base_amount: Decimal,
+        due_date: Optional[date],
+        as_of: Optional[date] = None,
+        existing_penalty_amount: Optional[Decimal] = None,
+        flat_already_applied: bool = False,
+    ) -> tuple[Decimal, int]:
+        """
+        Returns (penalty_amount, days_overdue).
+
+        - NONE  -> no penalty
+        - FLAT  -> one-time penalty once overdue starts
+        - DAILY -> daily fixed amount from penalty start date
+        """
+        as_of = as_of or timezone.localdate()
+        base_amount = q2(base_amount or Decimal("0"))
+        existing_penalty_amount = q2(existing_penalty_amount or Decimal("0"))
+
+        if self.penalty_mode == "NONE":
+            return Decimal("0.00"), 0
+
+        penalty_start = self.penalty_starts_on(due_date)
+        if not penalty_start or as_of < penalty_start:
+            return Decimal("0.00"), 0
+
+        days_overdue = (as_of - penalty_start).days + 1
+        if days_overdue < 0:
+            days_overdue = 0
+
+        penalty = Decimal("0.00")
+
+        if self.penalty_mode == "FLAT":
+            penalty = q2(self.flat_penalty_amount or Decimal("0.00"))
+            if flat_already_applied and existing_penalty_amount > 0:
+                penalty = existing_penalty_amount
+
+        elif self.penalty_mode == "DAILY":
+            per_day = q2(self.daily_penalty_amount or Decimal("0.00"))
+            penalty = q2(per_day * Decimal(days_overdue))
+
+        if self.penalty_cap_amount is not None:
+            cap = q2(self.penalty_cap_amount)
+            if penalty > cap:
+                penalty = cap
+
+        return q2(penalty), int(days_overdue)
+
     # -------- join/capacity helpers --------
     def active_seats_count(self) -> int:
         return self.seats.filter(is_active=True).count()
@@ -296,6 +436,18 @@ class MerryGoRound(models.Model):
     # -------- payout ordering --------
     def next_payout_position(self) -> int:
         mx = self.seats.filter(is_active=True).aggregate(m=Max("payout_position")).get("m") or 0
+        return int(mx) + 1
+
+    def ordered_active_payout_seats(self) -> List["MerrySeat"]:
+        seats = list(
+            self.seats.filter(is_active=True)
+            .select_related("member", "member__user")
+            .order_by("payout_position", "seat_no", "id")
+        )
+        return seats
+
+    def next_turn_no(self) -> int:
+        mx = self.payouts.aggregate(m=Max("turn_no")).get("m") or 0
         return int(mx) + 1
 
     # -------- global seat-number helpers --------
@@ -354,7 +506,9 @@ class MerryGoRound(models.Model):
                 slot_no=1,
                 defaults={
                     "due_amount": due_amt,
+                    "base_amount": due_amt,
                     "paid_amount": Decimal("0"),
+                    "penalty_amount": Decimal("0"),
                     "status": "PENDING",
                     "due_date": due_date,
                     "is_advance_payable": False,
@@ -377,7 +531,7 @@ class MerryGoRound(models.Model):
     def admin_due_qs(self, period_key: Optional[str] = None, slot_no: Optional[int] = None):
         period_key = period_key or self.current_period_key()
         qs = MerryContributionDue.objects.filter(merry=self, period_key=period_key).select_related(
-            "seat", "seat__member", "seat__member__user"
+            "seat", "seat__member", "seat__member__user", "payout"
         )
         if slot_no is not None:
             qs = qs.filter(slot_no=slot_no)
@@ -395,7 +549,7 @@ class MerryGoRound(models.Model):
             .aggregate(s=Sum("amount"))
             .get("s")
         )
-        return amt or Decimal("0")
+        return q2(amt or Decimal("0"))
 
     def admin_outstanding_by_member(self, period_key: Optional[str] = None) -> List[Dict[str, Any]]:
         period_key = period_key or self.current_period_key()
@@ -416,10 +570,12 @@ class MerryGoRound(models.Model):
                     "required": Decimal("0"),
                     "paid": Decimal("0"),
                     "outstanding": Decimal("0"),
+                    "penalty": Decimal("0"),
                 }
 
-            by_user[u.id]["paid"] += (d.paid_amount or Decimal("0"))
-            by_user[u.id]["required"] += (d.due_amount or Decimal("0"))
+            by_user[u.id]["paid"] += q2(d.paid_amount or Decimal("0"))
+            by_user[u.id]["required"] += q2(d.due_amount or Decimal("0"))
+            by_user[u.id]["penalty"] += q2(d.penalty_amount or Decimal("0"))
 
         seat_counts = (
             self.seats.filter(is_active=True)
@@ -438,11 +594,14 @@ class MerryGoRound(models.Model):
                     "required": Decimal("0"),
                     "paid": Decimal("0"),
                     "outstanding": Decimal("0"),
+                    "penalty": Decimal("0"),
                 }
             by_user[uid]["seats"] = int(row["c"])
 
         for v in by_user.values():
-            out = (v["required"] or Decimal("0")) - (v["paid"] or Decimal("0"))
+            due_total = q2(v["required"] or Decimal("0"))
+            paid_total = q2(v["paid"] or Decimal("0"))
+            out = due_total - paid_total
             v["outstanding"] = out if out > 0 else Decimal("0")
 
         result = list(by_user.values())
@@ -473,7 +632,6 @@ class MerrySlotConfig(models.Model):
     def clean(self):
         if self.slot_no < 1:
             raise ValidationError("slot_no must be >= 1")
-        # Compatibility: allow legacy rows, but active queue mode should not depend on >1 slots.
 
     def __str__(self):
         return f"{self.merry_id} slot {self.slot_no} => {self.get_weekday_display()}"
@@ -502,6 +660,9 @@ class MerryMember(models.Model):
             models.Index(fields=["user", "is_active"]),
             models.Index(fields=["merry", "is_active"]),
         ]
+
+    def joined_on(self) -> date:
+        return _date_only(self.joined_at) or timezone.localdate()
 
     def __str__(self):
         return f"{self.user_id} - {self.merry.name}"
@@ -546,6 +707,9 @@ class MerrySeat(models.Model):
                 raise ValidationError(
                     f"seat_no cannot exceed max_seats ({self.merry.max_seats}) for this merry."
                 )
+
+    def eligible_from_date(self) -> date:
+        return self.member.joined_on()
 
     def __str__(self):
         return f"Seat#{self.id} merry={self.merry_id} user={self.member.user_id} seat_no={self.seat_no}"
@@ -743,7 +907,85 @@ class MerryJoinRequest(models.Model):
 
 
 # ----------------------------
-# Scheduled dues (per seat, compatibility-safe)
+# Payouts (seat-based, permanent turn history)
+# ----------------------------
+class MerryPayout(models.Model):
+    STATUS_CHOICES = (
+        ("SCHEDULED", "Scheduled"),
+        ("PROCESSING", "Processing"),
+        ("PAID", "Paid"),
+        ("FAILED", "Failed"),
+        ("CANCELLED", "Cancelled"),
+    )
+
+    merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="payouts")
+    seat = models.ForeignKey(MerrySeat, on_delete=models.CASCADE, related_name="payouts")
+
+    # Permanent turn-linked ROSCA fields
+    turn_no = models.PositiveIntegerField(default=1, db_index=True)
+    cycle_no = models.PositiveIntegerField(default=1, db_index=True)
+    scheduled_date = models.DateField(null=True, blank=True, db_index=True)
+
+    # Legacy compatibility
+    period_key = models.CharField(max_length=20, db_index=True)
+    slot_no = models.PositiveIntegerField(default=1)
+
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+
+    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="SCHEDULED")
+    paid_at = models.DateTimeField(null=True, blank=True)
+
+    notes = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["turn_no", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["merry", "turn_no"],
+                name="uniq_payout_turn_no_per_merry",
+            ),
+            models.UniqueConstraint(
+                fields=["merry", "period_key", "slot_no"],
+                name="uniq_payout_per_period_slot",
+            ),
+            models.UniqueConstraint(
+                fields=["merry", "seat", "period_key"],
+                name="uniq_seat_payout_per_period",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["merry", "turn_no"]),
+            models.Index(fields=["merry", "cycle_no", "turn_no"]),
+            models.Index(fields=["merry", "scheduled_date"]),
+            models.Index(fields=["merry", "period_key", "slot_no"]),
+            models.Index(fields=["status", "created_at"]),
+        ]
+
+    def clean(self):
+        if self.seat_id and self.merry_id and self.seat.merry_id != self.merry_id:
+            raise ValidationError("Payout.merry must match seat.merry")
+        if self.slot_no < 1:
+            raise ValidationError("slot_no must be >= 1")
+        if self.turn_no < 1:
+            raise ValidationError("turn_no must be >= 1")
+        if self.cycle_no < 1:
+            raise ValidationError("cycle_no must be >= 1")
+        if self.amount is not None and self.amount <= 0:
+            raise ValidationError("amount must be > 0")
+
+    def effective_due_date(self) -> Optional[date]:
+        return self.scheduled_date or self.merry.get_slot_due_date(self.period_key, self.slot_no)
+
+    def __str__(self):
+        return (
+            f"MerryPayout#{self.id} merry={self.merry_id} seat={self.seat_id} "
+            f"turn={self.turn_no} cycle={self.cycle_no} scheduled={self.scheduled_date} {self.status}"
+        )
+
+
+# ----------------------------
+# Scheduled dues (per seat, turn-linked, compatibility-safe)
 # ----------------------------
 class MerryContributionDue(models.Model):
     STATUS_CHOICES = (
@@ -757,11 +999,29 @@ class MerryContributionDue(models.Model):
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="dues")
     seat = models.ForeignKey(MerrySeat, on_delete=models.CASCADE, related_name="dues")
 
+    # New permanent linkage to exact payout turn
+    payout = models.ForeignKey(
+        MerryPayout,
+        on_delete=models.CASCADE,
+        related_name="dues",
+        null=True,
+        blank=True,
+    )
+
+    # Legacy compatibility
     period_key = models.CharField(max_length=20, db_index=True)
     slot_no = models.PositiveIntegerField(default=1)
 
+    # Historic due values
     due_amount = models.DecimalField(max_digits=12, decimal_places=2)
     paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0"))
+
+    # Turn-based stored accounting
+    base_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    penalty_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    penalty_applied_at = models.DateTimeField(null=True, blank=True)
+    penalty_last_calculated_at = models.DateTimeField(null=True, blank=True)
+    days_overdue = models.PositiveIntegerField(default=0)
 
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="PENDING")
     due_date = models.DateField(null=True, blank=True)
@@ -778,11 +1038,18 @@ class MerryContributionDue(models.Model):
                 fields=["seat", "period_key", "slot_no"],
                 name="uniq_due_per_seat_period_slot",
             ),
+            models.UniqueConstraint(
+                fields=["seat", "payout"],
+                condition=Q(payout__isnull=False),
+                name="uniq_due_per_seat_per_payout",
+            ),
         ]
         indexes = [
+            models.Index(fields=["merry", "payout"]),
             models.Index(fields=["merry", "period_key", "slot_no"]),
             models.Index(fields=["status", "updated_at"]),
             models.Index(fields=["due_date", "status"]),
+            models.Index(fields=["days_overdue", "status"]),
         ]
 
     def clean(self):
@@ -790,14 +1057,36 @@ class MerryContributionDue(models.Model):
             raise ValidationError("slot_no must be >= 1")
         if self.merry_id and self.seat_id and self.seat.merry_id != self.merry_id:
             raise ValidationError("Due.merry must match seat.merry")
-        if self.due_amount is not None and self.due_amount <= 0:
-            raise ValidationError("due_amount must be > 0")
+        if self.payout_id and self.merry_id and self.payout.merry_id != self.merry_id:
+            raise ValidationError("Due.merry must match payout.merry")
+        if self.payout_id and self.seat_id and self.payout.seat_id == self.seat_id:
+            # The beneficiary payout seat should not owe itself for that turn in most ROSCA designs.
+            # We keep this as a soft model-level guard only if your business flow wants strict enforcement.
+            pass
+        if self.due_amount is not None and self.due_amount < 0:
+            raise ValidationError("due_amount cannot be negative")
+        if self.base_amount is not None and self.base_amount < 0:
+            raise ValidationError("base_amount cannot be negative")
+        if self.penalty_amount is not None and self.penalty_amount < 0:
+            raise ValidationError("penalty_amount cannot be negative")
         if self.paid_amount is not None and self.paid_amount < 0:
             raise ValidationError("paid_amount cannot be negative")
 
+    def effective_base_amount(self) -> Decimal:
+        if self.base_amount and self.base_amount > 0:
+            return q2(self.base_amount)
+        return q2(self.due_amount or Decimal("0"))
+
+    def total_due_amount(self) -> Decimal:
+        return q2(self.effective_base_amount() + q2(self.penalty_amount or Decimal("0")))
+
     def outstanding(self) -> Decimal:
-        out = (self.due_amount or Decimal("0")) - (self.paid_amount or Decimal("0"))
-        return out if out > 0 else Decimal("0")
+        out = self.total_due_amount() - q2(self.paid_amount or Decimal("0"))
+        return out if out > 0 else Decimal("0.00")
+
+    def outstanding_base_only(self) -> Decimal:
+        out = self.effective_base_amount() - q2(self.paid_amount or Decimal("0"))
+        return out if out > 0 else Decimal("0.00")
 
     def is_overdue(self) -> bool:
         if self.status in ["PAID", "CANCELLED"]:
@@ -815,15 +1104,85 @@ class MerryContributionDue(models.Model):
             return False
         return bool(self.due_date and self.due_date > timezone.localdate())
 
+    def is_member_eligible_for_turn(self) -> bool:
+        """
+        Member starts contributing from first turn whose due date is on/after joined_at.
+        """
+        joined_on = self.seat.member.joined_on()
+        target_due_date = self.due_date
+        if target_due_date is None and self.payout_id:
+            target_due_date = self.payout.effective_due_date()
+        if target_due_date is None:
+            return True
+        return target_due_date >= joined_on
+
+    def refresh_penalty(self, as_of: Optional[date] = None, save: bool = False) -> tuple[Decimal, int]:
+        """
+        Recalculate penalty based on merry policy.
+        """
+        as_of = as_of or timezone.localdate()
+        merry = self.merry
+        existing_penalty = q2(self.penalty_amount or Decimal("0"))
+        flat_already_applied = existing_penalty > 0 and merry.penalty_mode == "FLAT"
+
+        penalty, overdue_days = merry.calculate_penalty_for_due(
+            base_amount=self.effective_base_amount(),
+            due_date=self.due_date,
+            as_of=as_of,
+            existing_penalty_amount=existing_penalty,
+            flat_already_applied=flat_already_applied,
+        )
+
+        changed = False
+
+        if q2(self.penalty_amount or Decimal("0")) != q2(penalty):
+            self.penalty_amount = q2(penalty)
+            changed = True
+
+        if int(self.days_overdue or 0) != int(overdue_days):
+            self.days_overdue = int(overdue_days)
+            changed = True
+
+        now_ts = timezone.now()
+        self.penalty_last_calculated_at = now_ts
+        changed = True
+
+        if self.penalty_amount > 0 and self.penalty_applied_at is None:
+            self.penalty_applied_at = now_ts
+            changed = True
+
+        # Keep legacy due_amount aligned to total due for compatibility
+        total_due = self.total_due_amount()
+        if q2(self.due_amount or Decimal("0")) != total_due:
+            self.due_amount = total_due
+            changed = True
+
+        self.recalc_status()
+
+        if save and changed:
+            self.save(
+                update_fields=[
+                    "penalty_amount",
+                    "days_overdue",
+                    "penalty_last_calculated_at",
+                    "penalty_applied_at",
+                    "due_amount",
+                    "status",
+                    "updated_at",
+                ]
+            )
+
+        return q2(self.penalty_amount or Decimal("0")), int(self.days_overdue or 0)
+
     def recalc_status(self):
         if self.status == "CANCELLED":
             return
 
-        paid = self.paid_amount or Decimal("0")
-        due = self.due_amount or Decimal("0")
+        paid = q2(self.paid_amount or Decimal("0"))
+        due = self.total_due_amount()
         today = timezone.localdate()
 
-        if paid >= due:
+        if paid >= due and due > 0:
             self.status = "PAID"
             return
 
@@ -837,7 +1196,10 @@ class MerryContributionDue(models.Model):
             self.status = "PENDING"
 
     def __str__(self):
-        return f"Due#{self.id} seat={self.seat_id} {self.period_key} slot={self.slot_no} {self.status}"
+        return (
+            f"Due#{self.id} seat={self.seat_id} payout={self.payout_id} "
+            f"{self.period_key} slot={self.slot_no} {self.status}"
+        )
 
 
 # ----------------------------
@@ -1011,62 +1373,4 @@ class MerryWalletTransaction(models.Model):
         return (
             f"MerryWalletTx#{self.id} wallet={self.wallet_id} user={self.user_id} "
             f"{self.tx_type} amount={self.amount} after={self.balance_after}"
-        )
-
-
-# ----------------------------
-# Payouts (seat-based, one active payout at a time)
-# ----------------------------
-class MerryPayout(models.Model):
-    STATUS_CHOICES = (
-        ("SCHEDULED", "Scheduled"),
-        ("PROCESSING", "Processing"),
-        ("PAID", "Paid"),
-        ("FAILED", "Failed"),
-        ("CANCELLED", "Cancelled"),
-    )
-
-    merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="payouts")
-    seat = models.ForeignKey(MerrySeat, on_delete=models.CASCADE, related_name="payouts")
-
-    period_key = models.CharField(max_length=20, db_index=True)
-    slot_no = models.PositiveIntegerField(default=1)
-
-    amount = models.DecimalField(max_digits=12, decimal_places=2)
-
-    status = models.CharField(max_length=50, choices=STATUS_CHOICES, default="SCHEDULED")
-    paid_at = models.DateTimeField(null=True, blank=True)
-
-    notes = models.CharField(max_length=255, blank=True, default="")
-    created_at = models.DateTimeField(default=timezone.now)
-
-    class Meta:
-        ordering = ["-id"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["merry", "period_key", "slot_no"],
-                name="uniq_payout_per_period_slot",
-            ),
-            models.UniqueConstraint(
-                fields=["merry", "seat", "period_key"],
-                name="uniq_seat_payout_per_period",
-            ),
-        ]
-        indexes = [
-            models.Index(fields=["merry", "period_key", "slot_no"]),
-            models.Index(fields=["status", "created_at"]),
-        ]
-
-    def clean(self):
-        if self.seat_id and self.merry_id and self.seat.merry_id != self.merry_id:
-            raise ValidationError("Payout.merry must match seat.merry")
-        if self.slot_no < 1:
-            raise ValidationError("slot_no must be >= 1")
-        if self.amount is not None and self.amount <= 0:
-            raise ValidationError("amount must be > 0")
-
-    def __str__(self):
-        return (
-            f"MerryPayout#{self.id} merry={self.merry_id} seat={self.seat_id} "
-            f"period={self.period_key} slot={self.slot_no} {self.status}"
         )
