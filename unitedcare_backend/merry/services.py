@@ -421,7 +421,38 @@ def _add_months(d: date, months: int = 1) -> date:
     return date(year, month, day)
 
 
+def _ordered_slot_configs(merry: MerryGoRound) -> List[MerrySlotConfig]:
+    return list(merry.slot_configs.all().order_by("slot_no", "id"))
+
+
+def _has_slot_config_schedule(merry: MerryGoRound) -> bool:
+    return len(_ordered_slot_configs(merry)) > 0
+
+
+def _next_slot_config_candidate_on_or_after(merry: MerryGoRound, anchor_date: date) -> Tuple[date, int]:
+    configs = _ordered_slot_configs(merry)
+    if not configs:
+        return anchor_date, 1
+
+    for offset in range(0, 21):
+        candidate = anchor_date + timedelta(days=offset)
+        weekday = candidate.weekday()
+        for cfg in configs:
+            if int(cfg.weekday) == weekday:
+                return candidate, int(cfg.slot_no)
+
+    first = configs[0]
+    return anchor_date, int(first.slot_no)
+
+
+def _next_slot_config_candidate_after(merry: MerryGoRound, anchor_date: date) -> Tuple[date, int]:
+    return _next_slot_config_candidate_on_or_after(merry, anchor_date + timedelta(days=1))
+
+
 def _add_schedule_step(merry: MerryGoRound, base_date: date) -> date:
+    if _has_slot_config_schedule(merry):
+        return _next_slot_config_candidate_after(merry, base_date)[0]
+
     if hasattr(merry, "add_schedule_step"):
         return merry.add_schedule_step(base_date)
 
@@ -458,6 +489,16 @@ def get_period_date_range(*, merry: MerryGoRound, period_key: str) -> Dict[str, 
         raise BadState("period_key is required.")
 
     d = _period_key_to_date(pk)
+
+    if _has_slot_config_schedule(merry):
+        return {
+            "period_key": pk,
+            "label": d.strftime("%A, %d %b %Y"),
+            "start_date": d,
+            "end_date": d,
+            "frequency": "WEEKDAY_SCHEDULE",
+        }
+
     freq = _normalized_frequency(merry)
 
     if freq == "DAILY":
@@ -480,16 +521,15 @@ def get_period_date_range(*, merry: MerryGoRound, period_key: str) -> Dict[str, 
             "frequency": freq,
         }
 
-    start = d
-    end = d + timedelta(days=6)
+    start_date = d
+    end_date = d + timedelta(days=6)
     return {
         "period_key": pk,
-        "label": f"Week of {start.strftime('%d %b %Y')}",
-        "start_date": start,
-        "end_date": end,
+        "label": f"Week of {start_date.strftime('%d %b %Y')}",
+        "start_date": start_date,
+        "end_date": end_date,
         "frequency": freq,
     }
-
 
 def _expected_pool_amount(merry: MerryGoRound) -> Decimal:
     if hasattr(merry, "total_pool_per_slot"):
@@ -849,22 +889,43 @@ def _cycle_number_for_turn(merry: MerryGoRound, turn_no: int) -> int:
 
 
 def _turn_date_for_next_payout(merry: MerryGoRound) -> date:
+    slot_date, _ = _next_turn_schedule_for_payout(merry)
+    return slot_date
+
+
+def _next_turn_schedule_for_payout(merry: MerryGoRound) -> Tuple[date, int]:
     last_payout = (
         MerryPayout.objects.filter(merry=merry)
         .order_by("-turn_no", "-id")
         .first()
     )
+
     if last_payout and getattr(last_payout, "scheduled_date", None):
-        return _add_schedule_step(merry, last_payout.scheduled_date)
+        if _has_slot_config_schedule(merry):
+            return _next_slot_config_candidate_after(merry, last_payout.scheduled_date)
+        return _add_schedule_step(merry, last_payout.scheduled_date), 1
+
     if last_payout and getattr(last_payout, "period_key", None):
         try:
-            return _add_schedule_step(merry, _period_key_to_date(last_payout.period_key))
+            base_date = _period_key_to_date(last_payout.period_key)
+            if _has_slot_config_schedule(merry):
+                return _next_slot_config_candidate_after(merry, base_date)
+            return _add_schedule_step(merry, base_date), 1
         except Exception:
             pass
-    if merry.next_payout_date:
-        return merry.next_payout_date
-    return timezone.localdate()
 
+    created_anchor = (
+        merry.created_at.date()
+        if getattr(merry, "created_at", None)
+        else timezone.localdate()
+    )
+    configured_anchor = getattr(merry, "next_payout_date", None)
+    anchor = configured_anchor if configured_anchor and configured_anchor >= created_anchor else created_anchor
+
+    if _has_slot_config_schedule(merry):
+        return _next_slot_config_candidate_on_or_after(merry, anchor)
+
+    return anchor, 1
 
 def get_existing_current_payout(*, merry_id: int) -> Optional[MerryPayout]:
     return (
@@ -883,8 +944,9 @@ def _find_next_open_period_slot_for_seat(
 ) -> Tuple[str, int]:
     payout = get_existing_current_payout(merry_id=merry.id)
     if payout:
-        return payout.period_key, 1
-    return _date_to_period_key(_turn_date_for_next_payout(merry)), 1
+        return payout.period_key, int(getattr(payout, "slot_no", 1) or 1)
+    due_date, slot_no = _next_turn_schedule_for_payout(merry)
+    return _date_to_period_key(due_date), slot_no
 
 
 def _preview_next_payout_meta(merry: MerryGoRound) -> Dict[str, Any]:
@@ -893,11 +955,12 @@ def _preview_next_payout_meta(merry: MerryGoRound) -> Dict[str, Any]:
         seat = payout.seat
         due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
         period_key = payout.period_key
+        slot_no = int(getattr(payout, "slot_no", 1) or 1)
         turn_no = getattr(payout, "turn_no", 1)
         cycle_number = getattr(payout, "cycle_no", _cycle_number_for_turn(merry, turn_no))
     else:
         seat = _next_turn_seat(merry)
-        due_date = _turn_date_for_next_payout(merry)
+        due_date, slot_no = _next_turn_schedule_for_payout(merry)
         period_key = _date_to_period_key(due_date)
         turn_no = _next_turn_no(merry)
         cycle_number = _cycle_number_for_turn(merry, turn_no)
@@ -905,7 +968,7 @@ def _preview_next_payout_meta(merry: MerryGoRound) -> Dict[str, Any]:
     return {
         "seat": seat,
         "period_key": period_key,
-        "slot_no": 1,
+        "slot_no": slot_no,
         "due_date": due_date,
         "cycle_number": cycle_number,
         "cycle_complete": _is_cycle_complete(merry),
@@ -946,7 +1009,7 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
         return existing
 
     seat = _next_turn_seat(merry)
-    scheduled_date = _turn_date_for_next_payout(merry)
+    scheduled_date, slot_no = _next_turn_schedule_for_payout(merry)
     turn_no = _next_turn_no(merry)
     cycle_no = _cycle_number_for_turn(merry, turn_no)
     period_key = _date_to_period_key(scheduled_date)
@@ -958,7 +1021,7 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
         cycle_no=cycle_no,
         scheduled_date=scheduled_date,
         period_key=period_key,
-        slot_no=1,
+        slot_no=slot_no,
         amount=_expected_pool_amount(merry),
         status="SCHEDULED",
         notes=f"Auto-created current ROSCA payout for seat {seat.seat_no}.",
