@@ -672,6 +672,7 @@ def _select_member_dues_for_breakdown(
     return dues
 
 
+@transaction.atomic
 def _select_member_dues_for_payment(
     *,
     member: MerryMember,
@@ -702,6 +703,7 @@ def _select_member_dues_for_payment(
 # -----------------------------
 # Wallet helpers
 # -----------------------------
+@transaction.atomic
 def _get_or_create_wallet_for_user(user) -> MerryWallet:
     wallet, _ = MerryWallet.objects.select_for_update().get_or_create(
         user=user,
@@ -735,6 +737,7 @@ def _create_wallet_tx(
     )
 
 
+@transaction.atomic
 def add_merry_wallet_credit(
     *,
     user,
@@ -855,36 +858,60 @@ def _turn_date_for_next_payout(merry: MerryGoRound) -> date:
     return timezone.localdate()
 
 
+def get_existing_current_payout(*, merry_id: int) -> Optional[MerryPayout]:
+    return (
+        MerryPayout.objects.filter(merry_id=merry_id, status="SCHEDULED")
+        .select_related("seat", "seat__member", "seat__member__user")
+        .order_by("turn_no", "id")
+        .first()
+    )
+
+
 def _find_next_open_period_slot_for_seat(
     *,
     merry: MerryGoRound,
     seat: MerrySeat,
     start_period_key: Optional[str] = None,
 ) -> Tuple[str, int]:
-    payout = ensure_current_payout_exists(merry_id=merry.id)
-    return payout.period_key, 1
+    payout = get_existing_current_payout(merry_id=merry.id)
+    if payout:
+        return payout.period_key, 1
+    return _date_to_period_key(_turn_date_for_next_payout(merry)), 1
 
 
 def _preview_next_payout_meta(merry: MerryGoRound) -> Dict[str, Any]:
-    payout = ensure_current_payout_exists(merry_id=merry.id)
-    seat = payout.seat
-    due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+    payout = get_existing_current_payout(merry_id=merry.id)
+    if payout:
+        seat = payout.seat
+        due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+        period_key = payout.period_key
+        turn_no = getattr(payout, "turn_no", 1)
+        cycle_number = getattr(payout, "cycle_no", _cycle_number_for_turn(merry, turn_no))
+    else:
+        seat = _next_turn_seat(merry)
+        due_date = _turn_date_for_next_payout(merry)
+        period_key = _date_to_period_key(due_date)
+        turn_no = _next_turn_no(merry)
+        cycle_number = _cycle_number_for_turn(merry, turn_no)
 
     return {
         "seat": seat,
-        "period_key": payout.period_key,
+        "period_key": period_key,
         "slot_no": 1,
         "due_date": due_date,
-        "cycle_number": getattr(payout, "cycle_no", _current_cycle_number(merry)),
+        "cycle_number": cycle_number,
         "cycle_complete": _is_cycle_complete(merry),
-        "turn_no": getattr(payout, "turn_no", 1),
+        "turn_no": turn_no,
     }
 
 
 def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
     try:
-        payout = ensure_current_payout_exists(merry_id=merry.id)
-        next_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+        payout = get_existing_current_payout(merry_id=merry.id)
+        if payout:
+            next_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+        else:
+            next_date = _turn_date_for_next_payout(merry)
     except Exception:
         next_date = None
 
@@ -1001,6 +1028,7 @@ def ensure_dues_for_current_payout(*, merry_id: int) -> int:
     return count
 
 
+@transaction.atomic
 def _ensure_historical_member_dues_until_turn(member: MerryMember, upto_turn_no: int) -> int:
     merry = member.merry
     created = 0
@@ -1072,6 +1100,7 @@ def _ensure_historical_member_dues_until_turn(member: MerryMember, upto_turn_no:
     return created
 
 
+@transaction.atomic
 def ensure_member_dues_up_to_current_turn(*, member: MerryMember) -> int:
     payout = ensure_current_payout_exists(merry_id=member.merry_id)
     return _ensure_historical_member_dues_until_turn(member, getattr(payout, "turn_no", 1))
@@ -1126,6 +1155,7 @@ def _ensure_current_dues_for_user_memberships(user_id: int) -> List[MerryMember]
     return members
 
 
+@transaction.atomic
 def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -> List[MerryContributionDue]:
     ensure_member_dues_up_to_current_turn(member=member)
 
@@ -1144,6 +1174,7 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
     return dues
 
 
+@transaction.atomic
 def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContributionDue]:
     ensure_member_dues_up_to_current_turn(member=member)
 
