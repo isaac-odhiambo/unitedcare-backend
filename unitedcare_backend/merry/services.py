@@ -1972,15 +1972,34 @@ def get_payout_readiness_status(
 
 
 @transaction.atomic
-def compute_payout_amount_for_slot(*, merry_id: int, period_key: str, slot_no: int) -> Decimal:
+def compute_payout_amount_for_slot(
+    *, 
+    merry_id: int, 
+    period_key: Optional[str] = None, 
+    slot_no: int = 1
+) -> Decimal:
     merry = get_merry(merry_id)
+
     payout = ensure_current_payout_exists(merry_id=merry.id)
+
+    # Use current payout period if none provided
+    pk = (period_key or "").strip() or payout.period_key
+
+    # Enforce current model (single slot only)
+    if slot_no != 1:
+        raise BadState("Only slot_no=1 is supported in current payout model.")
+
     total = (
-        MerryContributionDue.objects.filter(merry=merry, period_key=payout.period_key, slot_no=1)
+        MerryContributionDue.objects.filter(
+            merry=merry,
+            period_key=pk,
+            slot_no=1,
+        )
         .aggregate(s=Sum("paid_amount"))
         .get("s")
-        or Decimal("0")
+        or Decimal("0.00")
     )
+
     return q2(total)
 
 
@@ -2127,7 +2146,9 @@ def list_my_payments(*, user, limit: int = 200):
 def list_dues_for_member(*, user, merry_id: int, period_key: Optional[str] = None):
     merry = get_merry(merry_id)
     member = get_active_member(merry, user)
-    pk = (period_key or "").strip() or get_current_period_key(merry)
+
+    payout = ensure_current_payout_exists(merry_id=merry.id)
+    pk = (period_key or "").strip() or payout.period_key
 
     with transaction.atomic():
         ensure_dues_for_member_period(merry, member, pk)
@@ -2138,7 +2159,9 @@ def list_dues_for_member(*, user, merry_id: int, period_key: Optional[str] = Non
             seat__member=member,
             seat__is_active=True,
             period_key=pk,
+            slot_no=1,
         )
+        .exclude(status__in=["PAID", "CANCELLED"])
         .select_related("seat")
         .order_by("due_date", "slot_no", "seat__seat_no", "id")
     )
@@ -2175,8 +2198,11 @@ def get_user_merry_due_summary(*, user) -> Dict[str, Any]:
 
     for membership in memberships:
         merry = membership.merry
-        current_pk = get_current_period_key(merry)
-        ensure_dues_for_member_period(merry, membership, current_pk)
+
+        with transaction.atomic():
+            payout = ensure_current_payout_exists(merry_id=merry.id)
+            current_pk = payout.period_key
+            ensure_dues_for_member_period(merry, membership, current_pk)
 
         seats = membership.seats.filter(is_active=True).order_by("seat_no", "id")
         seat_numbers = list(seats.values_list("seat_no", flat=True))
@@ -2187,6 +2213,8 @@ def get_user_merry_due_summary(*, user) -> Dict[str, Any]:
             .filter(
                 merry=merry,
                 seat_id__in=seat_ids,
+                period_key=current_pk,
+                slot_no=1,
             )
             .exclude(status__in=["PAID", "CANCELLED"])
             .select_related("seat")
@@ -2220,6 +2248,10 @@ def get_user_merry_due_summary(*, user) -> Dict[str, Any]:
         for due in next_due_rows:
             next_total += _outstanding_amount(due)
 
+        overdue_total = q2(overdue_total)
+        current_total = q2(current_total)
+        next_total = q2(next_total)
+
         required_now = q2(overdue_total + current_total)
         pay_with_next = q2(required_now + next_total)
 
@@ -2232,24 +2264,30 @@ def get_user_merry_due_summary(*, user) -> Dict[str, Any]:
             "merry_name": merry.name,
             "seat_count": len(seat_numbers),
             "seat_numbers": seat_numbers,
-            "amount_per_seat": merry.contribution_amount,
-            "overdue": q2(overdue_total),
-            "current_due": q2(current_total),
-            "next_due": q2(next_total),
+            "amount_per_seat": q2(merry.contribution_amount or Decimal("0.00")),
+            "overdue": overdue_total,
+            "current_due": current_total,
+            "next_due": next_total,
             "next_due_date": next_due_date,
             "required_now": required_now,
             "pay_with_next": pay_with_next,
+            "current_period_key": current_pk,
+            "slot_no": 1,
         })
+
+    grand_overdue = q2(grand_overdue)
+    grand_current = q2(grand_current)
+    grand_next = q2(grand_next)
 
     return {
         "active_merries": memberships.count(),
         "total_seats": total_seats,
-        "total_overdue": q2(grand_overdue),
-        "total_current_due": q2(grand_current),
-        "total_next_due": q2(grand_next),
+        "total_overdue": grand_overdue,
+        "total_current_due": grand_current,
+        "total_next_due": grand_next,
         "total_required_now": q2(grand_overdue + grand_current),
         "total_pay_with_next": q2(grand_overdue + grand_current + grand_next),
-        "total_wallet_balance": get_user_merry_wallet_balance(user=user),
+        "total_wallet_balance": q2(get_user_merry_wallet_balance(user=user)),
         "items": summary_items,
     }
 
