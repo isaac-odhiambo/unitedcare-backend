@@ -60,6 +60,7 @@ def serialize_group_basic(group: Group, request_user=None):
     payload = {
         "id": group.id,
         "name": group.name,
+        "payment_code": (group.payment_code or "").upper(),
         "group_type": group.group_type,
         "group_type_display": group.get_group_type_display(),
         "description": group.description,
