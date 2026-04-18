@@ -564,38 +564,29 @@ def _refresh_due_penalty(due: MerryContributionDue, *, save: bool = True) -> Mer
     if due.status in ["PAID", "CANCELLED"]:
         return due
 
-    penalty_mode = getattr(merry, "penalty_mode", "NONE") or "NONE"
-    if penalty_mode == "NONE":
-        if getattr(due, "days_overdue", 0) != 0:
-            due.days_overdue = 0
-        if getattr(due, "penalty_amount", Decimal("0.00")) != Decimal("0.00"):
-            due.penalty_amount = Decimal("0.00")
-        due.recalc_status()
-        if save:
-            due.save(update_fields=["days_overdue", "penalty_amount", "status", "updated_at"])
-        return due
-
     due_date = due.due_date
     if not due_date:
         return due
 
     grace_days = int(getattr(merry, "penalty_grace_days", 0) or 0)
     penalty_start = due_date + timedelta(days=grace_days + 1)
-    if today < penalty_start:
-        due.days_overdue = 0
-        due.penalty_amount = Decimal("0.00")
-        due.recalc_status()
-        if save:
-            due.save(update_fields=["days_overdue", "penalty_amount", "status", "updated_at"])
-        return due
 
-    days_overdue = (today - penalty_start).days + 1
+    if today < penalty_start:
+        days_overdue = 0
+    else:
+        days_overdue = (today - penalty_start).days + 1
+
+    penalty_mode = getattr(merry, "penalty_mode", "NONE") or "NONE"
     penalty_amount = Decimal("0.00")
 
-    if penalty_mode == "FLAT":
-        penalty_amount = q2(getattr(merry, "flat_penalty_amount", Decimal("0.00")) or Decimal("0.00"))
-    elif penalty_mode == "DAILY":
-        per_day = q2(getattr(merry, "daily_penalty_amount", Decimal("0.00")) or Decimal("0.00"))
+    if penalty_mode == "FLAT" and days_overdue > 0:
+        penalty_amount = q2(
+            getattr(merry, "flat_penalty_amount", Decimal("0.00")) or Decimal("0.00")
+        )
+    elif penalty_mode == "DAILY" and days_overdue > 0:
+        per_day = q2(
+            getattr(merry, "daily_penalty_amount", Decimal("0.00")) or Decimal("0.00")
+        )
         penalty_amount = q2(per_day * Decimal(days_overdue))
 
     cap = getattr(merry, "penalty_cap_amount", None)
@@ -604,19 +595,30 @@ def _refresh_due_penalty(due: MerryContributionDue, *, save: bool = True) -> Mer
         if penalty_amount > cap:
             penalty_amount = cap
 
-    if hasattr(due, "base_amount"):
-        base_amount = q2(getattr(due, "base_amount", Decimal("0.00")) or Decimal("0.00"))
-        if base_amount <= 0:
-            base_amount = q2(getattr(due, "due_amount", Decimal("0.00")) or Decimal("0.00"))
-        due.base_amount = base_amount
-        due.penalty_amount = penalty_amount
-        due.days_overdue = days_overdue
-        due.due_amount = q2(base_amount + penalty_amount)
+    base_amount = q2(
+        getattr(due, "base_amount", Decimal("0.00"))
+        or getattr(due, "due_amount", Decimal("0.00"))
+        or Decimal("0.00")
+    )
+    if base_amount <= 0:
+        base_amount = q2(getattr(due, "due_amount", Decimal("0.00")) or Decimal("0.00"))
 
-        if hasattr(due, "penalty_last_calculated_at"):
-            due.penalty_last_calculated_at = timezone.now()
-        if penalty_amount > 0 and hasattr(due, "penalty_applied_at") and not due.penalty_applied_at:
-            due.penalty_applied_at = timezone.now()
+    if hasattr(due, "base_amount"):
+        due.base_amount = base_amount
+    if hasattr(due, "penalty_amount"):
+        due.penalty_amount = penalty_amount
+    if hasattr(due, "days_overdue"):
+        due.days_overdue = days_overdue
+    due.due_amount = q2(base_amount + penalty_amount)
+
+    if hasattr(due, "penalty_last_calculated_at") and days_overdue > 0:
+        due.penalty_last_calculated_at = timezone.now()
+    if (
+        penalty_amount > 0
+        and hasattr(due, "penalty_applied_at")
+        and not due.penalty_applied_at
+    ):
+        due.penalty_applied_at = timezone.now()
 
     due.recalc_status()
     if save:
@@ -627,7 +629,7 @@ def _refresh_due_penalty(due: MerryContributionDue, *, save: bool = True) -> Mer
             update_fields.append("days_overdue")
         if hasattr(due, "base_amount"):
             update_fields.append("base_amount")
-        if hasattr(due, "penalty_last_calculated_at"):
+        if hasattr(due, "penalty_last_calculated_at") and getattr(due, "penalty_last_calculated_at", None):
             update_fields.append("penalty_last_calculated_at")
         if hasattr(due, "penalty_applied_at") and due.penalty_applied_at:
             update_fields.append("penalty_applied_at")
@@ -847,38 +849,52 @@ def _paid_payout_count(merry: MerryGoRound) -> int:
     return MerryPayout.objects.filter(merry=merry, status="PAID").count()
 
 
+def _highest_turn_no(merry: MerryGoRound) -> int:
+    mx = MerryPayout.objects.filter(merry=merry).aggregate(m=Max("turn_no")).get("m") or 0
+    return int(mx)
+
+
 def _current_cycle_number(merry: MerryGoRound) -> int:
     seats_count = _cycle_length(merry)
     if seats_count <= 0:
         return 0
-    paid_count = _paid_payout_count(merry)
-    return (paid_count // seats_count) + 1
+
+    current_payout = get_existing_current_payout(merry_id=merry.id)
+    if current_payout:
+        turn_no = int(getattr(current_payout, "turn_no", 1) or 1)
+        return ((turn_no - 1) // seats_count) + 1
+
+    highest_turn_no = _highest_turn_no(merry)
+    if highest_turn_no <= 0:
+        return 1
+    return ((highest_turn_no - 1) // seats_count) + 1
 
 
 def _is_cycle_complete(merry: MerryGoRound) -> bool:
     seats_count = _cycle_length(merry)
     if seats_count <= 0:
         return False
-    paid_count = _paid_payout_count(merry)
-    return paid_count > 0 and (paid_count % seats_count == 0)
+
+    highest_turn_no = _highest_turn_no(merry)
+    return highest_turn_no > 0 and (highest_turn_no % seats_count == 0)
 
 
-def _next_turn_index(merry: MerryGoRound) -> int:
+def _next_turn_index(merry: MerryGoRound, *, turn_no: Optional[int] = None) -> int:
     seats_count = _cycle_length(merry)
     if seats_count <= 0:
         raise BadState("This merry has no active seats.")
-    paid_count = _paid_payout_count(merry)
-    return paid_count % seats_count
+
+    resolved_turn_no = int(turn_no or _next_turn_no(merry))
+    return (resolved_turn_no - 1) % seats_count
 
 
-def _next_turn_seat(merry: MerryGoRound) -> MerrySeat:
+def _next_turn_seat(merry: MerryGoRound, *, turn_no: Optional[int] = None) -> MerrySeat:
     seats = _ordered_active_payout_seats(merry)
-    return seats[_next_turn_index(merry)]
+    return seats[_next_turn_index(merry, turn_no=turn_no)]
 
 
 def _next_turn_no(merry: MerryGoRound) -> int:
-    mx = MerryPayout.objects.filter(merry=merry).aggregate(m=Max("turn_no")).get("m") or 0
-    return int(mx) + 1
+    return _highest_turn_no(merry) + 1
 
 
 def _cycle_number_for_turn(merry: MerryGoRound, turn_no: int) -> int:
@@ -927,14 +943,105 @@ def _next_turn_schedule_for_payout(merry: MerryGoRound) -> Tuple[date, int]:
 
     return anchor, 1
 
+
+def _get_or_create_scheduled_payout_for_turn(
+    *,
+    merry: MerryGoRound,
+    turn_no: int,
+    scheduled_date: date,
+    slot_no: int,
+) -> MerryPayout:
+    period_key = _date_to_period_key(scheduled_date)
+
+    existing = (
+        MerryPayout.objects.select_for_update()
+        .filter(merry=merry, turn_no=turn_no)
+        .select_related("seat", "seat__member", "seat__member__user")
+        .first()
+    )
+    if existing:
+        changed = False
+        if existing.period_key != period_key:
+            existing.period_key = period_key
+            changed = True
+        if int(getattr(existing, "slot_no", 1) or 1) != int(slot_no):
+            existing.slot_no = int(slot_no)
+            changed = True
+        if getattr(existing, "scheduled_date", None) != scheduled_date:
+            existing.scheduled_date = scheduled_date
+            changed = True
+        expected_cycle_no = _cycle_number_for_turn(merry, turn_no)
+        if int(getattr(existing, "cycle_no", expected_cycle_no) or expected_cycle_no) != expected_cycle_no:
+            existing.cycle_no = expected_cycle_no
+            changed = True
+        expected_seat = _next_turn_seat(merry, turn_no=turn_no)
+        if existing.seat_id != expected_seat.id:
+            existing.seat = expected_seat
+            changed = True
+        expected_amount = _expected_pool_amount(merry)
+        if q2(getattr(existing, "amount", Decimal("0.00")) or Decimal("0.00")) != expected_amount:
+            existing.amount = expected_amount
+            changed = True
+        if changed:
+            existing.save(update_fields=["period_key", "slot_no", "scheduled_date", "cycle_no", "seat", "amount"])
+        return existing
+
+    existing = (
+        MerryPayout.objects.select_for_update()
+        .filter(merry=merry, status="SCHEDULED", period_key=period_key, slot_no=slot_no)
+        .select_related("seat", "seat__member", "seat__member__user")
+        .first()
+    )
+    if existing:
+        changed = False
+        if int(getattr(existing, "turn_no", turn_no) or turn_no) != int(turn_no):
+            existing.turn_no = int(turn_no)
+            changed = True
+        expected_cycle_no = _cycle_number_for_turn(merry, turn_no)
+        if int(getattr(existing, "cycle_no", expected_cycle_no) or expected_cycle_no) != expected_cycle_no:
+            existing.cycle_no = expected_cycle_no
+            changed = True
+        expected_seat = _next_turn_seat(merry, turn_no=turn_no)
+        if existing.seat_id != expected_seat.id:
+            existing.seat = expected_seat
+            changed = True
+        expected_amount = _expected_pool_amount(merry)
+        if q2(getattr(existing, "amount", Decimal("0.00")) or Decimal("0.00")) != expected_amount:
+            existing.amount = expected_amount
+            changed = True
+        if changed:
+            existing.save(update_fields=["turn_no", "cycle_no", "seat", "amount"])
+        return existing
+
+    seat = _next_turn_seat(merry, turn_no=turn_no)
+    cycle_no = _cycle_number_for_turn(merry, turn_no)
+    return MerryPayout.objects.create(
+        merry=merry,
+        seat=seat,
+        turn_no=turn_no,
+        cycle_no=cycle_no,
+        scheduled_date=scheduled_date,
+        period_key=period_key,
+        slot_no=slot_no,
+        amount=_expected_pool_amount(merry),
+        status="SCHEDULED",
+        notes=f"Auto-created current ROSCA payout for seat {seat.seat_no}.",
+    )
+
 def get_existing_current_payout(*, merry_id: int) -> Optional[MerryPayout]:
-    return (
+    today = timezone.localdate()
+    payouts = (
         MerryPayout.objects.filter(merry_id=merry_id, status="SCHEDULED")
         .select_related("seat", "seat__member", "seat__member__user")
         .order_by("turn_no", "id")
-        .first()
     )
 
+    for payout in payouts:
+        payout_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+        if payout_date >= today:
+            return payout
+
+    return payouts.order_by("-turn_no", "-id").first()
 
 def _find_next_open_period_slot_for_seat(
     *,
@@ -997,42 +1104,90 @@ def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
 @transaction.atomic
 def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
     merry = get_merry(merry_id)
+    today = timezone.localdate()
 
-    existing = (
+    scheduled_payouts = list(
         MerryPayout.objects.select_for_update()
         .filter(merry=merry, status="SCHEDULED")
         .select_related("seat", "seat__member", "seat__member__user")
         .order_by("turn_no", "id")
-        .first()
-    )
-    if existing:
-        return existing
-
-    seat = _next_turn_seat(merry)
-    scheduled_date, slot_no = _next_turn_schedule_for_payout(merry)
-    turn_no = _next_turn_no(merry)
-    cycle_no = _cycle_number_for_turn(merry, turn_no)
-    period_key = _date_to_period_key(scheduled_date)
-
-    payout = MerryPayout.objects.create(
-        merry=merry,
-        seat=seat,
-        turn_no=turn_no,
-        cycle_no=cycle_no,
-        scheduled_date=scheduled_date,
-        period_key=period_key,
-        slot_no=slot_no,
-        amount=_expected_pool_amount(merry),
-        status="SCHEDULED",
-        notes=f"Auto-created current ROSCA payout for seat {seat.seat_no}.",
     )
 
-    if merry.next_payout_date != scheduled_date:
-        merry.next_payout_date = scheduled_date
+    future_or_today = None
+    for payout in scheduled_payouts:
+        payout_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+        if payout_date >= today:
+            future_or_today = payout
+            break
+
+    if future_or_today:
+        if merry.next_payout_date != future_or_today.scheduled_date:
+            merry.next_payout_date = future_or_today.scheduled_date
+            merry.save(update_fields=["next_payout_date"])
+        return future_or_today
+
+    if scheduled_payouts:
+        latest_scheduled = scheduled_payouts[-1]
+        last_date = getattr(latest_scheduled, "scheduled_date", None) or _period_key_to_date(latest_scheduled.period_key)
+        next_turn_no = int(getattr(latest_scheduled, "turn_no", 0) or 0) + 1
+    else:
+        latest_payout = (
+            MerryPayout.objects.select_for_update()
+            .filter(merry=merry)
+            .order_by("-turn_no", "-id")
+            .select_related("seat", "seat__member", "seat__member__user")
+            .first()
+        )
+        if latest_payout:
+            last_date = getattr(latest_payout, "scheduled_date", None) or _period_key_to_date(latest_payout.period_key)
+            next_turn_no = int(getattr(latest_payout, "turn_no", 0) or 0) + 1
+        else:
+            created_anchor = (
+                merry.created_at.date()
+                if getattr(merry, "created_at", None)
+                else today
+            )
+            configured_anchor = getattr(merry, "next_payout_date", None)
+            anchor = configured_anchor if configured_anchor and configured_anchor >= created_anchor else created_anchor
+
+            if _has_slot_config_schedule(merry):
+                first_date, first_slot_no = _next_slot_config_candidate_on_or_after(merry, anchor)
+            else:
+                first_date, first_slot_no = anchor, 1
+
+            payout = _get_or_create_scheduled_payout_for_turn(
+                merry=merry,
+                turn_no=1,
+                scheduled_date=first_date,
+                slot_no=first_slot_no,
+            )
+            if merry.next_payout_date != first_date:
+                merry.next_payout_date = first_date
+                merry.save(update_fields=["next_payout_date"])
+            return payout
+
+    next_date = last_date
+    next_slot_no = 1
+    while next_date < today:
+        if _has_slot_config_schedule(merry):
+            next_date, next_slot_no = _next_slot_config_candidate_after(merry, next_date)
+        else:
+            next_date = _add_schedule_step(merry, next_date)
+            next_slot_no = 1
+
+        payout = _get_or_create_scheduled_payout_for_turn(
+            merry=merry,
+            turn_no=next_turn_no,
+            scheduled_date=next_date,
+            slot_no=next_slot_no,
+        )
+        next_turn_no += 1
+
+    if merry.next_payout_date != payout.scheduled_date:
+        merry.next_payout_date = payout.scheduled_date
         merry.save(update_fields=["next_payout_date"])
 
     return payout
-
 
 @transaction.atomic
 def ensure_dues_for_current_payout(*, merry_id: int) -> int:
@@ -1484,8 +1639,8 @@ def apply_mpesa_contribution_by_user_reference(
         created_payments.append(payment)
         remaining = q2(remaining - pay_amount)
 
-    if not created_payments and remaining == total_amount:
-        raise BadState("No allocatable merry dues were found for this user.")
+    # if not created_payments and remaining == total_amount:
+    #     raise BadState("No allocatable merry dues were found for this user.")
 
     wallet_credit_added = Decimal("0.00")
     wallet_balance_after = get_user_merry_wallet_balance(user=user)

@@ -1690,9 +1690,10 @@ def apply_weekly_late_fees(today: Optional[date] = None) -> int:
         today = timezone.now().date()
 
     count = 0
-    touched_loans = set()
+    late_payment_touched_loans = set()
+    newly_defaulted_loans = set()
 
-    overdue = (
+    overdue_installments = (
         LoanInstallment.objects.select_for_update()
         .filter(
             is_paid=False,
@@ -1700,9 +1701,10 @@ def apply_weekly_late_fees(today: Optional[date] = None) -> int:
             loan__status__in=["APPROVED", "DEFAULTED"],
         )
         .select_related("loan", "loan__product")
+        .order_by("loan_id", "installment_no")
     )
 
-    for inst in overdue:
+    for inst in overdue_installments:
         loan = inst.loan
         product = loan.product
 
@@ -1710,35 +1712,66 @@ def apply_weekly_late_fees(today: Optional[date] = None) -> int:
         if overdue_days < 7:
             continue
 
-        rate = Decimal(product.late_fee_rate_weekly) / Decimal("100.0")
-        remaining_due = q2(
-            Decimal(inst.total_due)
-            + Decimal(inst.late_fee)
-            - Decimal(inst.paid_amount)
-        )
+        weeks_overdue = overdue_days // 7
+        already_applied = int(inst.late_fee_weeks_applied or 0)
+        new_weeks_to_apply = weeks_overdue - already_applied
 
-        if remaining_due <= 0:
-            inst.is_paid = True
-            inst.save(update_fields=["is_paid"])
+        if new_weeks_to_apply <= 0:
             continue
 
-        fee = q2(remaining_due * rate)
-        if fee > 0:
+        weekly_rate = Decimal(product.late_fee_rate_weekly or 0) / Decimal("100.0")
+        if weekly_rate <= 0:
+            inst.late_fee_weeks_applied = weeks_overdue
+            inst.save(update_fields=["late_fee_weeks_applied"])
+            continue
+
+        applied_any_fee = False
+
+        for _ in range(new_weeks_to_apply):
+            remaining_due = q2(
+                Decimal(inst.total_due)
+                + Decimal(inst.late_fee)
+                - Decimal(inst.paid_amount)
+            )
+
+            if remaining_due <= 0:
+                inst.is_paid = True
+                inst.save(update_fields=["is_paid"])
+                break
+
+            fee = q2(remaining_due * weekly_rate)
+            if fee <= 0:
+                break
+
             inst.late_fee = q2(Decimal(inst.late_fee) + fee)
-            inst.save(update_fields=["late_fee"])
+            applied_any_fee = True
             count += 1
-            touched_loans.add(loan.id)
+
+        inst.late_fee_weeks_applied = weeks_overdue
+
+        update_fields = ["late_fee_weeks_applied"]
+        if applied_any_fee:
+            update_fields.append("late_fee")
+
+        inst.save(update_fields=update_fields)
+
+        if applied_any_fee:
+            late_payment_touched_loans.add(loan.id)
 
             if loan.status == "APPROVED":
                 loan.status = "DEFAULTED"
                 loan.is_defaulter = True
                 loan.save(update_fields=["status", "is_defaulter"])
+                newly_defaulted_loans.add(loan.id)
 
-    for loan_id in touched_loans:
+    for loan_id in late_payment_touched_loans:
         loan = Loan.objects.filter(id=loan_id).first()
         if loan:
             update_credit_on_late_payment(loan)
-            if loan.status == "DEFAULTED":
-                update_credit_on_default(loan)
+
+    for loan_id in newly_defaulted_loans:
+        loan = Loan.objects.filter(id=loan_id).first()
+        if loan:
+            update_credit_on_default(loan)
 
     return count

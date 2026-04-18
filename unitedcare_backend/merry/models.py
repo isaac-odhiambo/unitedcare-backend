@@ -1116,24 +1116,130 @@ class MerryContributionDue(models.Model):
             return True
         return target_due_date >= joined_on
 
+
+
+    def recalc_status(self) -> str:
+        """
+        Keep status aligned with payment progress and due date.
+        """
+        paid = q2(self.paid_amount or Decimal("0"))
+        total_due = self.total_due_amount()
+
+        if self.status == "CANCELLED":
+            return self.status
+
+        if paid >= total_due and total_due > Decimal("0.00"):
+            self.status = "PAID"
+            return self.status
+
+        if paid > Decimal("0.00"):
+            self.status = "PARTIAL"
+            return self.status
+
+        if self.due_date and self.due_date < timezone.localdate():
+            self.status = "OVERDUE"
+            return self.status
+
+        self.status = "PENDING"
+        return self.status
+
     def refresh_penalty(self, as_of: Optional[date] = None, save: bool = False) -> tuple[Decimal, int]:
         """
         Recalculate penalty based on merry policy.
+
+        Important rule:
+        - days_overdue should still be tracked even when penalty_mode == "NONE"
+        - penalty_amount remains 0.00 when penalties are disabled
         """
         as_of = as_of or timezone.localdate()
         merry = self.merry
-        existing_penalty = q2(self.penalty_amount or Decimal("0"))
-        flat_already_applied = existing_penalty > 0 and merry.penalty_mode == "FLAT"
-
-        penalty, overdue_days = merry.calculate_penalty_for_due(
-            base_amount=self.effective_base_amount(),
-            due_date=self.due_date,
-            as_of=as_of,
-            existing_penalty_amount=existing_penalty,
-            flat_already_applied=flat_already_applied,
-        )
 
         changed = False
+        now_ts = timezone.now()
+
+        # Closed dues should not carry overdue days or penalties
+        if self.status in ["PAID", "CANCELLED"]:
+            if q2(self.penalty_amount or Decimal("0")) != Decimal("0.00"):
+                self.penalty_amount = Decimal("0.00")
+                changed = True
+            if int(self.days_overdue or 0) != 0:
+                self.days_overdue = 0
+                changed = True
+
+            self.penalty_last_calculated_at = now_ts
+            changed = True
+
+            total_due = self.total_due_amount()
+            if q2(self.due_amount or Decimal("0")) != total_due:
+                self.due_amount = total_due
+                changed = True
+
+            self.recalc_status()
+
+            if save and changed:
+                self.save(
+                    update_fields=[
+                        "penalty_amount",
+                        "days_overdue",
+                        "penalty_last_calculated_at",
+                        "due_amount",
+                        "status",
+                        "updated_at",
+                    ]
+                )
+
+            return q2(self.penalty_amount or Decimal("0")), int(self.days_overdue or 0)
+
+        # No due date means nothing can be overdue yet
+        if not self.due_date:
+            if q2(self.penalty_amount or Decimal("0")) != Decimal("0.00"):
+                self.penalty_amount = Decimal("0.00")
+                changed = True
+            if int(self.days_overdue or 0) != 0:
+                self.days_overdue = 0
+                changed = True
+
+            self.penalty_last_calculated_at = now_ts
+            changed = True
+
+            total_due = self.total_due_amount()
+            if q2(self.due_amount or Decimal("0")) != total_due:
+                self.due_amount = total_due
+                changed = True
+
+            self.recalc_status()
+
+            if save and changed:
+                self.save(
+                    update_fields=[
+                        "penalty_amount",
+                        "days_overdue",
+                        "penalty_last_calculated_at",
+                        "due_amount",
+                        "status",
+                        "updated_at",
+                    ]
+                )
+
+            return q2(self.penalty_amount or Decimal("0")), int(self.days_overdue or 0)
+
+        # Always calculate overdue days from date, even when penalty is disabled
+        overdue_days = max(0, (as_of - self.due_date).days)
+
+        if (merry.penalty_mode or "NONE").upper() == "NONE":
+            penalty = Decimal("0.00")
+        else:
+            existing_penalty = q2(self.penalty_amount or Decimal("0"))
+            flat_already_applied = existing_penalty > 0 and merry.penalty_mode == "FLAT"
+
+            penalty, _ = merry.calculate_penalty_for_due(
+                base_amount=self.effective_base_amount(),
+                due_date=self.due_date,
+                as_of=as_of,
+                existing_penalty_amount=existing_penalty,
+                flat_already_applied=flat_already_applied,
+            )
+            penalty = q2(penalty)
 
         if q2(self.penalty_amount or Decimal("0")) != q2(penalty):
             self.penalty_amount = q2(penalty)
@@ -1143,7 +1249,6 @@ class MerryContributionDue(models.Model):
             self.days_overdue = int(overdue_days)
             changed = True
 
-        now_ts = timezone.now()
         self.penalty_last_calculated_at = now_ts
         changed = True
 
@@ -1151,7 +1256,6 @@ class MerryContributionDue(models.Model):
             self.penalty_applied_at = now_ts
             changed = True
 
-        # Keep legacy due_amount aligned to total due for compatibility
         total_due = self.total_due_amount()
         if q2(self.due_amount or Decimal("0")) != total_due:
             self.due_amount = total_due
@@ -1160,47 +1264,20 @@ class MerryContributionDue(models.Model):
         self.recalc_status()
 
         if save and changed:
-            self.save(
-                update_fields=[
-                    "penalty_amount",
-                    "days_overdue",
-                    "penalty_last_calculated_at",
-                    "penalty_applied_at",
-                    "due_amount",
-                    "status",
-                    "updated_at",
-                ]
-            )
+            update_fields = [
+                "penalty_amount",
+                "days_overdue",
+                "penalty_last_calculated_at",
+                "due_amount",
+                "status",
+                "updated_at",
+            ]
+            if self.penalty_applied_at is not None:
+                update_fields.append("penalty_applied_at")
+
+            self.save(update_fields=update_fields)
 
         return q2(self.penalty_amount or Decimal("0")), int(self.days_overdue or 0)
-
-    def recalc_status(self):
-        if self.status == "CANCELLED":
-            return
-
-        paid = q2(self.paid_amount or Decimal("0"))
-        due = self.total_due_amount()
-        today = timezone.localdate()
-
-        if paid >= due and due > 0:
-            self.status = "PAID"
-            return
-
-        is_past_due = bool(self.due_date and self.due_date < today)
-
-        if is_past_due:
-            self.status = "OVERDUE"
-        elif paid > 0:
-            self.status = "PARTIAL"
-        else:
-            self.status = "PENDING"
-
-    def __str__(self):
-        return (
-            f"Due#{self.id} seat={self.seat_id} payout={self.payout_id} "
-            f"{self.period_key} slot={self.slot_no} {self.status}"
-        )
-
 
 # ----------------------------
 # Payments

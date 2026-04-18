@@ -378,12 +378,18 @@ class LoanSecurityAllocation(models.Model):
 
 
 # ==========================================================
+# ==========================================================
 # Loan Installment
 # ==========================================================
 class LoanInstallment(models.Model):
     """
     Weekly repayment schedule.
     Due dates are generated in services.py.
+
+    late_fee_weeks_applied tracks how many overdue weeks have already
+    been charged, so late fees are:
+    - never duplicated
+    - never skipped even if the scheduler misses some runs
     """
 
     loan = models.ForeignKey(
@@ -400,6 +406,8 @@ class LoanInstallment(models.Model):
     total_due = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
 
     late_fee = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    late_fee_weeks_applied = models.PositiveIntegerField(default=0)
+
     paid_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
     is_paid = models.BooleanField(default=False)
 
@@ -409,7 +417,6 @@ class LoanInstallment(models.Model):
 
     def __str__(self):
         return f"Loan#{self.loan_id} week#{self.installment_no} due={self.due_date}"
-
 
 # ==========================================================
 # Loan Payment
