@@ -1,4 +1,5 @@
 from django.contrib import admin, messages
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
 
 from .models import (
@@ -67,7 +68,6 @@ def reject_loans(modeladmin, request, queryset):
             if loan.status not in ("PENDING", "UNDER_REVIEW", "APPROVED", "DEFAULTED"):
                 continue
 
-            # Safety: if security had already been reserved, release it first.
             if loan.security_reserved_total and loan.security_reserved_total > 0:
                 release_reserved_security_for_loan(loan)
 
@@ -108,7 +108,7 @@ def complete_loans(modeladmin, request, queryset):
 
     for loan in queryset:
         try:
-            if loan.status != "APPROVED":
+            if loan.status not in ("APPROVED", "UNDER_REPAYMENT", "DEFAULTED"):
                 continue
 
             loan.recompute_balances()
@@ -117,9 +117,7 @@ def complete_loans(modeladmin, request, queryset):
             loan.completed_at = timezone.now()
             loan.save(update_fields=["status", "outstanding_balance", "completed_at"])
 
-            # Important: release security after completion.
             release_reserved_security_for_loan(loan)
-
             count += 1
         except Exception as e:
             failed += 1
@@ -145,7 +143,9 @@ def complete_loans(modeladmin, request, queryset):
 
 @admin.action(description="Mark selected loans as defaulted")
 def default_loans(modeladmin, request, queryset):
-    updated = queryset.exclude(status__in=("COMPLETED", "REJECTED", "CANCELLED")).update(
+    updated = queryset.exclude(
+        status__in=("COMPLETED", "REJECTED", "CANCELLED")
+    ).update(
         status="DEFAULTED",
         is_defaulter=True,
     )
@@ -457,14 +457,6 @@ class LoanAdmin(admin.ModelAdmin):
 
     ordering = ("-id",)
 
-    readonly_fields = (
-        "approved_at",
-        "rejected_at",
-        "completed_at",
-        "created_at",
-        "is_active_display",
-    )
-
     actions = [
         mark_loans_under_review,
         approve_loans,
@@ -523,19 +515,50 @@ class LoanAdmin(admin.ModelAdmin):
         }),
     )
 
+    readonly_fields = (
+        "status",
+        "approved_at",
+        "rejected_at",
+        "completed_at",
+        "created_at",
+        "total_payable",
+        "total_paid",
+        "outstanding_balance",
+        "security_target",
+        "security_reserved_total",
+        "is_active_display",
+    )
+
     def is_active_display(self, obj):
         return obj.is_active
 
     is_active_display.boolean = True
     is_active_display.short_description = "Active Loan"
 
+    def get_readonly_fields(self, request, obj=None):
+        ro = list(super().get_readonly_fields(request, obj))
+        if obj:
+            # Once created, these should not be manually changed from admin form.
+            ro.extend(["borrower", "product", "principal", "term_weeks"])
+        return tuple(dict.fromkeys(ro))
+
     def save_model(self, request, obj, form, change):
-        if obj.status == "APPROVED" and not obj.approved_at:
-            obj.approved_at = timezone.now()
-        if obj.status == "REJECTED" and not obj.rejected_at:
-            obj.rejected_at = timezone.now()
-        if obj.status == "COMPLETED" and not obj.completed_at:
-            obj.completed_at = timezone.now()
+        """
+        Prevent manual status-based approval/rejection/completion from the form.
+        Loan lifecycle transitions must go through admin actions or service methods.
+        """
+        if change:
+            old_obj = Loan.objects.get(pk=obj.pk)
+
+            protected_statuses = {"APPROVED", "REJECTED", "COMPLETED", "DEFAULTED"}
+            if obj.status != old_obj.status and obj.status in protected_statuses:
+                raise DjangoValidationError(
+                    "Do not change loan status from the form. "
+                    "Use the admin actions: Approve selected loans using service logic, "
+                    "Reject selected loans, Mark selected loans as completed, or "
+                    "Mark selected loans as defaulted."
+                )
+
         super().save_model(request, obj, form, change)
 
 
