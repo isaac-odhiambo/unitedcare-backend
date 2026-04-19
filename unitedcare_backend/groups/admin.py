@@ -1,4 +1,3 @@
-# groups/admin.py
 from django.contrib import admin, messages
 
 from .models import (
@@ -9,6 +8,7 @@ from .models import (
     GroupMemberShare,
     GroupContribution,
     GroupShareHold,
+    GroupDependant,
 )
 from .services import release_group_share_for_loan
 
@@ -174,6 +174,79 @@ def release_share_holds(modeladmin, request, queryset):
 
 
 # =========================================================
+# DEPENDANT ACTIONS
+# =========================================================
+@admin.action(description="Activate selected dependants")
+def activate_dependants(modeladmin, request, queryset):
+    updated = queryset.update(is_active=True)
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) activated.",
+        level=messages.SUCCESS,
+    )
+
+
+@admin.action(description="Deactivate selected dependants")
+def deactivate_dependants(modeladmin, request, queryset):
+    updated = queryset.update(is_active=False)
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) deactivated.",
+        level=messages.WARNING,
+    )
+
+
+@admin.action(description="Set selected dependants as spouse")
+def make_dependants_spouse(modeladmin, request, queryset):
+    updated = queryset.update(relationship="SPOUSE")
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) updated to SPOUSE.",
+        level=messages.SUCCESS,
+    )
+
+
+@admin.action(description="Set selected dependants as child")
+def make_dependants_child(modeladmin, request, queryset):
+    updated = queryset.update(relationship="CHILD")
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) updated to CHILD.",
+        level=messages.SUCCESS,
+    )
+
+
+@admin.action(description="Set selected dependants as sibling")
+def make_dependants_sibling(modeladmin, request, queryset):
+    updated = queryset.update(relationship="SIBLING")
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) updated to SIBLING.",
+        level=messages.SUCCESS,
+    )
+
+
+@admin.action(description="Set selected dependants as parent")
+def make_dependants_parent(modeladmin, request, queryset):
+    updated = queryset.update(relationship="PARENT")
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) updated to PARENT.",
+        level=messages.SUCCESS,
+    )
+
+
+@admin.action(description="Set selected dependants as other")
+def make_dependants_other(modeladmin, request, queryset):
+    updated = queryset.update(relationship="OTHER")
+    modeladmin.message_user(
+        request,
+        f"{updated} dependant(s) updated to OTHER.",
+        level=messages.SUCCESS,
+    )
+
+
+# =========================================================
 # READ-ONLY INLINE MIXINS
 # =========================================================
 class ReadOnlyTabularInline(admin.TabularInline):
@@ -264,6 +337,20 @@ class GroupShareHoldInline(ReadOnlyTabularInline):
     readonly_fields = ("user", "loan_id", "amount", "is_active", "created_at", "released_at")
 
 
+class GroupDependantInline(admin.TabularInline):
+    model = GroupDependant
+    extra = 0
+    fields = (
+        "name",
+        "relationship",
+        "date_of_birth",
+        "is_active",
+        "created_at",
+    )
+    readonly_fields = ("created_at",)
+    show_change_link = True
+
+
 # =========================================================
 # GROUP ADMIN
 # =========================================================
@@ -279,6 +366,7 @@ class GroupAdmin(admin.ModelAdmin):
         "is_active",
         "member_count",
         "active_member_count",
+        "dependant_count",
         "max_members",
         "fund_balance_display",
         "created_by",
@@ -355,6 +443,14 @@ class GroupAdmin(admin.ModelAdmin):
 
     active_member_count.short_description = "Active Members"
 
+    def dependant_count(self, obj):
+        return GroupDependant.objects.filter(
+            membership__group=obj,
+            is_active=True,
+        ).count()
+
+    dependant_count.short_description = "Active Dependants"
+
     def fund_balance_display(self, obj):
         fund = getattr(obj, "fund", None)
         return getattr(fund, "balance", "—")
@@ -374,6 +470,7 @@ class GroupMembershipAdmin(admin.ModelAdmin):
         "role",
         "is_active",
         "joined_at",
+        "dependant_count",
     )
     list_filter = (
         "role",
@@ -397,6 +494,12 @@ class GroupMembershipAdmin(admin.ModelAdmin):
         make_treasurers,
         make_secretaries,
     ]
+    inlines = [GroupDependantInline]
+
+    def dependant_count(self, obj):
+        return obj.dependants.filter(is_active=True).count()
+
+    dependant_count.short_description = "Active Dependants"
 
 
 # =========================================================
@@ -677,3 +780,77 @@ class GroupShareHoldAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+# =========================================================
+# GROUP DEPENDANT ADMIN
+# =========================================================
+@admin.register(GroupDependant)
+class GroupDependantAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "name",
+        "relationship",
+        "membership",
+        "user_display",
+        "group_display",
+        "is_active",
+        "created_at",
+        "updated_at",
+    )
+    list_filter = (
+        "relationship",
+        "is_active",
+        "created_at",
+        "updated_at",
+        "membership__group",
+    )
+    search_fields = (
+        "name",
+        "note",
+        "membership__group__name",
+        "membership__user__username",
+        "membership__user__phone",
+        "membership__user__email",
+    )
+    ordering = ("-id",)
+    readonly_fields = ("created_at", "updated_at")
+    actions = [
+        activate_dependants,
+        deactivate_dependants,
+        make_dependants_spouse,
+        make_dependants_child,
+        make_dependants_sibling,
+        make_dependants_parent,
+        make_dependants_other,
+    ]
+    autocomplete_fields = ("membership",)
+
+    fieldsets = (
+        ("Dependant", {
+            "fields": (
+                "membership",
+                "name",
+                "relationship",
+                "date_of_birth",
+                "note",
+                "is_active",
+            )
+        }),
+        ("Dates", {
+            "fields": (
+                "created_at",
+                "updated_at",
+            )
+        }),
+    )
+
+    def user_display(self, obj):
+        return obj.membership.user
+
+    user_display.short_description = "User"
+
+    def group_display(self, obj):
+        return obj.membership.group
+
+    group_display.short_description = "Group"

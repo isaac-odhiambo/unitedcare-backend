@@ -1,4 +1,3 @@
-# groups/models.py
 from __future__ import annotations
 
 from decimal import Decimal
@@ -188,6 +187,70 @@ class GroupMembership(models.Model):
 
     def __str__(self):
         return f"{self.group.name} - {self.user} ({self.role})"
+
+
+# ==========================================================
+# GROUP DEPENDANTS
+# ==========================================================
+class GroupDependant(models.Model):
+    RELATIONSHIP_CHOICES = (
+        ("SPOUSE", "Spouse"),
+        ("CHILD", "Child"),
+        ("SIBLING", "Sibling"),
+        ("PARENT", "Parent"),
+        ("OTHER", "Other"),
+    )
+
+    membership = models.ForeignKey(
+        GroupMembership,
+        on_delete=models.CASCADE,
+        related_name="dependants",
+    )
+    name = models.CharField(max_length=120)
+    relationship = models.CharField(max_length=20, choices=RELATIONSHIP_CHOICES, default="OTHER")
+    date_of_birth = models.DateField(null=True, blank=True)
+    note = models.CharField(max_length=255, blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["id"]
+        indexes = [
+            models.Index(fields=["membership", "is_active"]),
+            models.Index(fields=["relationship", "is_active"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["membership", "name", "relationship"],
+                name="uniq_membership_dependant_name_relationship",
+            ),
+        ]
+
+    def clean(self):
+        self.name = (self.name or "").strip()
+        self.note = (self.note or "").strip()
+
+        if not self.name:
+            raise ValidationError({"name": "Dependant name is required."})
+
+        if self.membership_id:
+            if not self.membership.is_active:
+                raise ValidationError("You can only add dependants to an active membership.")
+
+    @property
+    def group(self):
+        return self.membership.group
+
+    @property
+    def user(self):
+        return self.membership.user
+
+    def __str__(self):
+        return (
+            f"{self.name} ({self.get_relationship_display()}) - "
+            f"{self.membership.group.name} / user {self.membership.user_id}"
+        )
 
 
 # ==========================================================
@@ -578,6 +641,19 @@ class GroupShareHold(models.Model):
 #     is_active = models.BooleanField(default=True)
 #     max_members = models.PositiveIntegerField(default=0, help_text="0 means unlimited members")
 
+#     # Manual payment identifier for references like UN1, WF12, MG7
+#     # Rule:
+#     # - letters only
+#     # - unique system-wide
+#     # - backend will later parse: <payment_code><user_id>
+#     payment_code = models.CharField(
+#         max_length=10,
+#         unique=True,
+#         null=True,
+#         blank=True,
+#         help_text="Unique letters-only code used in manual payment references, e.g. UN, WF, MG.",
+#     )
+
 #     # Optional contribution settings
 #     requires_contributions = models.BooleanField(default=False)
 #     contribution_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
@@ -597,6 +673,7 @@ class GroupShareHold(models.Model):
 #             models.Index(fields=["group_type", "is_active"]),
 #             models.Index(fields=["join_policy", "is_active"]),
 #             models.Index(fields=["visibility", "is_active"]),
+#             models.Index(fields=["payment_code"]),
 #         ]
 
 #     def clean(self):
@@ -607,6 +684,20 @@ class GroupShareHold(models.Model):
 #             raise ValidationError(
 #                 "Contribution amount must be greater than 0 if contributions are required."
 #             )
+
+#         if self.payment_code:
+#             self.payment_code = self.payment_code.strip().upper()
+
+#             if not self.payment_code.isalpha():
+#                 raise ValidationError(
+#                     {"payment_code": "Payment code must contain letters only, e.g. UN, WF, MG."}
+#                 )
+
+#     def save(self, *args, **kwargs):
+#         if self.payment_code:
+#             self.payment_code = self.payment_code.strip().upper()
+#         self.full_clean()
+#         super().save(*args, **kwargs)
 
 #     def active_members_count(self) -> int:
 #         return self.memberships.filter(is_active=True).count()
@@ -630,6 +721,16 @@ class GroupShareHold(models.Model):
 #                 return False, "This group has reached maximum members."
 
 #         return True, "OK"
+
+#     @property
+#     def manual_payment_reference_prefix(self) -> str:
+#         return (self.payment_code or "").strip().upper()
+
+#     def build_member_reference(self, user_id: int) -> str:
+#         code = (self.payment_code or "").strip().upper()
+#         if not code:
+#             raise ValidationError("This group does not have a payment_code yet.")
+#         return f"{code}{int(user_id)}"
 
 #     def __str__(self):
 #         return f"{self.name} ({self.get_group_type_display()})"
@@ -1007,3 +1108,4 @@ class GroupShareHold(models.Model):
 #             f"GroupShareHold loan={self.loan_id} "
 #             f"group={self.group_id} user={self.user_id} amount={self.amount}"
 #         )
+

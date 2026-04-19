@@ -488,3 +488,143 @@ def apply_mpesa_contribution(*, user, amount: Decimal, mpesa_tx, reference: str 
         note=note,
         source="MPESA",
     )
+# ==========================================================
+# GROUP DEPENDANTS
+# ==========================================================
+from .models import GroupDependant
+
+
+@transaction.atomic
+def list_my_dependants(*, user, group_id: int | None = None):
+    """
+    List dependants for the current user.
+    Optional filter by group.
+    """
+    if group_id:
+        require_active_membership(group_id, user)
+
+        return GroupDependant.objects.filter(
+            membership__user=user,
+            membership__group_id=group_id,
+            is_active=True,
+        ).select_related("membership", "membership__group")
+
+    return GroupDependant.objects.filter(
+        membership__user=user,
+        is_active=True,
+    ).select_related("membership", "membership__group")
+
+
+@transaction.atomic
+def add_group_dependant(
+    *,
+    user,
+    membership_id: int,
+    name: str,
+    relationship: str,
+    date_of_birth=None,
+    note: str = "",
+) -> GroupDependant:
+    """
+    Add dependant under a membership.
+    """
+
+    membership = GroupMembership.objects.filter(
+        id=membership_id,
+        user=user,
+        is_active=True,
+    ).first()
+
+    if not membership:
+        raise PermissionDenied("You can only add dependants to your active membership.")
+
+    name = (name or "").strip()
+    relationship = (relationship or "").strip().upper()
+    note = (note or "").strip()
+
+    if not name:
+        raise ValidationError("Dependant name is required.")
+
+    allowed = {"SPOUSE", "CHILD", "SIBLING", "PARENT", "OTHER"}
+    if relationship not in allowed:
+        raise ValidationError("Invalid relationship type.")
+
+    dependant = GroupDependant.objects.create(
+        membership=membership,
+        name=name,
+        relationship=relationship,
+        date_of_birth=date_of_birth,
+        note=note,
+        is_active=True,
+    )
+
+    return dependant
+
+
+@transaction.atomic
+def update_group_dependant(
+    *,
+    user,
+    dependant_id: int,
+    name: str | None = None,
+    relationship: str | None = None,
+    date_of_birth=None,
+    note: str | None = None,
+) -> GroupDependant:
+    """
+    Update dependant details.
+    """
+
+    dependant = GroupDependant.objects.select_related("membership").filter(
+        id=dependant_id,
+        membership__user=user,
+        is_active=True,
+    ).first()
+
+    if not dependant:
+        raise PermissionDenied("Dependant not found or not yours.")
+
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ValidationError("Dependant name cannot be empty.")
+        dependant.name = name
+
+    if relationship is not None:
+        relationship = relationship.strip().upper()
+        allowed = {"SPOUSE", "CHILD", "SIBLING", "PARENT", "OTHER"}
+        if relationship not in allowed:
+            raise ValidationError("Invalid relationship type.")
+        dependant.relationship = relationship
+
+    if date_of_birth is not None:
+        dependant.date_of_birth = date_of_birth
+
+    if note is not None:
+        dependant.note = note.strip()
+
+    dependant.full_clean()
+    dependant.save()
+
+    return dependant
+
+
+@transaction.atomic
+def remove_group_dependant(*, user, dependant_id: int) -> dict:
+    """
+    Soft delete dependant.
+    """
+
+    dependant = GroupDependant.objects.select_related("membership").filter(
+        id=dependant_id,
+        membership__user=user,
+        is_active=True,
+    ).first()
+
+    if not dependant:
+        raise PermissionDenied("Dependant not found or not yours.")
+
+    dependant.is_active = False
+    dependant.save(update_fields=["is_active"])
+
+    return {"message": "Dependant removed."}

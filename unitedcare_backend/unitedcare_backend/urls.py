@@ -22,6 +22,7 @@ urlpatterns = [
     path("api/groups/", include("groups.urls")),
     path("payments/", include("payments.urls")),
     path("notifications/", include("notifications.urls")),
+    path("api/channels/", include("channels.urls")),
 ]
 
 if settings.DEBUG:

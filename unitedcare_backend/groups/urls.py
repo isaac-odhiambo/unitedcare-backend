@@ -1,15 +1,14 @@
-# groups/urls.py
-
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
-    GroupViewSet,
-    GroupMembershipViewSet,
+    GroupContributionsHistoryView,
+    GroupDependantViewSet,
     GroupJoinRequestViewSet,
+    GroupMembershipViewSet,
+    GroupViewSet,
     MyGroupSavingsSummaryView,
     PostGroupContributionView,
-    GroupContributionsHistoryView,
 )
 
 router = DefaultRouter()
@@ -22,6 +21,9 @@ router.register(r"memberships", GroupMembershipViewSet, basename="memberships")
 
 # Join requests
 router.register(r"join-requests", GroupJoinRequestViewSet, basename="group-join-requests")
+
+# Dependants
+router.register(r"dependants", GroupDependantViewSet, basename="group-dependants")
 
 urlpatterns = [
     # Router endpoints

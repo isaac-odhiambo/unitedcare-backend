@@ -1,4 +1,3 @@
-# groups/views.py
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -12,18 +11,23 @@ from rest_framework.views import APIView
 from .models import (
     Group,
     GroupContribution,
+    GroupDependant,
     GroupFund,
     GroupJoinRequest,
     GroupMemberShare,
     GroupMembership,
 )
-from .serializers import PostContributionSerializer
+from .serializers import GroupDependantSerializer, PostContributionSerializer
 from .services import (
+    add_group_dependant,
     get_or_create_group_fund,
     get_or_create_member_share,
+    list_my_dependants,
     post_group_contribution,
+    remove_group_dependant,
     require_active_membership,
     require_group_admin,
+    update_group_dependant,
 )
 
 # optional if you still use ledger as source of truth
@@ -835,3 +839,91 @@ class GroupContributionsHistoryView(APIView):
             return Response(payload, status=status.HTTP_200_OK)
 
         raise ValidationError("Invalid scope. Use 'my' or 'all'.")
+
+
+# ====================================================
+# GROUP DEPENDANTS
+# ====================================================
+class GroupDependantViewSet(viewsets.ViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def list(self, request):
+        """
+        GET /api/groups/dependants/?group_id=1
+        """
+        group_id = request.query_params.get("group_id")
+
+        dependants = list_my_dependants(
+            user=request.user,
+            group_id=int(group_id) if group_id else None,
+        )
+
+        ser = GroupDependantSerializer(dependants, many=True)
+        return Response(ser.data, status=status.HTTP_200_OK)
+
+    def create(self, request):
+        """
+        POST /api/groups/dependants/
+        """
+        membership_id = request.data.get("membership")
+        name = request.data.get("name")
+        relationship = request.data.get("relationship")
+        date_of_birth = request.data.get("date_of_birth")
+        note = request.data.get("note")
+
+        if not membership_id:
+            raise ValidationError({"membership": "membership is required."})
+
+        dependant = add_group_dependant(
+            user=request.user,
+            membership_id=int(membership_id),
+            name=name,
+            relationship=relationship,
+            date_of_birth=date_of_birth,
+            note=note,
+        )
+
+        ser = GroupDependantSerializer(dependant)
+        return Response(ser.data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, pk=None):
+        """
+        PUT /api/groups/dependants/{id}/
+        """
+        dependant = update_group_dependant(
+            user=request.user,
+            dependant_id=int(pk),
+            name=request.data.get("name"),
+            relationship=request.data.get("relationship"),
+            date_of_birth=request.data.get("date_of_birth"),
+            note=request.data.get("note"),
+        )
+
+        ser = GroupDependantSerializer(dependant)
+        return Response(ser.data, status=status.HTTP_200_OK)
+
+    def partial_update(self, request, pk=None):
+        """
+        PATCH /api/groups/dependants/{id}/
+        """
+        dependant = update_group_dependant(
+            user=request.user,
+            dependant_id=int(pk),
+            name=request.data.get("name"),
+            relationship=request.data.get("relationship"),
+            date_of_birth=request.data.get("date_of_birth"),
+            note=request.data.get("note"),
+        )
+
+        ser = GroupDependantSerializer(dependant)
+        return Response(ser.data, status=status.HTTP_200_OK)
+
+    def destroy(self, request, pk=None):
+        """
+        DELETE /api/groups/dependants/{id}/
+        """
+        data = remove_group_dependant(
+            user=request.user,
+            dependant_id=int(pk),
+        )
+        return Response(data, status=status.HTTP_200_OK)

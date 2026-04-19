@@ -2,6 +2,7 @@
 from decimal import Decimal
 
 from rest_framework import serializers
+from .models import GroupDependant
 
 from .models import (
     Group,
@@ -294,3 +295,91 @@ class PostContributionSerializer(serializers.Serializer):
 
     def validate_note(self, value):
         return (value or "").strip()
+    
+
+# ---------------------------------------------------
+# Group Dependants
+# ---------------------------------------------------
+
+
+class GroupDependantSerializer(serializers.ModelSerializer):
+    group_id = serializers.IntegerField(source="membership.group.id", read_only=True)
+    group_name = serializers.CharField(source="membership.group.name", read_only=True)
+    user_id = serializers.IntegerField(source="membership.user.id", read_only=True)
+    user_name = serializers.SerializerMethodField()
+    relationship_display = serializers.CharField(source="get_relationship_display", read_only=True)
+
+    class Meta:
+        model = GroupDependant
+        fields = (
+            "id",
+            "membership",
+            "group_id",
+            "group_name",
+            "user_id",
+            "user_name",
+            "name",
+            "relationship",
+            "relationship_display",
+            "date_of_birth",
+            "note",
+            "is_active",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = (
+            "id",
+            "group_id",
+            "group_name",
+            "user_id",
+            "user_name",
+            "relationship_display",
+            "created_at",
+            "updated_at",
+        )
+
+    def get_user_name(self, obj):
+        user = obj.membership.user
+        return (
+            getattr(user, "username", None)
+            or getattr(user, "full_name", None)
+            or getattr(user, "name", None)
+            or str(user.id)
+        )
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("Dependant name is required.")
+        return value
+
+    def validate_relationship(self, value):
+        value = (value or "").strip().upper()
+        allowed = {"SPOUSE", "CHILD", "SIBLING", "PARENT", "OTHER"}
+        if value not in allowed:
+            raise serializers.ValidationError(
+                "relationship must be SPOUSE, CHILD, SIBLING, PARENT or OTHER."
+            )
+        return value
+
+    def validate_note(self, value):
+        return (value or "").strip()
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+
+        membership = attrs.get("membership")
+
+        # 🔒 Ensure user only adds dependants to their own membership
+        if request and membership:
+            if membership.user_id != request.user.id:
+                raise serializers.ValidationError(
+                    "You can only add dependants to your own membership."
+                )
+
+            if not membership.is_active:
+                raise serializers.ValidationError(
+                    "Cannot add dependants to an inactive membership."
+                )
+
+        return attrs

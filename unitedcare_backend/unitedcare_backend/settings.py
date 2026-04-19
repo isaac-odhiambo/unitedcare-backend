@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     "groups",
     "payments",
     "notifications",
+    'channels',
 ]
 
 # =========================
