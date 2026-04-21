@@ -2300,49 +2300,54 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
         payment.period_key = current_payout.period_key
         payment.save(update_fields=["period_key"])
 
-    remaining = q2(payment.amount or Decimal("0"))
+    remaining = q2(payment.amount or Decimal("0.00"))
     if remaining <= 0:
         raise BadState("Payment amount must be > 0.")
 
     dues = list(
-    MerryContributionDue.objects.select_for_update()
-    .filter(
-        merry=merry,
-        seat__member=member,
-        seat__is_active=True,
-        status__in=["PENDING", "PARTIAL", "OVERDUE"],
+        MerryContributionDue.objects.select_for_update()
+        .filter(
+            merry=merry,
+            seat__member=member,
+            seat__is_active=True,
+            status__in=["PENDING", "PARTIAL", "OVERDUE"],
+        )
+        .exclude(
+            payout__isnull=True,
+            due_date__isnull=True,
+        )
+        .select_related("seat")
+        .order_by("due_date", "seat__seat_no", "id")
     )
-    .exclude(
-        payout__isnull=True,
-        due_date__isnull=True,
-    )
-    .select_related("seat")
-    .order_by("due_date", "seat__seat_no", "id")
-)
     _refresh_penalties_for_queryset(dues)
 
     for due in dues:
         if remaining <= 0:
             break
 
-        need = _outstanding_amount(due)
+        due_amount = q2(due.due_amount or Decimal("0.00"))
+        paid_amount = q2(due.paid_amount or Decimal("0.00"))
+        need = q2(due_amount - paid_amount)
+
         if need <= 0:
             continue
 
-        alloc = remaining if remaining < need else need
+        alloc = q2(min(remaining, need))
         if alloc <= 0:
             continue
 
         allocation, _ = MerryPaymentAllocation.objects.get_or_create(
             payment=payment,
             due=due,
-            defaults={"amount_allocated": Decimal("0")},
+            defaults={"amount_allocated": Decimal("0.00")},
         )
-        allocation.amount_allocated = q2((allocation.amount_allocated or Decimal("0")) + alloc)
+        allocation.amount_allocated = q2(
+            (allocation.amount_allocated or Decimal("0.00")) + alloc
+        )
         allocation.full_clean()
         allocation.save(update_fields=["amount_allocated"])
 
-        due.paid_amount = q2((due.paid_amount or Decimal("0")) + alloc)
+        due.paid_amount = q2((due.paid_amount or Decimal("0.00")) + alloc)
         due.recalc_status()
         due.save(update_fields=["paid_amount", "status", "updated_at"])
 
@@ -2353,12 +2358,14 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
             user=member.user,
             amount=remaining,
             reference=f"PAY-{payment.id}",
-            narration=f"Excess merry payment saved to wallet after payment allocation #{payment.id}.",
+            narration=(
+                f"Excess merry payment saved to wallet after payment allocation "
+                f"#{payment.id}."
+            ),
             mpesa_receipt_number=payment.mpesa_receipt_number,
         )
 
     return payment
-
 
 # -----------------------------
 # Readiness helpers
