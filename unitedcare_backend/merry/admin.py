@@ -630,13 +630,15 @@ class MerryWalletTransactionInline(admin.TabularInline):
     show_change_link = True
 
 
-#from django import forms
+
+
+from django import forms
 from django.contrib import admin
 from .models import MerryGoRound
 
+
 # Custom Admin Form for handling payout_days as checkboxes
 class MerryGoRoundAdminForm(forms.ModelForm):
-    # List of choices for payout days (Monday to Sunday)
     PAYOUT_DAY_CHOICES = [
         ('0', 'Monday'),
         ('1', 'Tuesday'),
@@ -647,11 +649,10 @@ class MerryGoRoundAdminForm(forms.ModelForm):
         ('6', 'Sunday'),
     ]
     
-    # MultipleChoiceField for payout_days with checkboxes
     payout_days = forms.MultipleChoiceField(
         choices=PAYOUT_DAY_CHOICES,
-        widget=forms.CheckboxSelectMultiple,  # Display as checkboxes
-        required=False,  # Allow empty field
+        widget=forms.CheckboxSelectMultiple,
+        required=False,
         help_text="Select the payout days for this merry-go-round."
     )
 
@@ -663,7 +664,6 @@ class MerryGoRoundAdminForm(forms.ModelForm):
         cleaned_data = super().clean()
         payout_days = cleaned_data.get("payout_days")
 
-        # Ensure at least one payout day is selected
         if not payout_days:
             raise forms.ValidationError("At least one payout day must be selected.")
         return cleaned_data
@@ -672,7 +672,7 @@ class MerryGoRoundAdminForm(forms.ModelForm):
 # Admin interface for MerryGoRound
 @admin.register(MerryGoRound)
 class MerryGoRoundAdmin(admin.ModelAdmin):
-    form = MerryGoRoundAdminForm  # Use the custom form for admin
+    form = MerryGoRoundAdminForm  # Link the custom form to the admin panel
     list_display = (
         "id",
         "name",
@@ -690,14 +690,13 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "payout_days_display",  # Display payout days in list view
     )
 
-    # Define fieldsets to show in admin form (remove custom methods)
     fieldsets = (
         ("Core", {
             "fields": (
                 "name",
                 "created_by",
                 "contribution_amount",
-                "cycle_duration_weeks",  # Show cycle duration in admin form
+                "cycle_duration_weeks",
             )
         }),
         ("Payout Setup", {
@@ -721,15 +720,15 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
             "fields": (
                 "is_open",
                 "max_seats",
-                "available_seats_display",  # Add this to display available seats in the admin form
+                "available_seats_display",
             )
         }),
         ("Current Queue Summary", {
             "fields": (
-                "current_target_display",  # This is for displaying in the form
-                "current_due_date_display",  # This is for displaying in the form
-                "current_pool_display",  # This is for displaying in the form
-                "queue_summary_display",  # This is for displaying in the form
+                "current_target_display",  # Display method, not field
+                "current_due_date_display",  # Display method, not field
+                "current_pool_display",  # Display method, not field
+                "queue_summary_display",  # Display method, not field
                 "created_at",
             )
         }),
@@ -797,7 +796,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         return format_html("<br>".join(parts))
 
     queue_summary_display.short_description = "Queue Order"
-    
+
 # # MERRYGOROUND ADMIN
 # # =========================================================
 # @admin.register(MerryGoRound)
