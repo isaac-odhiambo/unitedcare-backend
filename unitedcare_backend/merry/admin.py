@@ -630,11 +630,52 @@ class MerryWalletTransactionInline(admin.TabularInline):
     show_change_link = True
 
 
-# =========================================================
-# MERRYGOROUND ADMIN
-# =========================================================
+## admin.py
+
+from django import forms
+from django.contrib import admin
+from .models import MerryGoRound
+
+
+# Custom Admin Form for handling payout_days as checkboxes
+class MerryGoRoundAdminForm(forms.ModelForm):
+    # List of choices for payout days (Monday to Sunday)
+    PAYOUT_DAY_CHOICES = [
+        ('0', 'Monday'),
+        ('1', 'Tuesday'),
+        ('2', 'Wednesday'),
+        ('3', 'Thursday'),
+        ('4', 'Friday'),
+        ('5', 'Saturday'),
+        ('6', 'Sunday'),
+    ]
+    
+    # MultipleChoiceField for payout_days with checkboxes
+    payout_days = forms.MultipleChoiceField(
+        choices=PAYOUT_DAY_CHOICES,
+        widget=forms.CheckboxSelectMultiple,  # Display as checkboxes
+        required=False,  # Allow empty field
+        help_text="Select the payout days for this merry-go-round."
+    )
+
+    class Meta:
+        model = MerryGoRound
+        fields = "__all__"
+
+    def clean(self):
+        cleaned_data = super().clean()
+        payout_days = cleaned_data.get("payout_days")
+
+        # Ensure at least one payout day is selected
+        if not payout_days:
+            raise forms.ValidationError("At least one payout day must be selected.")
+        return cleaned_data
+
+
+# Admin interface for MerryGoRound
 @admin.register(MerryGoRound)
 class MerryGoRoundAdmin(admin.ModelAdmin):
+    form = MerryGoRoundAdminForm  # Use the custom form for admin
     list_display = (
         "id",
         "name",
@@ -653,45 +694,17 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "active_seats_count",
         "current_pool_display",
         "created_at",
-        "payout_days_display",  # Add this line to display payout days
+        "payout_days_display",  # Add this to display payout days in the list view
     )
-    list_filter = (
-        "is_open",
-        "payout_order_type",
-        "payout_frequency",
-        "penalty_mode",
-        "created_at",
-    )
-    search_fields = (
-        "name",
-        "created_by__username",
-        "created_by__phone",
-    )
-    ordering = ("-id",)
-    list_select_related = ("created_by",)
-    readonly_fields = (
-        "created_at",
-        "available_seats_display",
-        "current_target_display",
-        "current_due_date_display",
-        "current_pool_display",
-        "queue_summary_display",
-    )
-    actions = [prepare_current_payout_and_dues]
-    inlines = [
-        MerryMemberInline,
-        MerrySeatInline,
-        MerryJoinRequestInline,
-        MerryPayoutInline,
-    ]
 
+    # Define fieldsets to show in admin form
     fieldsets = (
         ("Core", {
             "fields": (
                 "name",
                 "created_by",
                 "contribution_amount",
-                # "cycle_duration_weeks",
+                "cycle_duration_weeks",  # Show cycle duration in admin form
             )
         }),
         ("Payout Setup", {
@@ -699,7 +712,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "payout_order_type",
                 "payout_frequency",
                 "next_payout_date",
-                "payout_days",  # Add this line to allow admin to select payout days
+                "payout_days",  # Include payout_days in the admin form
             )
         }),
         ("Penalty Policy", {
@@ -729,6 +742,14 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         }),
     )
 
+    # Custom method to display payout days in list view
+    def payout_days_display(self, obj):
+        """Display the selected payout days in a comma-separated string."""
+        return ", ".join(obj.payout_days) if obj.payout_days else "Not Set"
+
+    payout_days_display.short_description = "Payout Days"
+
+    # Add other custom methods for active members, seats, etc.
     def active_members_count(self, obj):
         return obj.members.filter(is_active=True).count()
 
@@ -793,13 +814,6 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         return "Unlimited" if v is None else v
 
     available_seats_display.short_description = "Available Seats"
-
-    def payout_days_display(self, obj):
-        """Display the selected payout days in a comma-separated string."""
-        return ", ".join(obj.payout_days) if obj.payout_days else "Not Set"
-
-    payout_days_display.short_description = "Payout Days"
-# # =========================================================
 # # MERRYGOROUND ADMIN
 # # =========================================================
 # @admin.register(MerryGoRound)
