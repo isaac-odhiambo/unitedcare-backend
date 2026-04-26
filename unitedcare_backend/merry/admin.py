@@ -630,12 +630,9 @@ class MerryWalletTransactionInline(admin.TabularInline):
     show_change_link = True
 
 
-## admin.py
-
-from django import forms
+#from django import forms
 from django.contrib import admin
 from .models import MerryGoRound
-
 
 # Custom Admin Form for handling payout_days as checkboxes
 class MerryGoRoundAdminForm(forms.ModelForm):
@@ -686,18 +683,14 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "penalty_mode",
         "is_open",
         "max_seats",
-        "available_seats_display",
-        "current_target_display",
-        "current_due_date_display",
-        "next_payout_date",
-        "active_members_count",
-        "active_seats_count",
-        "current_pool_display",
-        "created_at",
-        "payout_days_display",  # Add this to display payout days in the list view
+        "available_seats_display",  # Display available seats in list view
+        "current_target_display",  # Display current target in list view
+        "current_due_date_display",  # Display current due date in list view
+        "current_pool_display",  # Display current pool in list view
+        "payout_days_display",  # Display payout days in list view
     )
 
-    # Define fieldsets to show in admin form
+    # Define fieldsets to show in admin form (remove custom methods)
     fieldsets = (
         ("Core", {
             "fields": (
@@ -712,7 +705,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "payout_order_type",
                 "payout_frequency",
                 "next_payout_date",
-                "payout_days",  # Include payout_days in the admin form
+                "payout_days",  # Include payout_days in the admin form for selection
             )
         }),
         ("Penalty Policy", {
@@ -728,15 +721,15 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
             "fields": (
                 "is_open",
                 "max_seats",
-                "available_seats_display",
+                "available_seats_display",  # Add this to display available seats in the admin form
             )
         }),
         ("Current Queue Summary", {
             "fields": (
-                "current_target_display",
-                "current_due_date_display",
-                "current_pool_display",
-                "queue_summary_display",
+                "current_target_display",  # This is for displaying in the form
+                "current_due_date_display",  # This is for displaying in the form
+                "current_pool_display",  # This is for displaying in the form
+                "queue_summary_display",  # This is for displaying in the form
                 "created_at",
             )
         }),
@@ -749,16 +742,12 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
 
     payout_days_display.short_description = "Payout Days"
 
-    # Add other custom methods for active members, seats, etc.
-    def active_members_count(self, obj):
-        return obj.members.filter(is_active=True).count()
+    # Custom methods for other fields (These should only be in list_display)
+    def available_seats_display(self, obj):
+        v = obj.available_seats()
+        return "Unlimited" if v is None else v
 
-    active_members_count.short_description = "Active Members"
-
-    def active_seats_count(self, obj):
-        return obj.seats.filter(is_active=True).count()
-
-    active_seats_count.short_description = "Active Seats"
+    available_seats_display.short_description = "Available Seats"
 
     def current_target_display(self, obj):
         try:
@@ -808,12 +797,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         return format_html("<br>".join(parts))
 
     queue_summary_display.short_description = "Queue Order"
-
-    def available_seats_display(self, obj):
-        v = obj.available_seats()
-        return "Unlimited" if v is None else v
-
-    available_seats_display.short_description = "Available Seats"
+    
 # # MERRYGOROUND ADMIN
 # # =========================================================
 # @admin.register(MerryGoRound)
