@@ -114,7 +114,7 @@ def _date_only(value) -> Optional[date]:
         return value
     return None
 
-
+# models.py
 # ----------------------------
 # Core Merry
 # ----------------------------
@@ -280,54 +280,111 @@ class MerryGoRound(models.Model):
 
         year, week = _parse_week_period_key(period_key)
         return date.fromisocalendar(year, week, 7)
+    
+def get_slot_due_date(self, period_key: str, slot_no: int) -> Optional[date]:
+    """
+    Compatibility helper with added logic to respect each seat's payout_day.
+    - slot_no should still be 1 for the main payout logic.
+    - seat payout days are checked dynamically.
+    """
+    if slot_no == 1:
+        start = self.period_start_date(period_key)
 
-    def get_slot_due_date(self, period_key: str, slot_no: int) -> Optional[date]:
-        """
-        Compatibility helper.
+        # Find the first active seat (if available) to get the corresponding payout_day
+        seat = self.seats.filter(is_active=True).first()  # Get the first active seat
 
-        Queue-based ROSCA does not rely on multi-slot config anymore.
-        We keep this method because older code/admin may still call it.
+        if seat and seat.payout_day:
+            # Get the weekday for the seat's specific payout_day
+            weekday = int(seat.payout_day)
+            # Calculate the first payout date (week starting from the start date)
+            payout_date = start + timedelta(days=(weekday - start.weekday()) % 7)
+            return payout_date
 
-        Active expectation:
-          - slot_no should be 1
-          - due date should resolve to the period date / start date
+        # If no specific payout_day is set, fallback to default logic (start date)
+        return start  # Fallback: Return the start date if no payout_day is set
 
-        Legacy slot-config support is kept as a fallback.
-        """
-        if slot_no == 1:
-            start = self.period_start_date(period_key)
-            return start
+    # Legacy fallback path for slot configurations (keeps compatibility)
+    slot_cfg = self.slot_configs.filter(slot_no=slot_no).first()
+    if not slot_cfg:
+        return None
 
-        # Legacy fallback path only
-        slot_cfg = self.slot_configs.filter(slot_no=slot_no).first()
-        if not slot_cfg:
-            return None
+    weekday = int(slot_cfg.weekday)
 
-        weekday = int(slot_cfg.weekday)
+    # Handle monthly payouts (if configured)
+    if self.payout_frequency == "MONTHLY":
+        year, month = _parse_month_period_key(period_key)
+        due_dt = _nth_weekday_in_month(year, month, weekday, slot_no)
 
-        if self.payout_frequency == "MONTHLY":
-            year, month = _parse_month_period_key(period_key)
-            due_dt = _nth_weekday_in_month(year, month, weekday, slot_no)
+        if due_dt is not None:
+            return due_dt
 
-            if due_dt is not None:
-                return due_dt
+        last_valid = None
+        n = 1
+        while True:
+            candidate = _nth_weekday_in_month(year, month, weekday, n)
+            if candidate is None:
+                break
+            last_valid = candidate
+            n += 1
+        return last_valid
 
-            last_valid = None
-            n = 1
-            while True:
-                candidate = _nth_weekday_in_month(year, month, weekday, n)
-                if candidate is None:
-                    break
-                last_valid = candidate
-                n += 1
-            return last_valid
+    # Handle daily payouts (if configured)
+    if self.payout_frequency == "DAILY":
+        return _parse_day_period_key(period_key)
 
-        if self.payout_frequency == "DAILY":
-            return _parse_day_period_key(period_key)
+    # Handle weekly payouts (default logic)
+    year, week = _parse_week_period_key(period_key)
+    monday = date.fromisocalendar(year, week, 1)
+    return monday + timedelta(days=weekday)
 
-        year, week = _parse_week_period_key(period_key)
-        monday = date.fromisocalendar(year, week, 1)
-        return monday + timedelta(days=weekday)
+
+    # def get_slot_due_date(self, period_key: str, slot_no: int) -> Optional[date]:
+    #     """
+    #     Compatibility helper.
+
+    #     Queue-based ROSCA does not rely on multi-slot config anymore.
+    #     We keep this method because older code/admin may still call it.
+
+    #     Active expectation:
+    #       - slot_no should be 1
+    #       - due date should resolve to the period date / start date
+
+    #     Legacy slot-config support is kept as a fallback.
+    #     """
+    #     if slot_no == 1:
+    #         start = self.period_start_date(period_key)
+    #         return start
+
+    #     # Legacy fallback path only
+    #     slot_cfg = self.slot_configs.filter(slot_no=slot_no).first()
+    #     if not slot_cfg:
+    #         return None
+
+    #     weekday = int(slot_cfg.weekday)
+
+    #     if self.payout_frequency == "MONTHLY":
+    #         year, month = _parse_month_period_key(period_key)
+    #         due_dt = _nth_weekday_in_month(year, month, weekday, slot_no)
+
+    #         if due_dt is not None:
+    #             return due_dt
+
+    #         last_valid = None
+    #         n = 1
+    #         while True:
+    #             candidate = _nth_weekday_in_month(year, month, weekday, n)
+    #             if candidate is None:
+    #                 break
+    #             last_valid = candidate
+    #             n += 1
+    #         return last_valid
+
+    #     if self.payout_frequency == "DAILY":
+    #         return _parse_day_period_key(period_key)
+
+    #     year, week = _parse_week_period_key(period_key)
+    #     monday = date.fromisocalendar(year, week, 1)
+    #     return monday + timedelta(days=weekday)
 
     def add_schedule_step(self, base_date: date) -> date:
         if self.payout_frequency == "DAILY":
@@ -671,6 +728,7 @@ class MerryMember(models.Model):
 # ----------------------------
 # Seats/Shares
 # ----------------------------
+
 class MerrySeat(models.Model):
     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="seats")
     member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="seats")
@@ -678,8 +736,33 @@ class MerrySeat(models.Model):
     seat_no = models.PositiveIntegerField()
     payout_position = models.PositiveIntegerField(null=True, blank=True)
 
+    payout_day = models.PositiveSmallIntegerField(
+        choices=[
+            (0, 'Monday'),
+            (1, 'Tuesday'),
+            (2, 'Wednesday'),
+            (3, 'Thursday'),
+            (4, 'Friday'),
+            (5, 'Saturday'),
+            (6, 'Sunday'),
+        ],
+        null=True,
+        blank=True,
+        help_text="Day of the week for this seat payout"
+    )
+
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(default=timezone.now)
+
+# class MerrySeat(models.Model):
+#     merry = models.ForeignKey(MerryGoRound, on_delete=models.CASCADE, related_name="seats")
+#     member = models.ForeignKey(MerryMember, on_delete=models.CASCADE, related_name="seats")
+
+#     seat_no = models.PositiveIntegerField()
+#     payout_position = models.PositiveIntegerField(null=True, blank=True)
+
+#     is_active = models.BooleanField(default=True)
+#     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
         ordering = ["seat_no", "id"]

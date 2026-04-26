@@ -15,6 +15,7 @@ from .models import (
     MerryPayout,
     MerryWallet,
     MerryWalletTransaction,
+    MerrySlotConfig,
 )
 from .services import (
     add_seats_to_existing_member,
@@ -24,6 +25,9 @@ from .services import (
     ensure_current_payout_exists,
     ensure_dues_for_current_payout,
     get_next_payout_turn,
+    admin_approve_join_request,
+    recalculate_merry_cycle_duration,
+    maybe_update_next_payout_date,
 )
 
 
@@ -525,6 +529,14 @@ def cancel_payouts(modeladmin, request, queryset):
 # =========================================================
 # INLINES
 # =========================================================
+
+class MerrySlotConfigInline(admin.TabularInline):
+    model = MerrySlotConfig
+    extra = 2
+    fields = ("slot_no", "weekday")
+    ordering = ("slot_no",)
+
+
 class MerryMemberInline(admin.TabularInline):
     model = MerryMember
     extra = 0
@@ -630,6 +642,167 @@ class MerryWalletTransactionInline(admin.TabularInline):
     show_change_link = True
 
 
+# # =========================================================
+# # MERRYGOROUND ADMIN
+# # =========================================================
+# @admin.register(MerryGoRound)
+# class MerryGoRoundAdmin(admin.ModelAdmin):
+#     list_display = (
+#         "id",
+#         "name",
+#         "created_by",
+#         "contribution_amount",
+#         "payout_frequency",
+#         "payout_order_type",
+#         "penalty_mode",
+#         "is_open",
+#         "max_seats",
+#         "available_seats_display",
+#         "current_target_display",
+#         "current_due_date_display",
+#         "next_payout_date",
+#         "active_members_count",
+#         "active_seats_count",
+#         "current_pool_display",
+#         "created_at",
+#     )
+#     list_filter = (
+#         "is_open",
+#         "payout_order_type",
+#         "payout_frequency",
+#         "penalty_mode",
+#         "created_at",
+#     )
+#     search_fields = (
+#         "name",
+#         "created_by__username",
+#         "created_by__phone",
+#     )
+#     ordering = ("-id",)
+#     list_select_related = ("created_by",)
+#     readonly_fields = (
+#         "created_at",
+#         "available_seats_display",
+#         "current_target_display",
+#         "current_due_date_display",
+#         "current_pool_display",
+#         "queue_summary_display",
+#     )
+#     actions = [prepare_current_payout_and_dues]
+#     inlines = [
+#         MerryMemberInline,
+#         MerrySeatInline,
+#         MerryJoinRequestInline,
+#         MerryPayoutInline,
+#     ]
+
+#     fieldsets = (
+#         ("Core", {
+#             "fields": (
+#                 "name",
+#                 "created_by",
+#                 "contribution_amount",
+#                 "cycle_duration_weeks",
+#             )
+#         }),
+#         ("Payout Setup", {
+#             "fields": (
+#                 "payout_order_type",
+#                 "payout_frequency",
+#                 "next_payout_date",
+#             )
+#         }),
+#         ("Penalty Policy", {
+#             "fields": (
+#                 "penalty_mode",
+#                 "flat_penalty_amount",
+#                 "daily_penalty_amount",
+#                 "penalty_grace_days",
+#                 "penalty_cap_amount",
+#             )
+#         }),
+#         ("Joining / Capacity", {
+#             "fields": (
+#                 "is_open",
+#                 "max_seats",
+#                 "available_seats_display",
+#             )
+#         }),
+#         ("Current Queue Summary", {
+#             "fields": (
+#                 "current_target_display",
+#                 "current_due_date_display",
+#                 "current_pool_display",
+#                 "queue_summary_display",
+#                 "created_at",
+#             )
+#         }),
+#     )
+
+#     def active_members_count(self, obj):
+#         return obj.members.filter(is_active=True).count()
+
+#     active_members_count.short_description = "Active Members"
+
+#     def active_seats_count(self, obj):
+#         return obj.seats.filter(is_active=True).count()
+
+#     active_seats_count.short_description = "Active Seats"
+
+#     def current_target_display(self, obj):
+#         try:
+#             preview = get_next_payout_turn(merry_id=obj.id)
+#             seat_no = preview.get("seat_no")
+#             username = preview.get("username") or "-"
+#             return f"{username} (Seat {seat_no})"
+#         except Exception:
+#             return "—"
+
+#     current_target_display.short_description = "Current Payout Target"
+
+#     def current_due_date_display(self, obj):
+#         try:
+#             preview = get_next_payout_turn(merry_id=obj.id)
+#             return preview.get("due_date") or preview.get("period_key") or "—"
+#         except Exception:
+#             return "—"
+
+#     current_due_date_display.short_description = "Current Payout Date"
+
+#     def current_pool_display(self, obj):
+#         try:
+#             preview = get_next_payout_turn(merry_id=obj.id)
+#             return preview.get("expected_amount") or 0
+#         except Exception:
+#             try:
+#                 return obj.total_pool_per_slot()
+#             except Exception:
+#                 return "—"
+
+#     current_pool_display.short_description = "Current Payout Pool"
+
+#     def queue_summary_display(self, obj):
+#         seats = list(
+#             obj.seats.filter(is_active=True)
+#             .select_related("member", "member__user")
+#             .order_by("payout_position", "seat_no", "id")
+#         )
+#         if not seats:
+#             return "No active seats."
+
+#         parts = [
+#             f"{seat.payout_position or '-'}: {seat.member.user} (Seat {seat.seat_no})"
+#             for seat in seats
+#         ]
+#         return format_html("<br>".join(parts))
+
+#     queue_summary_display.short_description = "Queue Order"
+
+#     def available_seats_display(self, obj):
+#         v = obj.available_seats()
+#         return "Unlimited" if v is None else v
+
+#     available_seats_display.short_description = "Available Seats"
 # =========================================================
 # MERRYGOROUND ADMIN
 # =========================================================
@@ -654,6 +827,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "current_pool_display",
         "created_at",
     )
+
     list_filter = (
         "is_open",
         "payout_order_type",
@@ -661,23 +835,31 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "penalty_mode",
         "created_at",
     )
+
     search_fields = (
         "name",
         "created_by__username",
         "created_by__phone",
     )
+
     ordering = ("-id",)
     list_select_related = ("created_by",)
+
     readonly_fields = (
         "created_at",
+        "cycle_duration_weeks",
+        "payout_days_display",
         "available_seats_display",
         "current_target_display",
         "current_due_date_display",
         "current_pool_display",
         "queue_summary_display",
     )
+
     actions = [prepare_current_payout_and_dues]
+
     inlines = [
+        MerrySlotConfigInline,
         MerryMemberInline,
         MerrySeatInline,
         MerryJoinRequestInline,
@@ -698,6 +880,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "payout_order_type",
                 "payout_frequency",
                 "next_payout_date",
+                "payout_days_display",
             )
         }),
         ("Penalty Policy", {
@@ -726,6 +909,28 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
             )
         }),
     )
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+
+        merry = form.instance
+        recalculate_merry_cycle_duration(merry=merry)
+        maybe_update_next_payout_date(merry=merry)
+
+    def payout_days_display(self, obj):
+        if not obj or not obj.pk:
+            return "Save first, then add payout weekdays below."
+
+        slots = obj.slot_configs.all().order_by("slot_no", "id")
+        if not slots:
+            return "No payout days configured."
+
+        return ", ".join(
+            f"Slot {slot.slot_no}: {slot.get_weekday_display()}"
+            for slot in slots
+        )
+
+    payout_days_display.short_description = "Configured Payout Days"
 
     def active_members_count(self, obj):
         return obj.members.filter(is_active=True).count()
@@ -791,7 +996,6 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         return "Unlimited" if v is None else v
 
     available_seats_display.short_description = "Available Seats"
-
 
 # =========================================================
 # MEMBER ADMIN
@@ -974,6 +1178,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         "reviewed_at",
         "created_at",
     )
+
     list_filter = (
         "status",
         "created_at",
@@ -981,14 +1186,17 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         "merry",
         "merry__is_open",
     )
+
     search_fields = (
         "merry__name",
         "user__username",
         "user__phone",
         "note",
     )
+
     ordering = ("-id",)
     list_select_related = ("merry", "user", "reviewed_by")
+
     readonly_fields = (
         "created_at",
         "reviewed_at",
@@ -996,6 +1204,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         "member_note_display",
         "assigned_seats_display",
     )
+
     actions = [reject_join_requests]
 
     fieldsets = (
@@ -1049,6 +1258,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
             "member_note_display",
             "assigned_seats_display",
         ]
+
         if obj and obj.status == "APPROVED":
             ro.extend([
                 "merry",
@@ -1059,6 +1269,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 "reviewed_by",
                 "available_seat_selection",
             ])
+
         return ro
 
     def merry_open_display(self, obj):
@@ -1070,6 +1281,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
     def member_note_short(self, obj):
         if not obj.note:
             return "-"
+
         text = obj.note.strip()
         return text if len(text) <= 40 else f"{text[:40]}..."
 
@@ -1078,6 +1290,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
     def member_note_display(self, obj):
         if not obj or not obj.pk or not obj.note:
             return "No note provided by member."
+
         return obj.note
 
     member_note_display.short_description = "Full Member Note"
@@ -1125,13 +1338,19 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         selected_seats = form.cleaned_data.get("available_seat_selection") or []
 
         if change:
-            old_obj = MerryJoinRequest.objects.select_related("merry", "user").get(pk=obj.pk)
+            old_obj = (
+                MerryJoinRequest.objects
+                .select_related("merry", "user")
+                .get(pk=obj.pk)
+            )
 
             if old_obj.status == "PENDING" and obj.status == "APPROVED":
-                member, seats = old_obj.approve(
-                    request.user,
+                member, seats = admin_approve_join_request(
+                    admin_user=request.user,
+                    request_id=old_obj.id,
                     assigned_seat_numbers=selected_seats,
                 )
+
                 self.message_user(
                     request,
                     f"Join request approved. Seats assigned: {', '.join(str(seat.seat_no) for seat in seats)}",
@@ -1141,6 +1360,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
 
             if old_obj.status == "PENDING" and obj.status == "REJECTED":
                 old_obj.reject(request.user, note=obj.note or "")
+
                 self.message_user(
                     request,
                     "Join request rejected.",
@@ -1157,7 +1377,6 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 return
 
         super().save_model(request, obj, form, change)
-
 
 # =========================================================
 # CONTRIBUTION DUE ADMIN

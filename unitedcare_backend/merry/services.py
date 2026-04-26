@@ -1696,21 +1696,147 @@ def apply_mpesa_contribution(
         reference=reference,
     )
 
+def _calculate_cycle_duration_weeks(*, active_seats: int, payout_days_count: int) -> int:
+    active_seats = int(active_seats or 0)
+    payout_days_count = int(payout_days_count or 1)
+
+    if payout_days_count < 1:
+        payout_days_count = 1
+
+    if active_seats < 1:
+        return 1
+
+    return max(1, (active_seats + payout_days_count - 1) // payout_days_count)
+
+
+def recalculate_merry_cycle_duration(*, merry: MerryGoRound) -> MerryGoRound:
+    active_seats = MerrySeat.objects.filter(merry=merry, is_active=True).count()
+    payout_days_count = MerrySlotConfig.objects.filter(merry=merry).count()
+
+    if payout_days_count < 1:
+        payout_days_count = 1
+
+    new_cycle_weeks = _calculate_cycle_duration_weeks(
+        active_seats=active_seats,
+        payout_days_count=payout_days_count,
+    )
+
+    changed = False
+
+    if merry.payouts_per_period != payout_days_count:
+        merry.payouts_per_period = payout_days_count
+        changed = True
+
+    if merry.cycle_duration_weeks != new_cycle_weeks:
+        merry.cycle_duration_weeks = new_cycle_weeks
+        changed = True
+
+    if changed:
+        merry.save(update_fields=["payouts_per_period", "cycle_duration_weeks"])
+
+    return merry
 
 # -----------------------------
 # Merry lifecycle
 # -----------------------------
+# @transaction.atomic
+# def create_merry(
+#     *,
+#     creator,
+#     name: str,
+#     contribution_amount: Decimal,
+#     cycle_duration_weeks: int = 1,
+#     payout_order_type: str = "manual",
+#     next_payout_date=None,
+#     payout_frequency: str = "WEEKLY",
+#     payouts_per_period: int = 1,
+#     is_open: bool = True,
+#     max_seats: int = 0,
+#     penalty_mode: str = "NONE",
+#     flat_penalty_amount: Decimal = Decimal("0.00"),
+#     daily_penalty_amount: Decimal = Decimal("0.00"),
+#     penalty_grace_days: int = 0,
+#     penalty_cap_amount: Optional[Decimal] = None,
+# ) -> MerryGoRound:
+#     if not is_admin(creator):
+#         raise NotAllowed("Admin only.")
+
+#     name = (name or "").strip()
+#     if not name:
+#         raise BadState("name is required.")
+
+#     amount = parse_decimal(contribution_amount, "contribution_amount")
+#     if amount <= 0:
+#         raise BadState("contribution_amount must be > 0.")
+
+#     cycle_duration_weeks = parse_int(
+#         cycle_duration_weeks,
+#         "cycle_duration_weeks",
+#         min_value=1,
+#         max_value=520,
+#     )
+
+#     payout_order_type = (payout_order_type or "manual").strip().lower()
+#     if payout_order_type not in ("manual", "random"):
+#         raise BadState("payout_order_type must be 'manual' or 'random'.")
+
+#     payout_frequency = (payout_frequency or "WEEKLY").upper().strip()
+#     if payout_frequency not in ("DAILY", "WEEKLY", "MONTHLY"):
+#         raise BadState("payout_frequency must be 'DAILY', 'WEEKLY' or 'MONTHLY'.")
+
+#     payouts_per_period = parse_int(
+#         payouts_per_period,
+#         "payouts_per_period",
+#         min_value=1,
+#         max_value=14,
+#     )
+
+#     is_open = parse_bool(is_open, default=True)
+#     max_seats = parse_int(max_seats or 0, "max_seats", min_value=0)
+
+#     penalty_mode = (penalty_mode or "NONE").upper().strip()
+#     if penalty_mode not in ("NONE", "FLAT", "DAILY"):
+#         raise BadState("penalty_mode must be NONE, FLAT or DAILY.")
+
+#     flat_penalty_amount = parse_decimal(flat_penalty_amount or 0, "flat_penalty_amount")
+#     daily_penalty_amount = parse_decimal(daily_penalty_amount or 0, "daily_penalty_amount")
+#     penalty_grace_days = parse_int(penalty_grace_days or 0, "penalty_grace_days", min_value=0)
+
+#     if penalty_cap_amount not in (None, ""):
+#         penalty_cap_amount = parse_decimal(penalty_cap_amount, "penalty_cap_amount")
+#     else:
+#         penalty_cap_amount = None
+
+#     merry = MerryGoRound.objects.create(
+#         name=name,
+#         contribution_amount=amount,
+#         cycle_duration_weeks=cycle_duration_weeks,
+#         payout_order_type=payout_order_type,
+#         next_payout_date=next_payout_date or None,
+#         created_by=creator,
+#         payout_frequency=payout_frequency,
+#         payouts_per_period=payouts_per_period,
+#         is_open=is_open,
+#         max_seats=max_seats,
+#         penalty_mode=penalty_mode,
+#         flat_penalty_amount=flat_penalty_amount,
+#         daily_penalty_amount=daily_penalty_amount,
+#         penalty_grace_days=penalty_grace_days,
+#         penalty_cap_amount=penalty_cap_amount,
+#     )
+#     merry.full_clean()
+#     merry.save()
+#     return merry
 @transaction.atomic
 def create_merry(
     *,
     creator,
     name: str,
     contribution_amount: Decimal,
-    cycle_duration_weeks: int = 1,
     payout_order_type: str = "manual",
     next_payout_date=None,
     payout_frequency: str = "WEEKLY",
-    payouts_per_period: int = 1,
+    payout_weekdays: Optional[List[int]] = None,
     is_open: bool = True,
     max_seats: int = 0,
     penalty_mode: str = "NONE",
@@ -1730,13 +1856,6 @@ def create_merry(
     if amount <= 0:
         raise BadState("contribution_amount must be > 0.")
 
-    cycle_duration_weeks = parse_int(
-        cycle_duration_weeks,
-        "cycle_duration_weeks",
-        min_value=1,
-        max_value=520,
-    )
-
     payout_order_type = (payout_order_type or "manual").strip().lower()
     if payout_order_type not in ("manual", "random"):
         raise BadState("payout_order_type must be 'manual' or 'random'.")
@@ -1745,12 +1864,22 @@ def create_merry(
     if payout_frequency not in ("DAILY", "WEEKLY", "MONTHLY"):
         raise BadState("payout_frequency must be 'DAILY', 'WEEKLY' or 'MONTHLY'.")
 
-    payouts_per_period = parse_int(
-        payouts_per_period,
-        "payouts_per_period",
-        min_value=1,
-        max_value=14,
-    )
+    if payout_weekdays is None:
+        payout_weekdays = [0]
+
+    if not isinstance(payout_weekdays, list) or not payout_weekdays:
+        raise BadState("payout_weekdays must be a non-empty list.")
+
+    normalized_weekdays = []
+    for weekday in payout_weekdays:
+        day = parse_int(weekday, "weekday", min_value=0, max_value=6)
+        if day in normalized_weekdays:
+            raise BadState("Duplicate payout weekday is not allowed.")
+        normalized_weekdays.append(day)
+
+    normalized_weekdays.sort()
+
+    payouts_per_period = len(normalized_weekdays)
 
     is_open = parse_bool(is_open, default=True)
     max_seats = parse_int(max_seats or 0, "max_seats", min_value=0)
@@ -1767,6 +1896,11 @@ def create_merry(
         penalty_cap_amount = parse_decimal(penalty_cap_amount, "penalty_cap_amount")
     else:
         penalty_cap_amount = None
+
+    cycle_duration_weeks = _calculate_cycle_duration_weeks(
+        active_seats=0,
+        payout_days_count=payouts_per_period,
+    )
 
     merry = MerryGoRound.objects.create(
         name=name,
@@ -1785,11 +1919,59 @@ def create_merry(
         penalty_grace_days=penalty_grace_days,
         penalty_cap_amount=penalty_cap_amount,
     )
+
+    for index, weekday in enumerate(normalized_weekdays, start=1):
+        MerrySlotConfig.objects.create(
+            merry=merry,
+            slot_no=index,
+            weekday=weekday,
+        )
+
+    recalculate_merry_cycle_duration(merry=merry)
+
     merry.full_clean()
     merry.save()
+
     return merry
 
 
+# @transaction.atomic
+# def set_slot_config_bulk(*, admin_user, merry_id: int, items: List[dict]) -> List[MerrySlotConfig]:
+#     if not is_admin(admin_user):
+#         raise NotAllowed("Admin only.")
+
+#     merry = get_merry(merry_id)
+
+#     if not isinstance(items, list) or not items:
+#         raise BadState("items must be a non-empty list.")
+
+#     seen = set()
+#     for it in items:
+#         slot_no = parse_int(it.get("slot_no"), "slot_no", min_value=1)
+#         weekday = parse_int(it.get("weekday"), "weekday", min_value=0, max_value=6)
+
+#         validate_slot(merry, slot_no)
+
+#         if slot_no in seen:
+#             raise BadState("Duplicate slot_no in payload.")
+#         seen.add(slot_no)
+
+#     out: List[MerrySlotConfig] = []
+#     for it in items:
+#         slot_no = int(it["slot_no"])
+#         weekday = int(it["weekday"])
+#         obj, _ = MerrySlotConfig.objects.get_or_create(
+#             merry=merry,
+#             slot_no=slot_no,
+#             defaults={"weekday": weekday},
+#         )
+#         if obj.weekday != weekday:
+#             obj.weekday = weekday
+#             obj.full_clean()
+#             obj.save(update_fields=["weekday"])
+#         out.append(obj)
+
+#     return out
 @transaction.atomic
 def set_slot_config_bulk(*, admin_user, merry_id: int, items: List[dict]) -> List[MerrySlotConfig]:
     if not is_admin(admin_user):
@@ -1800,34 +1982,34 @@ def set_slot_config_bulk(*, admin_user, merry_id: int, items: List[dict]) -> Lis
     if not isinstance(items, list) or not items:
         raise BadState("items must be a non-empty list.")
 
-    seen = set()
+    normalized_weekdays = []
+
     for it in items:
-        slot_no = parse_int(it.get("slot_no"), "slot_no", min_value=1)
         weekday = parse_int(it.get("weekday"), "weekday", min_value=0, max_value=6)
 
-        validate_slot(merry, slot_no)
+        if weekday in normalized_weekdays:
+            raise BadState("Duplicate payout weekday is not allowed.")
 
-        if slot_no in seen:
-            raise BadState("Duplicate slot_no in payload.")
-        seen.add(slot_no)
+        normalized_weekdays.append(weekday)
+
+    normalized_weekdays.sort()
+
+    MerrySlotConfig.objects.filter(merry=merry).delete()
 
     out: List[MerrySlotConfig] = []
-    for it in items:
-        slot_no = int(it["slot_no"])
-        weekday = int(it["weekday"])
-        obj, _ = MerrySlotConfig.objects.get_or_create(
+
+    for index, weekday in enumerate(normalized_weekdays, start=1):
+        obj = MerrySlotConfig.objects.create(
             merry=merry,
-            slot_no=slot_no,
-            defaults={"weekday": weekday},
+            slot_no=index,
+            weekday=weekday,
         )
-        if obj.weekday != weekday:
-            obj.weekday = weekday
-            obj.full_clean()
-            obj.save(update_fields=["weekday"])
         out.append(obj)
 
-    return out
+    recalculate_merry_cycle_duration(merry=merry)
+    maybe_update_next_payout_date(merry=merry)
 
+    return out
 
 # -----------------------------
 # Join requests
@@ -2047,8 +2229,10 @@ def admin_approve_join_request(
         seats_created=seats_created,
     )
 
-    return member, seats_created
+    recalculate_merry_cycle_duration(merry=merry)
+    maybe_update_next_payout_date(merry=merry)
 
+    return member, seats_created
 
 @transaction.atomic
 def admin_reject_join_request(*, admin_user, request_id: int, note: str = "") -> MerryJoinRequest:
@@ -2128,11 +2312,15 @@ def add_seats_to_existing_member(
                 created_at=timezone.now(),
             )
             created.append(seat)
+
     except IntegrityError:
         raise Conflict("Failed to add seat(s). Duplicate seat_no or payout_position detected.")
 
-    return created
+    # ✅ ADD THESE TWO LINES HERE
+    recalculate_merry_cycle_duration(merry=merry)
+    maybe_update_next_payout_date(merry=merry)
 
+    return created
 
 @transaction.atomic
 def reassign_existing_clean_seat(
