@@ -992,8 +992,13 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
     queue_summary_display.short_description = "Queue Order"
 
     def available_seats_display(self, obj):
-        v = obj.available_seats()
-        return "Unlimited" if v is None else v
+        if not obj.max_seats or obj.max_seats <= 0:
+            return "Unlimited"
+
+        active_count = obj.seats.filter(is_active=True).count()
+        remaining = obj.max_seats - active_count
+
+        return remaining if remaining > 0 else 0
 
     available_seats_display.short_description = "Available Seats"
 
