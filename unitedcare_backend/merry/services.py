@@ -1700,6 +1700,12 @@ def apply_mpesa_contribution(
 # -----------------------------
 # Merry lifecycle
 # -----------------------------
+import math
+
+import math
+from decimal import Decimal
+from django.db import transaction
+
 @transaction.atomic
 def create_merry(
     *,
@@ -1710,6 +1716,7 @@ def create_merry(
     payout_order_type: str = "manual",
     next_payout_date=None,
     payout_frequency: str = "WEEKLY",
+    payout_days: list = [],  # List of selected payout days (e.g., Monday, Friday)
     payouts_per_period: int = 1,
     is_open: bool = True,
     max_seats: int = 0,
@@ -1768,10 +1775,25 @@ def create_merry(
     else:
         penalty_cap_amount = None
 
+    # Calculate the number of payout days in the week
+    num_payout_days = len(payout_days)  # Number of payout days selected (e.g., Monday, Friday)
+
+    # Calculate the cycle duration based on active seats and payout days
+    if max_seats > 0 and num_payout_days > 0:
+        # Cycle duration = (number of seats) / (number of payout days per week)
+        cycle_duration_weeks = (max_seats / num_payout_days)  # This will give a float value
+        
+        # Round up the cycle duration to the nearest whole number
+        cycle_duration_weeks = math.ceil(cycle_duration_weeks)  # Ensure rounding up
+
+    # Ensure cycle duration doesn't exceed 520 weeks (10 years)
+    cycle_duration_weeks = min(cycle_duration_weeks, 520)
+
+    # Create the MerryGoRound object with the calculated cycle duration
     merry = MerryGoRound.objects.create(
         name=name,
         contribution_amount=amount,
-        cycle_duration_weeks=cycle_duration_weeks,
+        cycle_duration_weeks=cycle_duration_weeks,  # Store the rounded cycle duration
         payout_order_type=payout_order_type,
         next_payout_date=next_payout_date or None,
         created_by=creator,
@@ -1784,10 +1806,101 @@ def create_merry(
         daily_penalty_amount=daily_penalty_amount,
         penalty_grace_days=penalty_grace_days,
         penalty_cap_amount=penalty_cap_amount,
+        payout_days=payout_days,  # Save the selected payout days
     )
     merry.full_clean()
     merry.save()
     return merry
+
+# @transaction.atomic
+# def create_merry(
+#     *,
+#     creator,
+#     name: str,
+#     contribution_amount: Decimal,
+#     cycle_duration_weeks: int = 1,
+#     payout_order_type: str = "manual",
+#     next_payout_date=None,
+#     payout_frequency: str = "WEEKLY",
+#     payout_days: list = [],  # New parameter for selected payout days
+#     payouts_per_period: int = 1,
+#     is_open: bool = True,
+#     max_seats: int = 0,
+#     penalty_mode: str = "NONE",
+#     flat_penalty_amount: Decimal = Decimal("0.00"),
+#     daily_penalty_amount: Decimal = Decimal("0.00"),
+#     penalty_grace_days: int = 0,
+#     penalty_cap_amount: Optional[Decimal] = None,
+# ) -> MerryGoRound:
+#     if not is_admin(creator):
+#         raise NotAllowed("Admin only.")
+
+#     name = (name or "").strip()
+#     if not name:
+#         raise BadState("name is required.")
+
+#     amount = parse_decimal(contribution_amount, "contribution_amount")
+#     if amount <= 0:
+#         raise BadState("contribution_amount must be > 0.")
+
+#     cycle_duration_weeks = parse_int(
+#         cycle_duration_weeks,
+#         "cycle_duration_weeks",
+#         min_value=1,
+#         max_value=520,
+#     )
+
+#     payout_order_type = (payout_order_type or "manual").strip().lower()
+#     if payout_order_type not in ("manual", "random"):
+#         raise BadState("payout_order_type must be 'manual' or 'random'.")
+
+#     payout_frequency = (payout_frequency or "WEEKLY").upper().strip()
+#     if payout_frequency not in ("DAILY", "WEEKLY", "MONTHLY"):
+#         raise BadState("payout_frequency must be 'DAILY', 'WEEKLY' or 'MONTHLY'.")
+
+#     payouts_per_period = parse_int(
+#         payouts_per_period,
+#         "payouts_per_period",
+#         min_value=1,
+#         max_value=14,
+#     )
+
+#     is_open = parse_bool(is_open, default=True)
+#     max_seats = parse_int(max_seats or 0, "max_seats", min_value=0)
+
+#     penalty_mode = (penalty_mode or "NONE").upper().strip()
+#     if penalty_mode not in ("NONE", "FLAT", "DAILY"):
+#         raise BadState("penalty_mode must be NONE, FLAT or DAILY.")
+
+#     flat_penalty_amount = parse_decimal(flat_penalty_amount or 0, "flat_penalty_amount")
+#     daily_penalty_amount = parse_decimal(daily_penalty_amount or 0, "daily_penalty_amount")
+#     penalty_grace_days = parse_int(penalty_grace_days or 0, "penalty_grace_days", min_value=0)
+
+#     if penalty_cap_amount not in (None, ""):
+#         penalty_cap_amount = parse_decimal(penalty_cap_amount, "penalty_cap_amount")
+#     else:
+#         penalty_cap_amount = None
+
+#     merry = MerryGoRound.objects.create(
+#         name=name,
+#         contribution_amount=amount,
+#         cycle_duration_weeks=cycle_duration_weeks,
+#         payout_order_type=payout_order_type,
+#         next_payout_date=next_payout_date or None,
+#         created_by=creator,
+#         payout_frequency=payout_frequency,
+#         payouts_per_period=payouts_per_period,
+#         is_open=is_open,
+#         max_seats=max_seats,
+#         penalty_mode=penalty_mode,
+#         flat_penalty_amount=flat_penalty_amount,
+#         daily_penalty_amount=daily_penalty_amount,
+#         penalty_grace_days=penalty_grace_days,
+#         penalty_cap_amount=penalty_cap_amount,
+#     )
+#     merry.full_clean()
+#     merry.save()
+#     return merry
 
 
 @transaction.atomic

@@ -653,6 +653,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         "active_seats_count",
         "current_pool_display",
         "created_at",
+        "payout_days_display",  # Add this line to display payout days
     )
     list_filter = (
         "is_open",
@@ -690,7 +691,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "name",
                 "created_by",
                 "contribution_amount",
-                "cycle_duration_weeks",
+                # "cycle_duration_weeks",
             )
         }),
         ("Payout Setup", {
@@ -698,6 +699,7 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
                 "payout_order_type",
                 "payout_frequency",
                 "next_payout_date",
+                "payout_days",  # Add this line to allow admin to select payout days
             )
         }),
         ("Penalty Policy", {
@@ -791,6 +793,173 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         return "Unlimited" if v is None else v
 
     available_seats_display.short_description = "Available Seats"
+
+    def payout_days_display(self, obj):
+        """Display the selected payout days in a comma-separated string."""
+        return ", ".join(obj.payout_days) if obj.payout_days else "Not Set"
+
+    payout_days_display.short_description = "Payout Days"
+# # =========================================================
+# # MERRYGOROUND ADMIN
+# # =========================================================
+# @admin.register(MerryGoRound)
+# class MerryGoRoundAdmin(admin.ModelAdmin):
+#     list_display = (
+#         "id",
+#         "name",
+#         "created_by",
+#         "contribution_amount",
+#         "payout_frequency",
+#         "payout_order_type",
+#         "penalty_mode",
+#         "is_open",
+#         "max_seats",
+#         "available_seats_display",
+#         "current_target_display",
+#         "current_due_date_display",
+#         "next_payout_date",
+#         "active_members_count",
+#         "active_seats_count",
+#         "current_pool_display",
+#         "created_at",
+#     )
+#     list_filter = (
+#         "is_open",
+#         "payout_order_type",
+#         "payout_frequency",
+#         "penalty_mode",
+#         "created_at",
+#     )
+#     search_fields = (
+#         "name",
+#         "created_by__username",
+#         "created_by__phone",
+#     )
+#     ordering = ("-id",)
+#     list_select_related = ("created_by",)
+#     readonly_fields = (
+#         "created_at",
+#         "available_seats_display",
+#         "current_target_display",
+#         "current_due_date_display",
+#         "current_pool_display",
+#         "queue_summary_display",
+#     )
+#     actions = [prepare_current_payout_and_dues]
+#     inlines = [
+#         MerryMemberInline,
+#         MerrySeatInline,
+#         MerryJoinRequestInline,
+#         MerryPayoutInline,
+#     ]
+
+#     fieldsets = (
+#         ("Core", {
+#             "fields": (
+#                 "name",
+#                 "created_by",
+#                 "contribution_amount",
+#                 "cycle_duration_weeks",
+#             )
+#         }),
+#         ("Payout Setup", {
+#             "fields": (
+#                 "payout_order_type",
+#                 "payout_frequency",
+#                 "next_payout_date",
+#             )
+#         }),
+#         ("Penalty Policy", {
+#             "fields": (
+#                 "penalty_mode",
+#                 "flat_penalty_amount",
+#                 "daily_penalty_amount",
+#                 "penalty_grace_days",
+#                 "penalty_cap_amount",
+#             )
+#         }),
+#         ("Joining / Capacity", {
+#             "fields": (
+#                 "is_open",
+#                 "max_seats",
+#                 "available_seats_display",
+#             )
+#         }),
+#         ("Current Queue Summary", {
+#             "fields": (
+#                 "current_target_display",
+#                 "current_due_date_display",
+#                 "current_pool_display",
+#                 "queue_summary_display",
+#                 "created_at",
+#             )
+#         }),
+#     )
+
+#     def active_members_count(self, obj):
+#         return obj.members.filter(is_active=True).count()
+
+#     active_members_count.short_description = "Active Members"
+
+#     def active_seats_count(self, obj):
+#         return obj.seats.filter(is_active=True).count()
+
+#     active_seats_count.short_description = "Active Seats"
+
+#     def current_target_display(self, obj):
+#         try:
+#             preview = get_next_payout_turn(merry_id=obj.id)
+#             seat_no = preview.get("seat_no")
+#             username = preview.get("username") or "-"
+#             return f"{username} (Seat {seat_no})"
+#         except Exception:
+#             return "—"
+
+#     current_target_display.short_description = "Current Payout Target"
+
+#     def current_due_date_display(self, obj):
+#         try:
+#             preview = get_next_payout_turn(merry_id=obj.id)
+#             return preview.get("due_date") or preview.get("period_key") or "—"
+#         except Exception:
+#             return "—"
+
+#     current_due_date_display.short_description = "Current Payout Date"
+
+#     def current_pool_display(self, obj):
+#         try:
+#             preview = get_next_payout_turn(merry_id=obj.id)
+#             return preview.get("expected_amount") or 0
+#         except Exception:
+#             try:
+#                 return obj.total_pool_per_slot()
+#             except Exception:
+#                 return "—"
+
+#     current_pool_display.short_description = "Current Payout Pool"
+
+#     def queue_summary_display(self, obj):
+#         seats = list(
+#             obj.seats.filter(is_active=True)
+#             .select_related("member", "member__user")
+#             .order_by("payout_position", "seat_no", "id")
+#         )
+#         if not seats:
+#             return "No active seats."
+
+#         parts = [
+#             f"{seat.payout_position or '-'}: {seat.member.user} (Seat {seat.seat_no})"
+#             for seat in seats
+#         ]
+#         return format_html("<br>".join(parts))
+
+#     queue_summary_display.short_description = "Queue Order"
+
+#     def available_seats_display(self, obj):
+#         v = obj.available_seats()
+#         return "Unlimited" if v is None else v
+
+#     available_seats_display.short_description = "Available Seats"
 
 
 # =========================================================
