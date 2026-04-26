@@ -114,7 +114,10 @@ def _date_only(value) -> Optional[date]:
         return value
     return None
 
+
+# ----------------------------
 # Core Merry
+# ----------------------------
 class MerryGoRound(models.Model):
     ORDER_TYPES = (
         ("manual", "Manual"),
@@ -140,10 +143,13 @@ class MerryGoRound(models.Model):
     payout_order_type = models.CharField(max_length=10, choices=ORDER_TYPES, default="manual")
     payout_frequency = models.CharField(max_length=10, choices=PAYOUT_FREQUENCY, default="WEEKLY")
 
+    # Legacy compatibility field.
+    # Queue-based ROSCA uses one payout event at a time.
     payouts_per_period = models.PositiveIntegerField(default=1)
 
     is_open = models.BooleanField(default=True)
 
+    # 0 means unlimited
     max_seats = models.PositiveIntegerField(default=0, help_text="0 means unlimited seats")
 
     next_payout_date = models.DateField(null=True, blank=True)
@@ -168,11 +174,6 @@ class MerryGoRound(models.Model):
         help_text="Optional max total penalty per due.",
     )
 
-    # ----------------------------
-    # Payout Days (New Field)
-    # ----------------------------
-    payout_days = models.JSONField(default=list)  # Store selected payout days (e.g., ['Monday', 'Friday'])
-
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
@@ -187,79 +188,6 @@ class MerryGoRound(models.Model):
             models.Index(fields=["payout_frequency", "created_at"]),
             models.Index(fields=["penalty_mode", "created_at"]),
         ]
-# # ----------------------------
-# # Core Merry
-# # ----------------------------
-# class MerryGoRound(models.Model):
-#     ORDER_TYPES = (
-#         ("manual", "Manual"),
-#         ("random", "Random"),
-#     )
-
-#     PAYOUT_FREQUENCY = (
-#         ("DAILY", "Daily"),
-#         ("WEEKLY", "Weekly"),
-#         ("MONTHLY", "Monthly"),
-#     )
-
-#     PENALTY_MODES = (
-#         ("NONE", "None"),
-#         ("FLAT", "Flat"),
-#         ("DAILY", "Daily"),
-#     )
-
-#     name = models.CharField(max_length=255)
-#     contribution_amount = models.DecimalField(max_digits=12, decimal_places=2)  # per seat per payout
-#     cycle_duration_weeks = models.PositiveIntegerField(default=1)
-
-#     payout_order_type = models.CharField(max_length=10, choices=ORDER_TYPES, default="manual")
-#     payout_frequency = models.CharField(max_length=10, choices=PAYOUT_FREQUENCY, default="WEEKLY")
-
-#     # Legacy compatibility field.
-#     # Queue-based ROSCA uses one payout event at a time.
-#     payouts_per_period = models.PositiveIntegerField(default=1)
-
-#     is_open = models.BooleanField(default=True)
-
-#     # 0 means unlimited
-#     max_seats = models.PositiveIntegerField(default=0, help_text="0 means unlimited seats")
-
-#     next_payout_date = models.DateField(null=True, blank=True)
-
-#     # ----------------------------
-#     # Penalty policy
-#     # ----------------------------
-#     penalty_mode = models.CharField(
-#         max_length=10,
-#         choices=PENALTY_MODES,
-#         default="NONE",
-#         help_text="NONE, FLAT, or DAILY",
-#     )
-#     flat_penalty_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-#     daily_penalty_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-#     penalty_grace_days = models.PositiveIntegerField(default=0)
-#     penalty_cap_amount = models.DecimalField(
-#         max_digits=12,
-#         decimal_places=2,
-#         null=True,
-#         blank=True,
-#         help_text="Optional max total penalty per due.",
-#     )
-
-#     created_by = models.ForeignKey(
-#         settings.AUTH_USER_MODEL,
-#         on_delete=models.CASCADE,
-#         related_name="merries_created",
-#     )
-#     created_at = models.DateTimeField(default=timezone.now)
-
-#     class Meta:
-#         ordering = ["-id"]
-#         indexes = [
-#             models.Index(fields=["is_open", "created_at"]),
-#             models.Index(fields=["payout_frequency", "created_at"]),
-#             models.Index(fields=["penalty_mode", "created_at"]),
-#         ]
 
     def clean(self):
         if self.contribution_amount is not None and self.contribution_amount <= 0:
