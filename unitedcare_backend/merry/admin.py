@@ -1254,28 +1254,55 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
             )
         }),
     )
-
     def get_readonly_fields(self, request, obj=None):
-        ro = [
-            "created_at",
-            "reviewed_at",
+        base = [
+        "created_at",
+        "reviewed_at",
+        "seat_status_preview",
+        "member_note_display",
+        "assigned_seats_display",
+    ]
+
+        if obj and obj.status != "PENDING":
+            return [f.name for f in self.model._meta.fields] + [
+            "available_seat_selection",
             "seat_status_preview",
             "member_note_display",
             "assigned_seats_display",
         ]
 
-        if obj and obj.status == "APPROVED":
-            ro.extend([
-                "merry",
-                "user",
-                "requested_seats",
-                "status",
-                "note",
-                "reviewed_by",
-                "available_seat_selection",
-            ])
+        return base
+    
+    def get_fields(self, request, obj=None):
+        fields = super().get_fields(request, obj)
 
-        return ro
+        if obj and obj.status != "PENDING":
+            if "available_seat_selection" in fields:
+             fields.remove("available_seat_selection")
+
+        return fields
+
+    # def get_readonly_fields(self, request, obj=None):
+    #     ro = [
+    #         "created_at",
+    #         "reviewed_at",
+    #         "seat_status_preview",
+    #         "member_note_display",
+    #         "assigned_seats_display",
+    #     ]
+
+    #     if obj and obj.status == "APPROVED":
+    #         ro.extend([
+    #             "merry",
+    #             "user",
+    #             "requested_seats",
+    #             "status",
+    #             "note",
+    #             "reviewed_by",
+    #             "available_seat_selection",
+    #         ])
+
+    #     return ro
 
     def merry_open_display(self, obj):
         return obj.merry.is_open
