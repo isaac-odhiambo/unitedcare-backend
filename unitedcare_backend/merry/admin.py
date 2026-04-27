@@ -205,9 +205,6 @@ def build_seat_status_table_html(merry):
     )
 
 
-# =========================================================
-# FORMS
-# =========================================================
 class MerryJoinRequestAdminForm(forms.ModelForm):
     available_seat_selection = forms.MultipleChoiceField(
         required=False,
@@ -227,16 +224,19 @@ class MerryJoinRequestAdminForm(forms.ModelForm):
         if self.instance and self.instance.pk and self.instance.merry_id:
             merry = self.instance.merry
 
-        if merry and merry.max_seats and merry.max_seats > 0:
-            seat_choices = get_reusable_or_free_seat_numbers(merry)
-            self.fields["available_seat_selection"].choices = [
-                (str(n), f"Seat {n}") for n in seat_choices
-            ]
-        else:
-            self.fields["available_seat_selection"].choices = []
-            self.fields["available_seat_selection"].help_text = (
-                "Seat selection works only when max_seats is set on this merry."
-            )
+        # ✅ CRITICAL FIX: check field exists before using it
+        if "available_seat_selection" in self.fields:
+
+            if merry and merry.max_seats and merry.max_seats > 0:
+                seat_choices = get_reusable_or_free_seat_numbers(merry)
+                self.fields["available_seat_selection"].choices = [
+                    (str(n), f"Seat {n}") for n in seat_choices
+                ]
+            else:
+                self.fields["available_seat_selection"].choices = []
+                self.fields["available_seat_selection"].help_text = (
+                    "Seat selection works only when max_seats is set on this merry."
+                )
 
     def clean_available_seat_selection(self):
         values = self.cleaned_data.get("available_seat_selection") or []
@@ -256,12 +256,12 @@ class MerryJoinRequestAdminForm(forms.ModelForm):
         if status == "APPROVED":
             if not merry or not merry.max_seats or merry.max_seats <= 0:
                 raise forms.ValidationError(
-                    "This merry must have max_seats set before admin can assign seats from the seat table."
+                    "This merry must have max_seats set before admin can assign seats."
                 )
 
             if not selected:
                 raise forms.ValidationError(
-                    "You must select seat(s) from the seat table before approving."
+                    "You must select seat(s) before approving."
                 )
 
             if requested_seats and len(selected) != requested_seats:
