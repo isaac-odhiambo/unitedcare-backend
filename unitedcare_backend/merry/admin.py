@@ -1272,15 +1272,17 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         ]
 
         return base
-    
     def get_fields(self, request, obj=None):
-        fields = super().get_fields(request, obj)
+        return super().get_fields(request, obj)
+    
+    # def get_fields(self, request, obj=None):
+    #     fields = super().get_fields(request, obj)
 
-        if obj and obj.status != "PENDING":
-            if "available_seat_selection" in fields:
-             fields.remove("available_seat_selection")
+    #     if obj and obj.status != "PENDING":
+    #         if "available_seat_selection" in fields:
+    #          fields.remove("available_seat_selection")
 
-        return fields
+    #     return fields
 
     # def get_readonly_fields(self, request, obj=None):
     #     ro = [
