@@ -1226,25 +1226,21 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 "note",
                 "member_note_display",
             ),
-            "description": "Member request note submitted from the app.",
         }),
         ("Seat Status", {
             "fields": (
                 "seat_status_preview",
             ),
-            "description": "Select from reusable or available seats only.",
         }),
         ("Assign Seats for Approval", {
             "fields": (
                 "available_seat_selection",
             ),
-            "description": "Choose the seat numbers to assign before approving.",
         }),
         ("Assigned Seats", {
             "fields": (
                 "assigned_seats_display",
             ),
-            "description": "Visible after approval.",
         }),
         ("Review", {
             "fields": (
@@ -1255,7 +1251,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         }),
     )
 
-    # ✅ FIX 1: Proper readonly handling (NO _meta.fields)
+    # ✅ SAFE readonly control
     def get_readonly_fields(self, request, obj=None):
         readonly = [
             "created_at",
@@ -1273,21 +1269,13 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 "status",
                 "note",
                 "reviewed_by",
-                "available_seat_selection",  # safe here
+                "available_seat_selection",
             ]
 
         return readonly
 
-    # ✅ FIX 2: Remove seat selection when not pending
-    def get_fields(self, request, obj=None):
-        fields = list(super().get_fields(request, obj))
-
-        if obj and obj.status != "PENDING":
-            if "available_seat_selection" in fields:
-                fields.remove("available_seat_selection")
-
-        return fields
-
+    # -----------------------------------------------------
+    # DISPLAY HELPERS
     # -----------------------------------------------------
 
     def merry_open_display(self, obj):
@@ -1350,6 +1338,10 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
 
     seat_status_preview.short_description = "Seat Status"
 
+    # -----------------------------------------------------
+    # SAVE LOGIC
+    # -----------------------------------------------------
+
     def save_model(self, request, obj, form, change):
         selected_seats = form.cleaned_data.get("available_seat_selection") or []
 
@@ -1386,116 +1378,11 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 )
                 return
 
-            # BLOCK EDIT AFTER APPROVAL
+            # LOCK AFTER APPROVAL
             if old_obj.status == "APPROVED":
                 self.message_user(
                     request,
                     "Approved requests are locked (historical record).",
-                    level=messages.INFO,
-                )
-                return
-
-        super().save_model(request, obj, form, change)
-    def merry_open_display(self, obj):
-        return obj.merry.is_open
-
-    merry_open_display.boolean = True
-    merry_open_display.short_description = "Merry Open"
-
-    def member_note_short(self, obj):
-        if not obj.note:
-            return "-"
-
-        text = obj.note.strip()
-        return text if len(text) <= 40 else f"{text[:40]}..."
-
-    member_note_short.short_description = "Member Note"
-
-    def member_note_display(self, obj):
-        if not obj or not obj.pk or not obj.note:
-            return "No note provided by member."
-
-        return obj.note
-
-    member_note_display.short_description = "Full Member Note"
-
-    def assigned_seats_display(self, obj):
-        if not obj or not obj.pk:
-            return "Save the join request first to view assigned seats."
-
-        if obj.status != "APPROVED":
-            return "Seats will appear here after approval."
-
-        member = (
-            MerryMember.objects.filter(
-                merry=obj.merry,
-                user=obj.user,
-                is_active=True,
-            )
-            .prefetch_related("seats")
-            .first()
-        )
-
-        if not member:
-            return "No active member record found yet."
-
-        seat_numbers = list(
-            member.seats.filter(is_active=True)
-            .order_by("seat_no")
-            .values_list("seat_no", flat=True)
-        )
-
-        if not seat_numbers:
-            return "No active seats assigned."
-
-        return ", ".join(str(seat_no) for seat_no in seat_numbers)
-
-    assigned_seats_display.short_description = "Assigned Seats"
-
-    def seat_status_preview(self, obj):
-        merry = obj.merry if obj and obj.pk and obj.merry_id else None
-        return build_seat_status_table_html(merry)
-
-    seat_status_preview.short_description = "Seat Status"
-
-    def save_model(self, request, obj, form, change):
-        selected_seats = form.cleaned_data.get("available_seat_selection") or []
-
-        if change:
-            old_obj = (
-                MerryJoinRequest.objects
-                .select_related("merry", "user")
-                .get(pk=obj.pk)
-            )
-
-            if old_obj.status == "PENDING" and obj.status == "APPROVED":
-                member, seats = admin_approve_join_request(
-                    admin_user=request.user,
-                    request_id=old_obj.id,
-                    assigned_seat_numbers=selected_seats,
-                )
-
-                self.message_user(
-                    request,
-                    f"Join request approved. Seats assigned: {', '.join(str(seat.seat_no) for seat in seats)}",
-                    level=messages.SUCCESS,
-                )
-                return
-
-            if old_obj.status == "PENDING" and obj.status == "REJECTED":
-                old_obj.reject(request.user, note=obj.note or "")
-
-                self.message_user(
-                    request,
-                    "Join request rejected.",
-                    level=messages.WARNING,
-                )
-                return
-
-            if old_obj.status == "APPROVED":
-                self.message_user(
-                    request,
-                    "Approved join requests are historical records and were not reprocessed.",
                     level=messages.INFO,
                 )
                 return
