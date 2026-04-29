@@ -2862,46 +2862,87 @@ def compute_payout_amount_for_slot(
     return q2(total)
 
 
+# @transaction.atomic
+# def get_next_payout_turn(*, merry_id: int) -> Dict[str, Any]:
+#     merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
+#     if not merry:
+#         raise NotFound("Merry not found.")
+
+#     payout = ensure_current_payout_exists(merry_id=merry.id)
+#     seat = payout.seat
+#     period_meta = get_period_date_range(merry=merry, period_key=payout.period_key)
+#     due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+
+#     return {
+#         "merry_id": merry.id,
+#         "merry_name": merry.name,
+#         "payout_id": payout.id,
+#         "turn_no": getattr(payout, "turn_no", 1),
+#         "cycle_no": getattr(payout, "cycle_no", _current_cycle_number(merry)),
+#         "seat_id": seat.id,
+#         "seat_no": seat.seat_no,
+#         "member_id": seat.member_id,
+#         "user_id": seat.member.user_id,
+#         "username": getattr(seat.member.user, "username", None),
+#         "payout_position": seat.payout_position,
+#         "period_key": payout.period_key,
+#         "period_label": period_meta["label"],
+#         "period_start_date": period_meta["start_date"],
+#         "period_end_date": period_meta["end_date"],
+#         "slot_no": 1,
+#         "due_date": due_date,
+#         "scheduled_date": due_date,
+#         "cycle_number": getattr(payout, "cycle_no", _current_cycle_number(merry)),
+#         "cycle_complete": _is_cycle_complete(merry),
+#         "expected_amount": q2(
+#             payout.amount
+#             if getattr(payout, "amount", None) is not None
+#             else (_expected_pool_amount(merry))
+#         ),
+#     }
+
+
 @transaction.atomic
 def get_next_payout_turn(*, merry_id: int) -> Dict[str, Any]:
     merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
     if not merry:
         raise NotFound("Merry not found.")
 
-    payout = ensure_current_payout_exists(merry_id=merry.id)
-    seat = payout.seat
-    period_meta = get_period_date_range(merry=merry, period_key=payout.period_key)
-    due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+    # ✅ correct schedule-based turn
+    current_turn = _current_turn_from_schedule(merry)
+    next_turn = current_turn + 1
+
+    # ✅ correct seat selection
+    current_seat = _next_turn_seat(merry, turn_no=current_turn)
+    next_seat = _next_turn_seat(merry, turn_no=next_turn)
+
+    # ✅ compute scheduled date for current turn
+    scheduled_date = merry.next_payout_date
+    t = 1
+    while t < current_turn:
+        scheduled_date = _add_schedule_step(merry, scheduled_date)
+        t += 1
 
     return {
         "merry_id": merry.id,
         "merry_name": merry.name,
-        "payout_id": payout.id,
-        "turn_no": getattr(payout, "turn_no", 1),
-        "cycle_no": getattr(payout, "cycle_no", _current_cycle_number(merry)),
-        "seat_id": seat.id,
-        "seat_no": seat.seat_no,
-        "member_id": seat.member_id,
-        "user_id": seat.member.user_id,
-        "username": getattr(seat.member.user, "username", None),
-        "payout_position": seat.payout_position,
-        "period_key": payout.period_key,
-        "period_label": period_meta["label"],
-        "period_start_date": period_meta["start_date"],
-        "period_end_date": period_meta["end_date"],
-        "slot_no": 1,
-        "due_date": due_date,
-        "scheduled_date": due_date,
-        "cycle_number": getattr(payout, "cycle_no", _current_cycle_number(merry)),
-        "cycle_complete": _is_cycle_complete(merry),
-        "expected_amount": q2(
-            payout.amount
-            if getattr(payout, "amount", None) is not None
-            else (_expected_pool_amount(merry))
-        ),
+
+        "current_turn": current_turn,
+        "next_turn": next_turn,
+
+        "seat_id": current_seat.id,
+        "seat_no": current_seat.seat_no,
+        "member_id": current_seat.member_id,
+        "user_id": current_seat.member.user_id,
+        "username": getattr(current_seat.member.user, "username", None),
+
+        "next_seat_id": next_seat.id,
+        "next_seat_no": next_seat.seat_no,
+        "next_member_id": next_seat.member_id,
+        "next_username": getattr(next_seat.member.user, "username", None),
+
+        "scheduled_date": scheduled_date,
     }
-
-
 @transaction.atomic
 def create_payout_record(
     *,
