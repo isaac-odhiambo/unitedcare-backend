@@ -1168,7 +1168,7 @@ class MerrySeatAdmin(admin.ModelAdmin):
 
 
 # =========================================================
-# JOIN REQUEST ADMIN
+# JOIN REQUEST ADMIN (FINAL CLEAN VERSION)
 # =========================================================
 @admin.register(MerryJoinRequest)
 class MerryJoinRequestAdmin(admin.ModelAdmin):
@@ -1255,7 +1255,10 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
         }),
     )
 
-    # ✅ SAFE readonly control
+    # -----------------------------------------------------
+    # FIELD CONTROL (SAFE)
+    # -----------------------------------------------------
+
     def get_readonly_fields(self, request, obj=None):
         readonly = [
             "created_at",
@@ -1273,10 +1276,20 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 "status",
                 "note",
                 "reviewed_by",
-                "available_seat_selection",
+                # ❌ DO NOT include available_seat_selection
             ]
 
         return readonly
+
+    # OPTIONAL: hide seat selection after approval (clean UI)
+    def get_fields(self, request, obj=None):
+        fields = list(super().get_fields(request, obj))
+
+        if obj and obj.status != "PENDING":
+            if "available_seat_selection" in fields:
+                fields.remove("available_seat_selection")
+
+        return fields
 
     # -----------------------------------------------------
     # DISPLAY HELPERS
@@ -1343,7 +1356,7 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
     seat_status_preview.short_description = "Seat Status"
 
     # -----------------------------------------------------
-    # SAVE LOGIC
+    # SAVE LOGIC (SAFE + NO DOUBLE EXECUTION)
     # -----------------------------------------------------
 
     def save_model(self, request, obj, form, change):
@@ -1355,6 +1368,15 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 .select_related("merry", "user")
                 .get(pk=obj.pk)
             )
+
+            # ✅ prevent double approval
+            if old_obj.status == "APPROVED" and obj.status == "APPROVED":
+                self.message_user(
+                    request,
+                    "This request is already approved.",
+                    level=messages.WARNING,
+                )
+                return
 
             # APPROVE
             if old_obj.status == "PENDING" and obj.status == "APPROVED":
@@ -1392,7 +1414,6 @@ class MerryJoinRequestAdmin(admin.ModelAdmin):
                 return
 
         super().save_model(request, obj, form, change)
-
 # =========================================================
 # CONTRIBUTION DUE ADMIN
 # =========================================================
