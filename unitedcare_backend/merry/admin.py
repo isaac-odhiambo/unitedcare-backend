@@ -325,19 +325,23 @@ class MerrySeatAdminForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
 
         instance = getattr(self, "instance", None)
+
+        # ✅ Default safe queryset
+        queryset = MerryMember.objects.none()
+
         if instance and instance.pk and instance.merry_id:
-            self.fields["transfer_to_member"].queryset = (
+            queryset = (
                 MerryMember.objects.filter(
                     merry_id=instance.merry_id,
                     is_active=True,
                 )
+                .exclude(id=instance.member_id)  # ✅ prevent self-transfer
                 .select_related("user", "merry")
                 .order_by("user__username", "id")
             )
-        else:
-            self.fields["transfer_to_member"].queryset = MerryMember.objects.none()
 
-
+        # ✅ Always assign queryset (no condition skipping)
+        self.fields["transfer_to_member"].queryset = queryset
 # =========================================================
 # ACTIONS: MERRY
 # =========================================================
