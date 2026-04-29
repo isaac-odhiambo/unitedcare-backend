@@ -830,6 +830,41 @@ def get_user_merry_wallet_balance(*, user) -> Decimal:
 # -----------------------------
 # Turn helpers
 # -----------------------------
+def _compute_turn_from_schedule(merry: MerryGoRound) -> int:
+    today = timezone.localdate()
+
+    anchor = getattr(merry, "next_payout_date", None)
+    if not anchor:
+        raise BadState("next_payout_date is not set.")
+
+    turn = 1
+    current = anchor
+
+    while current < today:
+        current = _add_schedule_step(merry, current)
+        turn += 1
+
+    return turn
+
+def _current_turn_from_schedule(merry: MerryGoRound) -> int:
+    today = timezone.localdate()
+
+    anchor = getattr(merry, "next_payout_date", None)
+    if not anchor:
+        raise BadState("next_payout_date is not set.")
+
+    turn = 1
+    current = anchor
+
+    while True:
+        next_date = _add_schedule_step(merry, current)
+
+        if next_date > today:
+            return turn  # ✅ stops BEFORE passing today
+
+        current = next_date
+        turn += 1
+
 def _ordered_active_payout_seats(merry: MerryGoRound) -> List[MerrySeat]:
     seats = list(
         MerrySeat.objects.filter(merry=merry, is_active=True)
@@ -894,7 +929,8 @@ def _next_turn_seat(merry: MerryGoRound, *, turn_no: Optional[int] = None) -> Me
 
 
 def _next_turn_no(merry: MerryGoRound) -> int:
-    return _highest_turn_no(merry) + 1
+    # return _highest_turn_no(merry) + 1
+    return _compute_turn_from_schedule(merry)
 
 
 def _cycle_number_for_turn(merry: MerryGoRound, turn_no: int) -> int:
