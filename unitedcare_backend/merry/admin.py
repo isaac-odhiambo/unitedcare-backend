@@ -808,7 +808,7 @@ class MerryWalletTransactionInline(admin.TabularInline):
 
 #     available_seats_display.short_description = "Available Seats"
 # =========================================================
-# MERRYGOROUND ADMIN
+# MERRYGOROUND ADMIN (FIXED + SAFE)
 # =========================================================
 @admin.register(MerryGoRound)
 class MerryGoRoundAdmin(admin.ModelAdmin):
@@ -914,12 +914,19 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
         }),
     )
 
+    # -----------------------------------------------------
+    # SAVE RELATED
+    # -----------------------------------------------------
     def save_related(self, request, form, formsets, change):
         super().save_related(request, form, formsets, change)
 
         merry = form.instance
         recalculate_merry_cycle_duration(merry=merry)
         maybe_update_next_payout_date(merry=merry)
+
+    # -----------------------------------------------------
+    # DISPLAY HELPERS
+    # -----------------------------------------------------
 
     def payout_days_display(self, obj):
         if not obj or not obj.pk:
@@ -978,23 +985,37 @@ class MerryGoRoundAdmin(admin.ModelAdmin):
 
     current_pool_display.short_description = "Current Payout Pool"
 
+    # -----------------------------------------------------
+    # 🚨 FIXED SECTION (THIS WAS CRASHING)
+    # -----------------------------------------------------
     def queue_summary_display(self, obj):
         seats = list(
             obj.seats.filter(is_active=True)
             .select_related("member", "member__user")
             .order_by("payout_position", "seat_no", "id")
         )
+
         if not seats:
             return "No active seats."
 
-        parts = [
-            f"{seat.payout_position or '-'}: {seat.member.user} (Seat {seat.seat_no})"
-            for seat in seats
-        ]
+        parts = []
+
+        for seat in seats:
+            member = getattr(seat, "member", None)
+            user = getattr(member, "user", None)
+            username = getattr(user, "username", "Unknown User")
+
+            parts.append(
+                f"{seat.payout_position or '-'}: {username} (Seat {seat.seat_no})"
+            )
+
         return format_html("<br>".join(parts))
 
     queue_summary_display.short_description = "Queue Order"
 
+    # -----------------------------------------------------
+    # AVAILABLE SEATS
+    # -----------------------------------------------------
     def available_seats_display(self, obj):
         if not obj.max_seats or obj.max_seats <= 0:
             return "Unlimited"
