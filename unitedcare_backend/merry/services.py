@@ -1140,6 +1140,94 @@ def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
 # -----------------------------
 # Dues / payout generation
 # -----------------------------
+# @transaction.atomic
+# def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
+#     merry = get_merry(merry_id)
+#     today = timezone.localdate()
+
+#     scheduled_payouts = list(
+#         MerryPayout.objects.select_for_update()
+#         .filter(merry=merry, status="SCHEDULED")
+#         .select_related("seat", "seat__member", "seat__member__user")
+#         .order_by("turn_no", "id")
+#     )
+
+#     future_or_today = None
+#     for payout in scheduled_payouts:
+#         payout_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+#         if payout_date >= today:
+#             future_or_today = payout
+#             break
+
+#     if future_or_today:
+#         if merry.next_payout_date != future_or_today.scheduled_date:
+#             merry.next_payout_date = future_or_today.scheduled_date
+#             merry.save(update_fields=["next_payout_date"])
+#         return future_or_today
+
+#     if scheduled_payouts:
+#         latest_scheduled = scheduled_payouts[-1]
+#         last_date = getattr(latest_scheduled, "scheduled_date", None) or _period_key_to_date(latest_scheduled.period_key)
+#         next_turn_no = int(getattr(latest_scheduled, "turn_no", 0) or 0) + 1
+#     else:
+#         latest_payout = (
+#             MerryPayout.objects.select_for_update()
+#             .filter(merry=merry)
+#             .order_by("-turn_no", "-id")
+#             .select_related("seat", "seat__member", "seat__member__user")
+#             .first()
+#         )
+#         if latest_payout:
+#             last_date = getattr(latest_payout, "scheduled_date", None) or _period_key_to_date(latest_payout.period_key)
+#             next_turn_no = int(getattr(latest_payout, "turn_no", 0) or 0) + 1
+#         else:
+#             created_anchor = (
+#                 merry.created_at.date()
+#                 if getattr(merry, "created_at", None)
+#                 else today
+#             )
+#             configured_anchor = getattr(merry, "next_payout_date", None)
+#             anchor = configured_anchor if configured_anchor and configured_anchor >= created_anchor else created_anchor
+
+#             if _has_slot_config_schedule(merry):
+#                 first_date, first_slot_no = _next_slot_config_candidate_on_or_after(merry, anchor)
+#             else:
+#                 first_date, first_slot_no = anchor, 1
+
+#             payout = _get_or_create_scheduled_payout_for_turn(
+#                 merry=merry,
+#                 turn_no=1,
+#                 scheduled_date=first_date,
+#                 slot_no=first_slot_no,
+#             )
+#             if merry.next_payout_date != first_date:
+#                 merry.next_payout_date = first_date
+#                 merry.save(update_fields=["next_payout_date"])
+#             return payout
+
+#     next_date = last_date
+#     next_slot_no = 1
+#     while next_date < today:
+#         if _has_slot_config_schedule(merry):
+#             next_date, next_slot_no = _next_slot_config_candidate_after(merry, next_date)
+#         else:
+#             next_date = _add_schedule_step(merry, next_date)
+#             next_slot_no = 1
+
+#         payout = _get_or_create_scheduled_payout_for_turn(
+#             merry=merry,
+#             turn_no=next_turn_no,
+#             scheduled_date=next_date,
+#             slot_no=next_slot_no,
+#         )
+#         next_turn_no += 1
+
+#     if merry.next_payout_date != payout.scheduled_date:
+#         merry.next_payout_date = payout.scheduled_date
+#         merry.save(update_fields=["next_payout_date"])
+
+#     return payout
+
 @transaction.atomic
 def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
     merry = get_merry(merry_id)
@@ -1152,6 +1240,7 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
         .order_by("turn_no", "id")
     )
 
+    # ✅ 1. If there is a scheduled payout today or in future → use it
     future_or_today = None
     for payout in scheduled_payouts:
         payout_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
@@ -1160,15 +1249,12 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
             break
 
     if future_or_today:
-        if merry.next_payout_date != future_or_today.scheduled_date:
-            merry.next_payout_date = future_or_today.scheduled_date
-            merry.save(update_fields=["next_payout_date"])
-        return future_or_today
+        return future_or_today  # ✅ DO NOT update anchor
 
+    # ✅ 2. Determine last known date
     if scheduled_payouts:
         latest_scheduled = scheduled_payouts[-1]
         last_date = getattr(latest_scheduled, "scheduled_date", None) or _period_key_to_date(latest_scheduled.period_key)
-        next_turn_no = int(getattr(latest_scheduled, "turn_no", 0) or 0) + 1
     else:
         latest_payout = (
             MerryPayout.objects.select_for_update()
@@ -1177,17 +1263,19 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
             .select_related("seat", "seat__member", "seat__member__user")
             .first()
         )
+
         if latest_payout:
             last_date = getattr(latest_payout, "scheduled_date", None) or _period_key_to_date(latest_payout.period_key)
-            next_turn_no = int(getattr(latest_payout, "turn_no", 0) or 0) + 1
         else:
+            # ✅ FIRST EVER payout (anchor-based)
             created_anchor = (
                 merry.created_at.date()
                 if getattr(merry, "created_at", None)
                 else today
             )
             configured_anchor = getattr(merry, "next_payout_date", None)
-            anchor = configured_anchor if configured_anchor and configured_anchor >= created_anchor else created_anchor
+
+            anchor = configured_anchor if configured_anchor else created_anchor
 
             if _has_slot_config_schedule(merry):
                 first_date, first_slot_no = _next_slot_config_candidate_on_or_after(merry, anchor)
@@ -1200,13 +1288,16 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
                 scheduled_date=first_date,
                 slot_no=first_slot_no,
             )
-            if merry.next_payout_date != first_date:
-                merry.next_payout_date = first_date
-                merry.save(update_fields=["next_payout_date"])
-            return payout
 
+            return payout  # ✅ DO NOT update anchor
+
+    # ✅ 3. Compute correct turn FROM SCHEDULE (not DB)
+    next_turn_no = _current_turn_from_schedule(merry)
+
+    # ✅ 4. Generate payouts up to today
     next_date = last_date
     next_slot_no = 1
+
     while next_date < today:
         if _has_slot_config_schedule(merry):
             next_date, next_slot_no = _next_slot_config_candidate_after(merry, next_date)
@@ -1220,12 +1311,10 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
             scheduled_date=next_date,
             slot_no=next_slot_no,
         )
+
         next_turn_no += 1
 
-    if merry.next_payout_date != payout.scheduled_date:
-        merry.next_payout_date = payout.scheduled_date
-        merry.save(update_fields=["next_payout_date"])
-
+    # ✅ 5. RETURN ONLY — DO NOT TOUCH anchor
     return payout
 
 @transaction.atomic
