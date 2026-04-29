@@ -1119,20 +1119,23 @@ def _preview_next_payout_meta(merry: MerryGoRound) -> Dict[str, Any]:
     }
 
 
+# def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
+#     try:
+#         payout = get_existing_current_payout(merry_id=merry.id)
+#         if payout:
+#             next_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
+#         else:
+#             next_date = _turn_date_for_next_payout(merry)
+#     except Exception:
+#         next_date = None
+
+#     if merry.next_payout_date != next_date:
+#         merry.next_payout_date = next_date
+#         merry.save(update_fields=["next_payout_date"])
 def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
-    try:
-        payout = get_existing_current_payout(merry_id=merry.id)
-        if payout:
-            next_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
-        else:
-            next_date = _turn_date_for_next_payout(merry)
-    except Exception:
-        next_date = None
-
-    if merry.next_payout_date != next_date:
-        merry.next_payout_date = next_date
-        merry.save(update_fields=["next_payout_date"])
-
+    # 🚫 DO NOT update next_payout_date automatically
+    # This field must remain the FIRST payout (anchor)
+    return
 
 # -----------------------------
 # Dues / payout generation
