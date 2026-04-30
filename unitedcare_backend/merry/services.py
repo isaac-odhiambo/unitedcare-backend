@@ -1520,6 +1520,7 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
             seat__member=member,
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
+            due_date__lte=timezone.localdate(),   # ✅ ADD THIS
         )
         .exclude(
             payout__isnull=True,
@@ -1528,10 +1529,31 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
         .select_related("seat", "merry", "seat__member", "seat__member__user")
         .order_by("due_date", "seat__seat_no", "id")
     )
+
     _refresh_penalties_for_queryset(dues)
     return dues
 
+# @transaction.atomic
+# def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContributionDue]:
+#     ensure_member_dues_up_to_current_turn(member=member)
 
+#     dues = list(
+#         MerryContributionDue.objects.select_for_update()
+#         .filter(
+#             merry=member.merry,
+#             seat__member=member,
+#             seat__is_active=True,
+#             status__in=["PENDING", "PARTIAL", "OVERDUE"],
+#         )
+#         .exclude(
+#             payout__isnull=True,
+#             due_date__isnull=True,
+#         )
+#         .select_related("seat", "merry", "seat__member", "seat__member__user")
+#         .order_by("due_date", "seat__seat_no", "id")
+#     )
+#     _refresh_penalties_for_queryset(dues)
+#     return dues
 @transaction.atomic
 def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContributionDue]:
     ensure_member_dues_up_to_current_turn(member=member)
@@ -1543,6 +1565,7 @@ def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContribution
             seat__member=member,
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
+            due_date__lte=timezone.localdate(),   # ✅ THIS IS THE FIX
         )
         .exclude(
             payout__isnull=True,
@@ -1551,9 +1574,9 @@ def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContribution
         .select_related("seat", "merry", "seat__member", "seat__member__user")
         .order_by("due_date", "seat__seat_no", "id")
     )
+
     _refresh_penalties_for_queryset(dues)
     return dues
-
 
 def _create_confirmed_payment_shell(
     *,
