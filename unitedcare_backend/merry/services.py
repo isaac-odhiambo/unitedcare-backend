@@ -727,7 +727,8 @@ def _select_member_dues_for_payment(
     ensure_member_dues_up_to_current_turn(member=member)
 
     qs = (
-        MerryContributionDue.objects.select_for_update()
+        # MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=member.merry,
             seat__member=member,
@@ -929,8 +930,7 @@ def _next_turn_seat(merry: MerryGoRound, *, turn_no: Optional[int] = None) -> Me
 
 
 def _next_turn_no(merry: MerryGoRound) -> int:
-    # return _highest_turn_no(merry) + 1
-    return _compute_turn_from_schedule(merry)
+    return _current_turn_from_schedule(merry)
 
 
 def _cycle_number_for_turn(merry: MerryGoRound, turn_no: int) -> int:
@@ -945,39 +945,59 @@ def _turn_date_for_next_payout(merry: MerryGoRound) -> date:
     return slot_date
 
 
+# def _next_turn_schedule_for_payout(merry: MerryGoRound) -> Tuple[date, int]:
+#     last_payout = (
+#         MerryPayout.objects.filter(merry=merry)
+#         .order_by("-turn_no", "-id")
+#         .first()
+#     )
+
+#     if last_payout and getattr(last_payout, "scheduled_date", None):
+#         if _has_slot_config_schedule(merry):
+#             return _next_slot_config_candidate_after(merry, last_payout.scheduled_date)
+#         return _add_schedule_step(merry, last_payout.scheduled_date), 1
+
+#     if last_payout and getattr(last_payout, "period_key", None):
+#         try:
+#             base_date = _period_key_to_date(last_payout.period_key)
+#             if _has_slot_config_schedule(merry):
+#                 return _next_slot_config_candidate_after(merry, base_date)
+#             return _add_schedule_step(merry, base_date), 1
+#         except Exception:
+#             pass
+
+#     created_anchor = (
+#         merry.created_at.date()
+#         if getattr(merry, "created_at", None)
+#         else timezone.localdate()
+#     )
+#     configured_anchor = getattr(merry, "next_payout_date", None)
+#     anchor = configured_anchor if configured_anchor and configured_anchor >= created_anchor else created_anchor
+
+#     if _has_slot_config_schedule(merry):
+#         return _next_slot_config_candidate_on_or_after(merry, anchor)
+
+#     return anchor, 1
+
 def _next_turn_schedule_for_payout(merry: MerryGoRound) -> Tuple[date, int]:
-    last_payout = (
-        MerryPayout.objects.filter(merry=merry)
-        .order_by("-turn_no", "-id")
-        .first()
-    )
+    # 1. Get anchor (FIRST payout date)
+    anchor = getattr(merry, "next_payout_date", None)
+    if not anchor:
+        raise BadState("next_payout_date must be set.")
 
-    if last_payout and getattr(last_payout, "scheduled_date", None):
+    # 2. Get the correct turn (based on schedule)
+    turn_no = _current_turn_from_schedule(merry)
+
+    # 3. Compute date from anchor
+    current_date = anchor
+
+    for _ in range(1, turn_no):
         if _has_slot_config_schedule(merry):
-            return _next_slot_config_candidate_after(merry, last_payout.scheduled_date)
-        return _add_schedule_step(merry, last_payout.scheduled_date), 1
+            current_date, _ = _next_slot_config_candidate_after(merry, current_date)
+        else:
+            current_date = _add_schedule_step(merry, current_date)
 
-    if last_payout and getattr(last_payout, "period_key", None):
-        try:
-            base_date = _period_key_to_date(last_payout.period_key)
-            if _has_slot_config_schedule(merry):
-                return _next_slot_config_candidate_after(merry, base_date)
-            return _add_schedule_step(merry, base_date), 1
-        except Exception:
-            pass
-
-    created_anchor = (
-        merry.created_at.date()
-        if getattr(merry, "created_at", None)
-        else timezone.localdate()
-    )
-    configured_anchor = getattr(merry, "next_payout_date", None)
-    anchor = configured_anchor if configured_anchor and configured_anchor >= created_anchor else created_anchor
-
-    if _has_slot_config_schedule(merry):
-        return _next_slot_config_candidate_on_or_after(merry, anchor)
-
-    return anchor, 1
+    return current_date, 1
 
 
 def _get_or_create_scheduled_payout_for_turn(
@@ -1228,11 +1248,101 @@ def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
 
 #     return payout
 
+# @transaction.atomic
+# def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
+#     merry = get_merry(merry_id)
+#     today = timezone.localdate()
+
+#     # 🔹 1. Get all scheduled payouts
+#     scheduled_payouts = list(
+#         MerryPayout.objects.select_for_update()
+#         .filter(merry=merry, status="SCHEDULED")
+#         .select_related("seat", "seat__member", "seat__member__user")
+#         .order_by("turn_no", "id")
+#     )
+
+#     # 🔹 2. Compute expected turn from schedule
+#     expected_turn = _current_turn_from_schedule(merry)
+
+#     # 🔹 3. If correct payout already exists → return it
+#     existing = (
+#         MerryPayout.objects
+#         .filter(merry=merry, turn_no=expected_turn)
+#         .select_related("seat", "seat__member", "seat__member__user")
+#         .first()
+#     )
+#     if existing:
+#         return existing
+
+#     # 🔹 4. Determine starting point
+#     if scheduled_payouts:
+#         latest = scheduled_payouts[-1]
+#         last_date = getattr(latest, "scheduled_date", None) or _period_key_to_date(latest.period_key)
+#         next_turn_no = int(latest.turn_no) + 1
+#     else:
+#         latest = (
+#             MerryPayout.objects.select_for_update()
+#             .filter(merry=merry)
+#             .order_by("-turn_no", "-id")
+#             .first()
+#         )
+
+#         if latest:
+#             last_date = getattr(latest, "scheduled_date", None) or _period_key_to_date(latest.period_key)
+#             next_turn_no = int(latest.turn_no) + 1
+#         else:
+#             # 🔹 First ever payout
+#             created_anchor = (
+#                 merry.created_at.date()
+#                 if getattr(merry, "created_at", None)
+#                 else today
+#             )
+#             configured_anchor = getattr(merry, "next_payout_date", None)
+
+#             anchor = configured_anchor if configured_anchor else created_anchor
+
+#             if _has_slot_config_schedule(merry):
+#                 first_date, first_slot_no = _next_slot_config_candidate_on_or_after(merry, anchor)
+#             else:
+#                 first_date, first_slot_no = anchor, 1
+
+#             return _get_or_create_scheduled_payout_for_turn(
+#                 merry=merry,
+#                 turn_no=1,
+#                 scheduled_date=first_date,
+#                 slot_no=first_slot_no,
+#             )
+
+#     # 🔹 5. Generate payouts up to expected turn ONLY
+#     next_date = last_date
+#     next_slot_no = 1
+#     payout = None
+
+#     while next_turn_no <= expected_turn:
+#         if _has_slot_config_schedule(merry):
+#             next_date, next_slot_no = _next_slot_config_candidate_after(merry, next_date)
+#         else:
+#             next_date = _add_schedule_step(merry, next_date)
+#             next_slot_no = 1
+
+#         payout = _get_or_create_scheduled_payout_for_turn(
+#             merry=merry,
+#             turn_no=next_turn_no,
+#             scheduled_date=next_date,
+#             slot_no=next_slot_no,
+#         )
+
+#         next_turn_no += 1
+
+#     # 🔹 6. Return the current (expected) payout
+#     return payout
+
 @transaction.atomic
 def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
     merry = get_merry(merry_id)
     today = timezone.localdate()
 
+    # 🔹 1. Get all scheduled payouts
     scheduled_payouts = list(
         MerryPayout.objects.select_for_update()
         .filter(merry=merry, status="SCHEDULED")
@@ -1240,81 +1350,46 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
         .order_by("turn_no", "id")
     )
 
-    # ✅ 1. If there is a scheduled payout today or in future → use it
-    future_or_today = None
-    for payout in scheduled_payouts:
-        payout_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
-        if payout_date >= today:
-            future_or_today = payout
-            break
+    # 🔹 2. Compute expected turn from schedule
+    expected_turn = _current_turn_from_schedule(merry)
 
-    if future_or_today:
-        return future_or_today  # ✅ DO NOT update anchor
+    # 🔹 3. If correct payout already exists → return it
+    existing = (
+        MerryPayout.objects
+        .filter(merry=merry, turn_no=expected_turn)
+        .select_related("seat", "seat__member", "seat__member__user")
+        .first()
+    )
+    if existing:
+        return existing
 
-    # ✅ 2. Determine last known date
-    if scheduled_payouts:
-        latest_scheduled = scheduled_payouts[-1]
-        last_date = getattr(latest_scheduled, "scheduled_date", None) or _period_key_to_date(latest_scheduled.period_key)
-    else:
-        latest_payout = (
-            MerryPayout.objects.select_for_update()
-            .filter(merry=merry)
-            .order_by("-turn_no", "-id")
-            .select_related("seat", "seat__member", "seat__member__user")
-            .first()
-        )
+    # 🔴 FIX STARTS HERE (remove dependency on last_payout)
 
-        if latest_payout:
-            last_date = getattr(latest_payout, "scheduled_date", None) or _period_key_to_date(latest_payout.period_key)
-        else:
-            # ✅ FIRST EVER payout (anchor-based)
-            created_anchor = (
-                merry.created_at.date()
-                if getattr(merry, "created_at", None)
-                else today
-            )
-            configured_anchor = getattr(merry, "next_payout_date", None)
+    # 🔹 4. Always use anchor (FIRST payout date)
+    anchor = getattr(merry, "next_payout_date", None)
+    if not anchor:
+        raise BadState("next_payout_date must be set.")
 
-            anchor = configured_anchor if configured_anchor else created_anchor
+    payout = None
 
+    # 🔹 5. Generate payouts deterministically from anchor
+    for turn_no in range(1, expected_turn + 1):
+        current_date = anchor
+
+        for _ in range(1, turn_no):
             if _has_slot_config_schedule(merry):
-                first_date, first_slot_no = _next_slot_config_candidate_on_or_after(merry, anchor)
+                current_date, _ = _next_slot_config_candidate_after(merry, current_date)
             else:
-                first_date, first_slot_no = anchor, 1
-
-            payout = _get_or_create_scheduled_payout_for_turn(
-                merry=merry,
-                turn_no=1,
-                scheduled_date=first_date,
-                slot_no=first_slot_no,
-            )
-
-            return payout  # ✅ DO NOT update anchor
-
-    # ✅ 3. Compute correct turn FROM SCHEDULE (not DB)
-    next_turn_no = _current_turn_from_schedule(merry)
-
-    # ✅ 4. Generate payouts up to today
-    next_date = last_date
-    next_slot_no = 1
-
-    while next_date < today:
-        if _has_slot_config_schedule(merry):
-            next_date, next_slot_no = _next_slot_config_candidate_after(merry, next_date)
-        else:
-            next_date = _add_schedule_step(merry, next_date)
-            next_slot_no = 1
+                current_date = _add_schedule_step(merry, current_date)
 
         payout = _get_or_create_scheduled_payout_for_turn(
             merry=merry,
-            turn_no=next_turn_no,
-            scheduled_date=next_date,
-            slot_no=next_slot_no,
+            turn_no=turn_no,
+            scheduled_date=current_date,
+            slot_no=1,
         )
 
-        next_turn_no += 1
-
-    # ✅ 5. RETURN ONLY — DO NOT TOUCH anchor
+    # 🔹 6. Return the current (expected) payout
     return payout
 
 @transaction.atomic
@@ -1510,72 +1585,54 @@ def _ensure_current_dues_for_user_memberships(user_id: int) -> List[MerryMember]
 
 
 @transaction.atomic
-def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -> List[MerryContributionDue]:
-    ensure_member_dues_up_to_current_turn(member=member)
-
-    dues = list(
-        MerryContributionDue.objects.select_for_update()
-        .filter(
-            merry=member.merry,
-            seat__member=member,
-            seat__is_active=True,
-            status__in=["PENDING", "PARTIAL", "OVERDUE"],
-            due_date__lte=timezone.localdate(),   # ✅ ADD THIS
-        )
-        .exclude(
-            payout__isnull=True,
-            due_date__isnull=True,
-        )
-        .select_related("seat", "merry", "seat__member", "seat__member__user")
-        .order_by("due_date", "seat__seat_no", "id")
-    )
-
-    _refresh_penalties_for_queryset(dues)
-    return dues
-
-# @transaction.atomic
-# def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContributionDue]:
-#     ensure_member_dues_up_to_current_turn(member=member)
-
-#     dues = list(
-#         MerryContributionDue.objects.select_for_update()
-#         .filter(
-#             merry=member.merry,
-#             seat__member=member,
-#             seat__is_active=True,
-#             status__in=["PENDING", "PARTIAL", "OVERDUE"],
-#         )
-#         .exclude(
-#             payout__isnull=True,
-#             due_date__isnull=True,
-#         )
-#         .select_related("seat", "merry", "seat__member", "seat__member__user")
-#         .order_by("due_date", "seat__seat_no", "id")
-#     )
-#     _refresh_penalties_for_queryset(dues)
-#     return dues
-@transaction.atomic
 def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContributionDue]:
+    """
+    Fetch all open dues (PENDING, PARTIAL, OVERDUE) for a member
+    up to today, with row-level locking for safe allocation.
+
+    Ensures:
+    - dues are generated up to current turn
+    - penalties are up-to-date
+    - ordering is FIFO (oldest dues first)
+    """
+
+    # Ensure all dues exist up to current turn
     ensure_member_dues_up_to_current_turn(member=member)
 
+    today = timezone.localdate()
+
     dues = list(
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects
+        .select_for_update(of=("self",))
         .filter(
             merry=member.merry,
             seat__member=member,
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
-            due_date__lte=timezone.localdate(),   # ✅ THIS IS THE FIX
+            due_date__lte=today,
         )
         .exclude(
             payout__isnull=True,
             due_date__isnull=True,
         )
-        .select_related("seat", "merry", "seat__member", "seat__member__user")
+        .select_related("seat", "payout")  # 🔥 optimization
         .order_by("due_date", "seat__seat_no", "id")
     )
 
+    # 🔥 HARD GUARD: keep DB consistent with schedule
+    updated = []
+    for d in dues:
+        correct_date = d.payout.scheduled_date
+        if d.due_date != correct_date:
+            d.due_date = correct_date
+            updated.append(d)
+
+    if updated:
+        MerryContributionDue.objects.bulk_update(updated, ["due_date"])
+
+    # Refresh penalties AFTER fixing dates
     _refresh_penalties_for_queryset(dues)
+
     return dues
 
 def _create_confirmed_payment_shell(
@@ -2515,6 +2572,20 @@ def reassign_existing_clean_seat(
     seat.full_clean()
     seat.save(update_fields=["member"])
     return seat
+from decimal import Decimal
+from .models import MerryWallet
+
+
+def get_or_create_merry_wallet(user):
+    """
+    Returns user's merry wallet.
+    Creates one if it doesn't exist.
+    """
+    wallet, _ = MerryWallet.objects.get_or_create(
+        user=user,
+        defaults={"balance": Decimal("0.00")}
+    )
+    return wallet
 
 
 # -----------------------------
@@ -2611,6 +2682,45 @@ def mark_payment_failed(*, payment_id: int) -> MerryPayment:
     p.save(update_fields=["status"])
     return p
 
+from .models import MerryPayout
+
+
+def sync_merry_schedule(merry):
+    """
+    Ensures all payouts in DB match computed schedule logic.
+    Prevents date drift permanently.
+    """
+    from .services import _add_schedule_step  # local import to avoid circular issues
+
+    d = merry.next_payout_date
+
+    schedule = {}
+    for i in range(1, 200):
+        schedule[i] = d
+        d = _add_schedule_step(merry, d)
+
+    payouts = MerryPayout.objects.filter(merry=merry)
+
+    updates = []
+
+    for p in payouts:
+        correct = schedule.get(p.turn_no)
+
+        if correct and p.scheduled_date != correct:
+            p.scheduled_date = correct
+            p.period_key = str(correct)
+            updates.append(p)
+
+    if updates:
+        MerryPayout.objects.bulk_update(
+            updates,
+            ["scheduled_date", "period_key"]
+        )
+
+
+from decimal import Decimal
+from django.db import transaction
+from django.utils import timezone
 
 @transaction.atomic
 def allocate_payment(*, payment_id: int) -> MerryPayment:
@@ -2632,81 +2742,119 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
     if not member.is_active:
         raise BadState("Cannot allocate payment for an inactive member.")
 
-    current_payout = ensure_current_payout_exists(merry_id=merry.id)
+    # 🔥 1. Prevent schedule drift
+    sync_merry_schedule(merry)
+
+    # 🔥 2. Ensure dues exist ONLY
     ensure_member_dues_up_to_current_turn(member=member)
 
-    if (payment.period_key or "").strip() != current_payout.period_key:
-        payment.period_key = current_payout.period_key
-        payment.save(update_fields=["period_key"])
+    # 🔥 3. Get current turn (CORE FIX)
+    current_turn = _current_turn_from_schedule(merry)
 
-    remaining = q2(payment.amount or Decimal("0.00"))
-    if remaining <= 0:
-        raise BadState("Payment amount must be > 0.")
-
+    # 🔥 4. Fetch dues (TURN-BASED FIFO)
     dues = list(
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=merry,
             seat__member=member,
             seat__is_active=True,
             status__in=["PENDING", "PARTIAL", "OVERDUE"],
+            payout__turn_no__lte=current_turn,   # ✅ prevents future allocation
         )
         .exclude(
             payout__isnull=True,
             due_date__isnull=True,
         )
-        .select_related("seat")
-        .order_by("due_date", "seat__seat_no", "id")
+        .select_related("payout", "seat")
+        .order_by("payout__turn_no", "seat__seat_no", "id")
     )
+
+    # 🔥 5. Force due_date consistency
+    updated = []
+    for d in dues:
+        correct = d.payout.scheduled_date
+        if d.due_date != correct:
+            d.due_date = correct
+            updated.append(d)
+
+    if updated:
+        MerryContributionDue.objects.bulk_update(updated, ["due_date"])
+
     _refresh_penalties_for_queryset(dues)
+
+    # 🔥 6. USE WALLET FIRST
+    wallet = _get_or_create_wallet_for_user(member.user)
+    wallet_balance = q2(wallet.balance or Decimal("0.00"))
+
+    if wallet_balance > 0:
+        for due in dues:
+            if wallet_balance <= 0:
+                break
+
+            need = q2((due.due_amount or 0) - (due.paid_amount or 0))
+            if need <= 0:
+                continue
+
+            alloc = min(wallet_balance, need)
+
+            due.paid_amount = q2((due.paid_amount or 0) + alloc)
+            due.recalc_status()
+
+            wallet_balance = q2(wallet_balance - alloc)
+
+        MerryContributionDue.objects.bulk_update(
+            dues,
+            ["paid_amount", "status", "updated_at"]
+        )
+
+        wallet.balance = wallet_balance
+        wallet.save(update_fields=["balance"])
+
+    # 🔥 7. USE PAYMENT
+    remaining = q2(payment.amount or Decimal("0.00"))
+
+    if remaining <= 0:
+        raise BadState("Payment amount must be > 0.")
 
     for due in dues:
         if remaining <= 0:
             break
 
-        due_amount = q2(due.due_amount or Decimal("0.00"))
-        paid_amount = q2(due.paid_amount or Decimal("0.00"))
-        need = q2(due_amount - paid_amount)
-
+        need = q2((due.due_amount or 0) - (due.paid_amount or 0))
         if need <= 0:
             continue
 
-        alloc = q2(min(remaining, need))
-        if alloc <= 0:
-            continue
+        alloc = min(remaining, need)
 
         allocation, _ = MerryPaymentAllocation.objects.get_or_create(
             payment=payment,
             due=due,
             defaults={"amount_allocated": Decimal("0.00")},
         )
+
         allocation.amount_allocated = q2(
-            (allocation.amount_allocated or Decimal("0.00")) + alloc
+            (allocation.amount_allocated or 0) + alloc
         )
-        allocation.full_clean()
         allocation.save(update_fields=["amount_allocated"])
 
-        due.paid_amount = q2((due.paid_amount or Decimal("0.00")) + alloc)
+        due.paid_amount = q2((due.paid_amount or 0) + alloc)
         due.recalc_status()
         due.save(update_fields=["paid_amount", "status", "updated_at"])
 
         remaining = q2(remaining - alloc)
 
+    # 🔥 8. EXCESS → WALLET
     if remaining > 0:
         add_merry_wallet_credit(
             user=member.user,
             amount=remaining,
             reference=f"PAY-{payment.id}",
-            narration=(
-                f"Excess merry payment saved to wallet after payment allocation "
-                f"#{payment.id}."
-            ),
+            narration=f"Excess after allocation #{payment.id}",
             mpesa_receipt_number=payment.mpesa_receipt_number,
         )
 
     return payment
 
-# -----------------------------
 # Readiness helpers
 # -----------------------------
 def _slot_due_total(*, merry: MerryGoRound, period_key: str, slot_no: int) -> Decimal:
@@ -3071,6 +3219,7 @@ def list_my_payments(*, user, limit: int = 200):
         .select_related("merry", "beneficiary_member", "beneficiary_member__user")
         .order_by("-created_at")[:limit]
     )
+    
 
 
 def list_dues_for_member(*, user, merry_id: int, period_key: Optional[str] = None):
@@ -3087,7 +3236,7 @@ def list_dues_for_member(*, user, merry_id: int, period_key: Optional[str] = Non
             seat__is_active=True,
         )
         .exclude(status__in=["PAID", "CANCELLED"])
-        .select_related("seat", "payout")
+        .select_related("seat", "merry", "seat__member", ...)
         .order_by("due_date", "seat__seat_no", "id")
     )
     _refresh_penalties_for_queryset(dues)
@@ -3141,7 +3290,7 @@ def get_user_merry_due_summary(*, user) -> Dict[str, Any]:
                 seat_id__in=seat_ids,
             )
             .exclude(status__in=["PAID", "CANCELLED"])
-            .select_related("seat", "payout")
+            .select_related("seat", "merry", "seat__member", ...)
             .order_by("due_date", "seat__seat_no", "id")
         )
 
