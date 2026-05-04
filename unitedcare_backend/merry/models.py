@@ -674,18 +674,7 @@ class MerryMember(models.Model):
         return _date_only(self.joined_at) or timezone.localdate()
 
     def __str__(self):
-        try:
-            username = getattr(self.user, "username", f"user-{self.user_id}")
-        except Exception:
-            username = f"user-{self.user_id}"
-
-        try:
-         merry_name = getattr(self.merry, "name", f"merry-{self.merry_id}")
-        except Exception:
-            merry_name = f"merry-{self.merry_id}"
-
-        return f"{username} - {merry_name}"
-
+        return f"user-{self.user_id} - merry-{self.merry_id}"
 # ----------------------------
 # Seats/Shares
 # ----------------------------
