@@ -87,7 +87,7 @@ def build_seat_status_table_html(merry):
                     <tr>
                         <td style="border:1px solid #ddd; padding:6px;">{seat_no}</td>
                         <td style="border:1px solid #ddd; padding:6px; color:#b91c1c;"><strong>Taken (Active)</strong></td>
-                        <td style="border:1px solid #ddd; padding:6px;">{seat.member.user}</td>
+                        <td style="border:1px solid #ddd; padding:6px;"><td>{getattr(getattr(seat.member, "user", None), "username", "-")}</td></td>
                         <td style="border:1px solid #ddd; padding:6px;">Yes</td>
                         <td style="border:1px solid #ddd; padding:6px;">{seat.payout_position or "-"}</td>
                         <td style="border:1px solid #ddd; padding:6px; color:#6b7280;">Not selectable</td>
@@ -101,7 +101,7 @@ def build_seat_status_table_html(merry):
                     <tr>
                         <td style="border:1px solid #ddd; padding:6px;">{seat_no}</td>
                         <td style="border:1px solid #ddd; padding:6px; color:#92400e;"><strong>Inactive / Reusable</strong></td>
-                        <td style="border:1px solid #ddd; padding:6px;">{seat.member.user}</td>
+                        <td style="border:1px solid #ddd; padding:6px;"><td>{getattr(getattr(seat.member, "user", None), "username", "-")}</td></td>
                         <td style="border:1px solid #ddd; padding:6px;">No</td>
                         <td style="border:1px solid #ddd; padding:6px;">{seat.payout_position or "-"}</td>
                         <td style="border:1px solid #ddd; padding:6px; color:#166534;">Selectable</td>
@@ -171,7 +171,7 @@ def build_seat_status_table_html(merry):
             <tr>
                 <td style="border:1px solid #ddd; padding:6px;">{seat.seat_no}</td>
                 <td style="border:1px solid #ddd; padding:6px; color:{color};"><strong>{label}</strong></td>
-                <td style="border:1px solid #ddd; padding:6px;">{seat.member.user}</td>
+                <td style="border:1px solid #ddd; padding:6px;"><td>{getattr(getattr(seat.member, "user", None), "username", "-")}</td></td>
                 <td style="border:1px solid #ddd; padding:6px;">{"Yes" if seat.is_active else "No"}</td>
                 <td style="border:1px solid #ddd; padding:6px;">{seat.payout_position or "-"}</td>
                 <td style="border:1px solid #ddd; padding:6px;">Seat selection requires max_seats</td>
@@ -795,7 +795,7 @@ class MerryWalletTransactionInline(admin.TabularInline):
 #             return "No active seats."
 
 #         parts = [
-#             f"{seat.payout_position or '-'}: {seat.member.user} (Seat {seat.seat_no})"
+#             f"{seat.payout_position or '-'}: <td>{getattr(getattr(seat.member, "user", None), "username", "-")}</td> (Seat {seat.seat_no})"
 #             for seat in seats
 #         ]
 #         return format_html("<br>".join(parts))
@@ -1160,8 +1160,12 @@ class MerrySeatAdmin(admin.ModelAdmin):
     )
 
     def member_user_display(self, obj):
-        return obj.member.user
+        try:
+            return obj.member.user.username
+        except Exception:
+            return "-"
 
+    
     member_user_display.short_description = "User"
 
     def seat_status_preview(self, obj):
@@ -1461,6 +1465,7 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "is_advance_payable",
         "updated_at",
     )
+
     list_filter = (
         "status",
         "period_key",
@@ -1470,15 +1475,26 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         "is_advance_payable",
         "days_overdue",
     )
+
     search_fields = (
         "merry__name",
         "seat__member__user__username",
         "seat__member__user__phone",
         "period_key",
     )
+
     ordering = ("due_date", "slot_no", "id")
-    list_select_related = ("merry", "seat", "seat__member", "seat__member__user", "payout")
+
+    list_select_related = (
+        "merry",
+        "seat",
+        "seat__member",
+        "seat__member__user",
+        "payout",
+    )
+
     readonly_fields = ("created_at", "updated_at")
+
     actions = [cancel_dues, recalc_due_statuses]
 
     fieldsets = (
@@ -1511,8 +1527,14 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
         }),
     )
 
+    # ✅ FIXED (safe access — NO crash)
     def seat_user_display(self, obj):
-        return obj.seat.member.user
+        try:
+            member = getattr(obj.seat, "member", None)
+            user = getattr(member, "user", None)
+            return getattr(user, "username", "-")
+        except Exception:
+            return "-"
 
     seat_user_display.short_description = "User"
 
@@ -1535,6 +1557,9 @@ class MerryContributionDueAdmin(admin.ModelAdmin):
 # =========================================================
 # PAYMENT ADMIN
 # =========================================================
+# =========================================================
+# PAYMENT ADMIN
+# =========================================================
 @admin.register(MerryPayment)
 class MerryPaymentAdmin(admin.ModelAdmin):
     list_display = (
@@ -1550,6 +1575,7 @@ class MerryPaymentAdmin(admin.ModelAdmin):
         "paid_at",
         "created_at",
     )
+
     list_filter = (
         "status",
         "period_key",
@@ -1557,6 +1583,7 @@ class MerryPaymentAdmin(admin.ModelAdmin):
         "created_at",
         "merry",
     )
+
     search_fields = (
         "merry__name",
         "beneficiary_member__user__username",
@@ -1564,14 +1591,29 @@ class MerryPaymentAdmin(admin.ModelAdmin):
         "payer_phone",
         "mpesa_receipt_number",
     )
+
     ordering = ("-id",)
-    list_select_related = ("merry", "beneficiary_member", "beneficiary_member__user")
+
+    list_select_related = (
+        "merry",
+        "beneficiary_member",
+        "beneficiary_member__user",
+    )
+
     readonly_fields = ("created_at", "paid_at")
+
     actions = [confirm_payments, fail_payments]
+
     inlines = [MerryPaymentAllocationInline]
 
+    # ✅ FIXED (safe access)
     def beneficiary_user_display(self, obj):
-        return obj.beneficiary_member.user
+        try:
+            member = getattr(obj, "beneficiary_member", None)
+            user = getattr(member, "user", None)
+            return getattr(user, "username", "-")
+        except Exception:
+            return "-"
 
     beneficiary_user_display.short_description = "User"
 
