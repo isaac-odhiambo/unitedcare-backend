@@ -673,23 +673,23 @@ class MerryMember(models.Model):
     def joined_on(self) -> date:
         return _date_only(self.joined_at) or timezone.localdate()
 
-def __str__(self):
-    username = f"user-{self.user_id}"
-    merry_name = "No Merry"
+    def __str__(self):
+        username = f"user-{self.user_id}"
+        merry_name = "No Merry"
 
-    try:
-        if self.user:
-            username = getattr(self.user, "username", username)
-    except Exception:
-        pass
+        try:
+            if self.user:
+                username = getattr(self.user, "username", username)
+        except Exception:
+            pass
 
-    try:
-        if self.merry:
-            merry_name = getattr(self.merry, "name", merry_name)
-    except Exception:
-        pass
+        try:
+            if self.merry:
+                merry_name = getattr(self.merry, "name", merry_name)
+        except Exception:
+            pass
 
-    return f"{username} - {merry_name}"
+        return f"{username} - {merry_name}"
 
 # ----------------------------
 # Seats/Shares
@@ -719,7 +719,6 @@ class MerrySeat(models.Model):
 
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(default=timezone.now)
-
 
     class Meta:
         ordering = ["seat_no", "id"]
@@ -752,9 +751,14 @@ class MerrySeat(models.Model):
         return self.member.joined_on()
 
     def __str__(self):
-        return f"Seat#{self.id} merry={self.merry_id} user={self.member.user_id} seat_no={self.seat_no}"
+        user_id = None
+        try:
+            if self.member and self.member.user:
+                user_id = self.member.user_id
+        except Exception:
+            pass
 
-
+        return f"Seat#{self.id} merry={self.merry_id} user={user_id} seat_no={self.seat_no}"
 # ----------------------------
 # Join Requests (admin approval)
 # ----------------------------
