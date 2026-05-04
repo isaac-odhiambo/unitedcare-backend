@@ -1829,6 +1829,11 @@ class MerryPayoutAdmin(admin.ModelAdmin):
     )
 
     def seat_user_display(self, obj):
-        return obj.seat.member.user
+        try:
+            member = getattr(obj.seat, "member", None)
+            user = getattr(member, "user", None)
+            return getattr(user, "username", "-")
+        except Exception:
+         return "-"
 
     seat_user_display.short_description = "User"
