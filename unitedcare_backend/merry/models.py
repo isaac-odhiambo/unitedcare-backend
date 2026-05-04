@@ -1322,6 +1322,16 @@ class MerryContributionDue(models.Model):
             self.save(update_fields=update_fields)
 
         return q2(self.penalty_amount or Decimal("0")), int(self.days_overdue or 0)
+    
+    def __str__(self):
+        try:
+            merry_id = self.merry_id if self.merry_id else "NoMerry"
+            seat_id = self.seat_id if self.seat_id else "NoSeat"
+            amount = self.due_amount if self.due_amount is not None else "0.00"
+
+            return f"Due#{self.id} merry={merry_id} seat={seat_id} amount={amount}"
+        except Exception:
+            return f"Due#{self.id}"
 
 # ----------------------------
 # Payments
