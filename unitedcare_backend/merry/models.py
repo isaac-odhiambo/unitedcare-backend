@@ -735,14 +735,7 @@ class MerrySeat(models.Model):
         return self.member.joined_on()
 
     def __str__(self):
-        user_id = None
-        try:
-            if self.member and self.member.user:
-                user_id = self.member.user_id
-        except Exception:
-            pass
-
-        return f"Seat#{self.id} merry={self.merry_id} user={user_id} seat_no={self.seat_no}"
+        return f"Seat#{self.id} merry={self.merry_id} member={self.member_id} seat_no={self.seat_no}"
 # ----------------------------
 # Join Requests (admin approval)
 # ----------------------------
