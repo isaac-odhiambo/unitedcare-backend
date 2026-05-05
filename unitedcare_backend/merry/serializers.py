@@ -324,7 +324,18 @@ class MerryPaymentSerializer(serializers.ModelSerializer):
 
 
 class MerryPaymentAllocationSerializer(serializers.ModelSerializer):
-    payment_amount = serializers.DecimalField(source="payment.amount", read_only=True, max_digits=12, decimal_places=2)
+    payment_amount = serializers.DecimalField(
+        source="payment.amount",
+        read_only=True,
+        max_digits=12,
+        decimal_places=2,
+    )
+    amount = serializers.DecimalField(
+        source="amount_allocated",
+        read_only=True,
+        max_digits=12,
+        decimal_places=2,
+    )
     due_period_key = serializers.CharField(source="due.period_key", read_only=True)
     due_slot_no = serializers.IntegerField(source="due.slot_no", read_only=True)
     due_seat_no = serializers.IntegerField(source="due.seat.seat_no", read_only=True)
@@ -344,11 +355,11 @@ class MerryPaymentAllocationSerializer(serializers.ModelSerializer):
             "due_turn_no",
             "due_cycle_no",
             "amount_allocated",
+            "amount",
             "created_at",
         ]
         read_only_fields = fields
-
-
+        
 class MerryPayoutSerializer(serializers.ModelSerializer):
     merry_name = serializers.CharField(source="merry.name", read_only=True)
 
