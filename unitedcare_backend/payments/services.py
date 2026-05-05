@@ -626,6 +626,7 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
     - mus11 means merry allocation for USER id 11
     - reference is authoritative
     - phone mismatch should not block allocation
+    - outside-app MUS payments use the full M-Pesa amount as the merry contribution
     """
     if tx.allocation_status in ("AUTO_ALLOCATED", "MANUALLY_ALLOCATED"):
         return
@@ -664,15 +665,16 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
             )
             return
 
-        payload = tx.request_payload if isinstance(tx.request_payload, dict) else {}
-        base_amount = _money(payload.get("base_amount", tx.base_amount or tx.amount))
+        # Outside-app MUS payments must use the full M-Pesa amount.
+        # Do not use base_amount here because that removes the transaction fee.
+        merry_amount = _money(tx.amount)
 
         fn = getattr(merry_services, "apply_mpesa_contribution_by_user_reference", None)
         if callable(fn):
             try:
                 fn(
                     user_id=parsed.entity_id,
-                    amount=base_amount,
+                    amount=merry_amount,
                     mpesa_tx=tx,
                     reference=tx.reference or "",
                 )
@@ -709,7 +711,7 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
                 if fn_name == "apply_mpesa_contribution_by_user":
                     fallback(
                         user_id=parsed.entity_id,
-                        amount=base_amount,
+                        amount=merry_amount,
                         mpesa_tx=tx,
                         reference=tx.reference or "",
                     )
@@ -719,7 +721,7 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
                         raise ValueError("Beneficiary user not found for merry reference.")
                     fallback(
                         user=beneficiary_user,
-                        amount=base_amount,
+                        amount=merry_amount,
                         mpesa_tx=tx,
                         reference=tx.reference or "",
                     )
@@ -800,7 +802,6 @@ def _apply_merry_contribution(tx: MpesaTransaction) -> None:
         status="AUTO_ALLOCATED",
         notes="Legacy merry payment confirmed and allocated.",
     )
-
 
 @transaction.atomic
 def _apply_loan_repayment(tx: MpesaTransaction) -> None:
