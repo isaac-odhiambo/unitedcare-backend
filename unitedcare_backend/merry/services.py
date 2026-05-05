@@ -1066,18 +1066,34 @@ def _get_or_create_scheduled_payout_for_turn(
 
 def get_existing_current_payout(*, merry_id: int) -> Optional[MerryPayout]:
     today = timezone.localdate()
-    payouts = (
+
+    payouts = list(
         MerryPayout.objects.filter(merry_id=merry_id, status="SCHEDULED")
         .select_related("seat", "seat__member", "seat__member__user")
-        .order_by("turn_no", "id")
+        .order_by("scheduled_date", "turn_no", "id")
     )
 
-    for payout in payouts:
-        payout_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
-        if payout_date >= today:
-            return payout
+    due_or_past = []
+    future = []
 
-    return payouts.order_by("-turn_no", "-id").first()
+    for payout in payouts:
+        payout_date = (
+            getattr(payout, "scheduled_date", None)
+            or _period_key_to_date(payout.period_key)
+        )
+
+        if payout_date <= today:
+            due_or_past.append(payout)
+        else:
+            future.append(payout)
+
+    if due_or_past:
+        return due_or_past[-1]
+
+    if future:
+        return future[0]
+
+    return None
 
 def _find_next_open_period_slot_for_seat(
     *,
@@ -1093,20 +1109,20 @@ def _find_next_open_period_slot_for_seat(
 
 
 def _preview_next_payout_meta(merry: MerryGoRound) -> Dict[str, Any]:
-    payout = get_existing_current_payout(merry_id=merry.id)
-    if payout:
-        seat = payout.seat
-        due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
-        period_key = payout.period_key
-        slot_no = int(getattr(payout, "slot_no", 1) or 1)
-        turn_no = getattr(payout, "turn_no", 1)
-        cycle_number = getattr(payout, "cycle_no", _cycle_number_for_turn(merry, turn_no))
-    else:
-        seat = _next_turn_seat(merry)
-        due_date, slot_no = _next_turn_schedule_for_payout(merry)
-        period_key = _date_to_period_key(due_date)
-        turn_no = _next_turn_no(merry)
-        cycle_number = _cycle_number_for_turn(merry, turn_no)
+    payout = ensure_current_payout_exists(merry_id=merry.id)
+
+    seat = payout.seat
+    due_date = (
+        getattr(payout, "scheduled_date", None)
+        or _period_key_to_date(payout.period_key)
+    )
+    period_key = payout.period_key or _date_to_period_key(due_date)
+    slot_no = int(getattr(payout, "slot_no", 1) or 1)
+    turn_no = int(getattr(payout, "turn_no", 1) or 1)
+    cycle_number = int(
+        getattr(payout, "cycle_no", _cycle_number_for_turn(merry, turn_no))
+        or 1
+    )
 
     return {
         "seat": seat,
@@ -1233,113 +1249,73 @@ def ensure_current_payout_exists(*, merry_id: int) -> MerryPayout:
     merry = get_merry(merry_id)
     today = timezone.localdate()
 
-    scheduled_payouts = list(
-        MerryPayout.objects.select_for_update()
-        .filter(merry=merry, status="SCHEDULED")
-        .select_related("seat", "seat__member", "seat__member__user")
-        .order_by("scheduled_date", "turn_no", "id")
-    )
-
-    # 1. Calendar current turn:
-    # Return the latest scheduled payout whose date is today or already passed.
-    # This means old unpaid turns remain overdue, but they do not stop the
-    # app from showing the real current calendar turn.
-    due_or_past = []
-    for payout in scheduled_payouts:
-        payout_date = (
-            getattr(payout, "scheduled_date", None)
-            or _period_key_to_date(payout.period_key)
-        )
-
-        if payout_date <= today:
-            due_or_past.append(payout)
-
-    if due_or_past:
-        return due_or_past[-1]
-
-    # 2. If no payout is due yet, return the nearest future scheduled payout.
-    for payout in scheduled_payouts:
-        payout_date = (
-            getattr(payout, "scheduled_date", None)
-            or _period_key_to_date(payout.period_key)
-        )
-
-        if payout_date > today:
-            return payout
-
-    # 3. If no scheduled payout exists, create the first payout from the anchor.
-    latest_payout = (
-        MerryPayout.objects.select_for_update()
-        .filter(merry=merry)
-        .order_by("-turn_no", "-id")
-        .select_related("seat", "seat__member", "seat__member__user")
-        .first()
-    )
-
-    if latest_payout:
-        last_date = (
-            getattr(latest_payout, "scheduled_date", None)
-            or _period_key_to_date(latest_payout.period_key)
-        )
-        next_turn_no = int(getattr(latest_payout, "turn_no", 0) or 0) + 1
-    else:
-        created_anchor = (
+    anchor = getattr(merry, "next_payout_date", None)
+    if not anchor:
+        anchor = (
             merry.created_at.date()
             if getattr(merry, "created_at", None)
             else today
         )
-        configured_anchor = getattr(merry, "next_payout_date", None)
-        anchor = configured_anchor or created_anchor
 
-        if _has_slot_config_schedule(merry):
-            first_date, first_slot_no = _next_slot_config_candidate_on_or_after(
-                merry,
-                anchor,
-            )
-        else:
-            first_date, first_slot_no = anchor, 1
+    # 1. Work out the current calendar turn from the fixed anchor.
+    # The turn changes when its scheduled date is reached.
+    current_turn_no = 1
+    current_date = anchor
+    current_slot_no = 1
 
-        return _get_or_create_scheduled_payout_for_turn(
-            merry=merry,
-            turn_no=1,
-            scheduled_date=first_date,
-            slot_no=first_slot_no,
+    if _has_slot_config_schedule(merry):
+        current_date, current_slot_no = _next_slot_config_candidate_on_or_after(
+            merry,
+            anchor,
         )
-
-    # 4. Create missing scheduled payouts up to today.
-    # Return the latest payout that is due today or before today.
-    current_payout = latest_payout
-    next_date = last_date
 
     while True:
         if _has_slot_config_schedule(merry):
             next_date, next_slot_no = _next_slot_config_candidate_after(
                 merry,
-                next_date,
+                current_date,
             )
         else:
-            next_date = _add_schedule_step(merry, next_date)
+            next_date = _add_schedule_step(merry, current_date)
             next_slot_no = 1
 
         if next_date > today:
-            # Create the next future payout only if none exists for that turn/date.
-            _get_or_create_scheduled_payout_for_turn(
-                merry=merry,
-                turn_no=next_turn_no,
-                scheduled_date=next_date,
-                slot_no=next_slot_no,
-            )
-            return current_payout
+            break
 
-        current_payout = _get_or_create_scheduled_payout_for_turn(
-            merry=merry,
-            turn_no=next_turn_no,
-            scheduled_date=next_date,
-            slot_no=next_slot_no,
+        current_date = next_date
+        current_slot_no = next_slot_no
+        current_turn_no += 1
+
+    # 2. Create or correct the payout row for the current calendar turn.
+    payout = _get_or_create_scheduled_payout_for_turn(
+        merry=merry,
+        turn_no=current_turn_no,
+        scheduled_date=current_date,
+        slot_no=current_slot_no,
+    )
+
+    # 3. Also create or correct the next future turn.
+    # This lets the frontend show next turn correctly.
+    next_turn_no = current_turn_no + 1
+
+    if _has_slot_config_schedule(merry):
+        future_date, future_slot_no = _next_slot_config_candidate_after(
+            merry,
+            current_date,
         )
+    else:
+        future_date = _add_schedule_step(merry, current_date)
+        future_slot_no = 1
 
-        next_turn_no += 1
-        
+    _get_or_create_scheduled_payout_for_turn(
+        merry=merry,
+        turn_no=next_turn_no,
+        scheduled_date=future_date,
+        slot_no=future_slot_no,
+    )
+
+    return payout
+
 @transaction.atomic
 def ensure_dues_for_current_payout(*, merry_id: int) -> int:
     merry = get_merry(merry_id)
@@ -2908,45 +2884,6 @@ def compute_payout_amount_for_slot(
     return q2(total)
 
 
-# @transaction.atomic
-# def get_next_payout_turn(*, merry_id: int) -> Dict[str, Any]:
-#     merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
-#     if not merry:
-#         raise NotFound("Merry not found.")
-
-#     payout = ensure_current_payout_exists(merry_id=merry.id)
-#     seat = payout.seat
-#     period_meta = get_period_date_range(merry=merry, period_key=payout.period_key)
-#     due_date = getattr(payout, "scheduled_date", None) or _period_key_to_date(payout.period_key)
-
-#     return {
-#         "merry_id": merry.id,
-#         "merry_name": merry.name,
-#         "payout_id": payout.id,
-#         "turn_no": getattr(payout, "turn_no", 1),
-#         "cycle_no": getattr(payout, "cycle_no", _current_cycle_number(merry)),
-#         "seat_id": seat.id,
-#         "seat_no": seat.seat_no,
-#         "member_id": seat.member_id,
-#         "user_id": seat.member.user_id,
-#         "username": getattr(seat.member.user, "username", None),
-#         "payout_position": seat.payout_position,
-#         "period_key": payout.period_key,
-#         "period_label": period_meta["label"],
-#         "period_start_date": period_meta["start_date"],
-#         "period_end_date": period_meta["end_date"],
-#         "slot_no": 1,
-#         "due_date": due_date,
-#         "scheduled_date": due_date,
-#         "cycle_number": getattr(payout, "cycle_no", _current_cycle_number(merry)),
-#         "cycle_complete": _is_cycle_complete(merry),
-#         "expected_amount": q2(
-#             payout.amount
-#             if getattr(payout, "amount", None) is not None
-#             else (_expected_pool_amount(merry))
-#         ),
-#     }
-
 
 @transaction.atomic
 def get_next_payout_turn(*, merry_id: int) -> Dict[str, Any]:
@@ -2954,40 +2891,84 @@ def get_next_payout_turn(*, merry_id: int) -> Dict[str, Any]:
     if not merry:
         raise NotFound("Merry not found.")
 
-    # ✅ correct schedule-based turn
-    current_turn = _current_turn_from_schedule(merry)
-    next_turn = current_turn + 1
+    payout = ensure_current_payout_exists(merry_id=merry.id)
+    seat = payout.seat
 
-    # ✅ correct seat selection
-    current_seat = _next_turn_seat(merry, turn_no=current_turn)
-    next_seat = _next_turn_seat(merry, turn_no=next_turn)
+    scheduled_date = (
+        getattr(payout, "scheduled_date", None)
+        or _period_key_to_date(payout.period_key)
+    )
 
-    # ✅ compute scheduled date for current turn
-    scheduled_date = merry.next_payout_date
-    t = 1
-    while t < current_turn:
-        scheduled_date = _add_schedule_step(merry, scheduled_date)
-        t += 1
+    period_key = payout.period_key or _date_to_period_key(scheduled_date)
+    period_meta = get_period_date_range(merry=merry, period_key=period_key)
+
+    turn_no = int(getattr(payout, "turn_no", 1) or 1)
+    cycle_no = int(
+        getattr(
+            payout,
+            "cycle_no",
+            _cycle_number_for_turn(merry, turn_no),
+        )
+        or 1
+    )
+
+    next_turn_no = turn_no + 1
+    next_seat = _next_turn_seat(merry, turn_no=next_turn_no)
+
+    if _has_slot_config_schedule(merry):
+        next_scheduled_date, next_slot_no = _next_slot_config_candidate_after(
+            merry,
+            scheduled_date,
+        )
+    else:
+        next_scheduled_date = _add_schedule_step(merry, scheduled_date)
+        next_slot_no = 1
+
+    expected_amount = q2(
+        payout.amount
+        if getattr(payout, "amount", None) is not None
+        else _expected_pool_amount(merry)
+    )
 
     return {
         "merry_id": merry.id,
         "merry_name": merry.name,
 
-        "current_turn": current_turn,
-        "next_turn": next_turn,
+        "payout_id": payout.id,
+        "turn_no": turn_no,
+        "cycle_no": cycle_no,
 
-        "seat_id": current_seat.id,
-        "seat_no": current_seat.seat_no,
-        "member_id": current_seat.member_id,
-        "user_id": current_seat.member.user_id,
-        "username": getattr(current_seat.member.user, "username", None),
+        # Backward compatible aliases
+        "current_turn": turn_no,
+        "next_turn": next_turn_no,
+
+        "seat_id": seat.id,
+        "seat_no": seat.seat_no,
+        "member_id": seat.member_id,
+        "user_id": seat.member.user_id,
+        "username": getattr(seat.member.user, "username", None),
+        "payout_position": seat.payout_position,
+
+        "period_key": period_key,
+        "period_label": period_meta["label"],
+        "period_start_date": period_meta["start_date"],
+        "period_end_date": period_meta["end_date"],
+
+        "slot_no": int(getattr(payout, "slot_no", 1) or 1),
+        "due_date": scheduled_date,
+        "scheduled_date": scheduled_date,
+
+        "cycle_number": cycle_no,
+        "cycle_complete": _is_cycle_complete(merry),
+        "expected_amount": str(expected_amount),
 
         "next_seat_id": next_seat.id,
         "next_seat_no": next_seat.seat_no,
         "next_member_id": next_seat.member_id,
+        "next_user_id": next_seat.member.user_id,
         "next_username": getattr(next_seat.member.user, "username", None),
-
-        "scheduled_date": scheduled_date,
+        "next_scheduled_date": next_scheduled_date,
+        "next_slot_no": next_slot_no,
     }
 @transaction.atomic
 def create_payout_record(
