@@ -151,7 +151,7 @@ def get_active_member(merry: MerryGoRound, user) -> MerryMember:
 def get_member_by_id(member_id: int, *, lock: bool = False) -> MerryMember:
     qs = MerryMember.objects.select_related("merry", "user")
     if lock:
-        qs = qs.select_for_update()
+        qs = qs.select_for_update(of=("self",))
     member = qs.filter(id=member_id).first()
     if not member:
         raise NotFound("Member not found.")
@@ -727,7 +727,7 @@ def _select_member_dues_for_payment(
     ensure_member_dues_up_to_current_turn(member=member)
 
     qs = (
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=member.merry,
             seat__member=member,
@@ -755,7 +755,7 @@ def _select_member_dues_for_payment(
 # -----------------------------
 @transaction.atomic
 def _get_or_create_wallet_for_user(user) -> MerryWallet:
-    wallet, _ = MerryWallet.objects.select_for_update().get_or_create(
+    wallet, _ = MerryWallet.objects.select_for_update(of=("self",)).get_or_create(
         user=user,
         defaults={"balance": Decimal("0.00")},
     )
@@ -990,7 +990,7 @@ def _get_or_create_scheduled_payout_for_turn(
     period_key = _date_to_period_key(scheduled_date)
 
     existing = (
-        MerryPayout.objects.select_for_update()
+        MerryPayout.objects.select_for_update(of=("self",))
         .filter(merry=merry, turn_no=turn_no)
         .select_related("seat", "seat__member", "seat__member__user")
         .first()
@@ -1023,7 +1023,7 @@ def _get_or_create_scheduled_payout_for_turn(
         return existing
 
     existing = (
-        MerryPayout.objects.select_for_update()
+        MerryPayout.objects.select_for_update(of=("self",))
         .filter(merry=merry, status="SCHEDULED", period_key=period_key, slot_no=slot_no)
         .select_related("seat", "seat__member", "seat__member__user")
         .first()
@@ -1162,7 +1162,7 @@ def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
 #     today = timezone.localdate()
 
 #     scheduled_payouts = list(
-#         MerryPayout.objects.select_for_update()
+#         MerryPayout.objects.select_for_update(of=("self",))
 #         .filter(merry=merry, status="SCHEDULED")
 #         .select_related("seat", "seat__member", "seat__member__user")
 #         .order_by("turn_no", "id")
@@ -1187,7 +1187,7 @@ def maybe_update_next_payout_date(*, merry: MerryGoRound) -> None:
 #         next_turn_no = int(getattr(latest_scheduled, "turn_no", 0) or 0) + 1
 #     else:
 #         latest_payout = (
-#             MerryPayout.objects.select_for_update()
+#             MerryPayout.objects.select_for_update(of=("self",))
 #             .filter(merry=merry)
 #             .order_by("-turn_no", "-id")
 #             .select_related("seat", "seat__member", "seat__member__user")
@@ -1324,7 +1324,7 @@ def ensure_dues_for_current_payout(*, merry_id: int) -> int:
 
     count = 0
     active_seats = list(
-        MerrySeat.objects.select_for_update()
+        MerrySeat.objects.select_for_update(of=("self",))
         .filter(merry=merry, is_active=True)
         .select_related("member", "member__user")
         .order_by("seat_no", "id")
@@ -1395,7 +1395,7 @@ def _ensure_historical_member_dues_until_turn(member: MerryMember, upto_turn_no:
     )
 
     seats = list(
-        MerrySeat.objects.select_for_update()
+        MerrySeat.objects.select_for_update(of=("self",))
         .filter(merry=merry, member=member, is_active=True)
         .order_by("seat_no", "id")
     )
@@ -1488,7 +1488,7 @@ def _auto_apply_wallet_to_member_reached_dues(
         }
 
     dues = list(
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=member.merry,
             seat__member=member,
@@ -1634,7 +1634,7 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
     ensure_member_dues_up_to_current_turn(member=member)
 
     dues = list(
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=member.merry,
             seat__member=member,
@@ -1658,7 +1658,7 @@ def _collect_open_dues_for_member_period(member: MerryMember, period_key: str) -
 #     ensure_member_dues_up_to_current_turn(member=member)
 
 #     dues = list(
-#         MerryContributionDue.objects.select_for_update()
+#         MerryContributionDue.objects.select_for_update(of=("self",))
 #         .filter(
 #             merry=member.merry,
 #             seat__member=member,
@@ -1679,7 +1679,7 @@ def _collect_open_dues_for_member(member: MerryMember) -> List[MerryContribution
     ensure_member_dues_up_to_current_turn(member=member)
 
     dues = list(
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=member.merry,
             seat__member=member,
@@ -2353,7 +2353,7 @@ def request_to_join_merry(
     note: str = "",
     requested_seats: int = 1,
 ) -> MerryJoinRequest:
-    merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
+    merry = MerryGoRound.objects.select_for_update(of=("self",)).filter(id=merry_id).first()
     if not merry:
         raise NotFound("Merry not found.")
 
@@ -2374,7 +2374,7 @@ def request_to_join_merry(
             raise BadState(reason)
 
     existing_pending = (
-        MerryJoinRequest.objects.select_for_update()
+        MerryJoinRequest.objects.select_for_update(of=("self",))
         .filter(merry=merry, user=user, status="PENDING")
         .first()
     )
@@ -2398,7 +2398,7 @@ def request_to_join_merry(
         return existing_pending
 
     existing_latest = (
-        MerryJoinRequest.objects.select_for_update()
+        MerryJoinRequest.objects.select_for_update(of=("self",))
         .filter(merry=merry, user=user)
         .order_by("-created_at", "-id")
         .first()
@@ -2450,7 +2450,7 @@ def request_to_join_merry(
 
 @transaction.atomic
 def cancel_join_request(*, user, request_id: int) -> MerryJoinRequest:
-    jr = MerryJoinRequest.objects.select_for_update().filter(id=request_id).first()
+    jr = MerryJoinRequest.objects.select_for_update(of=("self",)).filter(id=request_id).first()
     if not jr:
         raise NotFound("Join request not found.")
     if jr.user_id != user.id:
@@ -2479,7 +2479,7 @@ def admin_approve_join_request(
         raise NotAllowed("Admin only.")
 
     jr = (
-        MerryJoinRequest.objects.select_for_update()
+        MerryJoinRequest.objects.select_for_update(of=("self",))
         .select_related("merry", "user")
         .filter(id=request_id)
         .first()
@@ -2489,7 +2489,7 @@ def admin_approve_join_request(
     if jr.status != "PENDING":
         raise BadState("Only PENDING requests can be approved.")
 
-    merry = MerryGoRound.objects.select_for_update().filter(id=jr.merry_id).first()
+    merry = MerryGoRound.objects.select_for_update(of=("self",)).filter(id=jr.merry_id).first()
     if not merry:
         raise NotFound("Merry not found.")
 
@@ -2571,7 +2571,7 @@ def admin_reject_join_request(*, admin_user, request_id: int, note: str = "") ->
         raise NotAllowed("Admin only.")
 
     jr = (
-        MerryJoinRequest.objects.select_for_update()
+        MerryJoinRequest.objects.select_for_update(of=("self",))
         .select_related("merry", "user")
         .filter(id=request_id)
         .first()
@@ -2616,7 +2616,7 @@ def add_seats_to_existing_member(
     if not member.is_active:
         raise BadState("Cannot add seats to an inactive member.")
 
-    merry = MerryGoRound.objects.select_for_update().get(id=member.merry_id)
+    merry = MerryGoRound.objects.select_for_update(of=("self",)).get(id=member.merry_id)
 
     seat_numbers = _validate_manual_seat_numbers_for_merry(
         merry=merry,
@@ -2664,7 +2664,7 @@ def reassign_existing_clean_seat(
         raise NotAllowed("Admin only.")
 
     seat = (
-        MerrySeat.objects.select_for_update()
+        MerrySeat.objects.select_for_update(of=("self",))
         .select_related("merry", "member", "member__user")
         .filter(id=seat_id)
         .first()
@@ -2742,7 +2742,7 @@ def confirm_payment_and_allocate(
     paid_at=None,
 ) -> MerryPayment:
     p = (
-        MerryPayment.objects.select_for_update()
+        MerryPayment.objects.select_for_update(of=("self",))
         .select_related("merry", "beneficiary_member", "beneficiary_member__user")
         .filter(id=payment_id)
         .first()
@@ -2786,7 +2786,7 @@ def confirm_payment_and_allocate(
 
 @transaction.atomic
 def mark_payment_failed(*, payment_id: int) -> MerryPayment:
-    p = MerryPayment.objects.select_for_update().filter(id=payment_id).first()
+    p = MerryPayment.objects.select_for_update(of=("self",)).filter(id=payment_id).first()
     if not p:
         raise NotFound("Payment not found.")
     if p.status == "CONFIRMED":
@@ -2802,7 +2802,7 @@ def mark_payment_failed(*, payment_id: int) -> MerryPayment:
 @transaction.atomic
 def allocate_payment(*, payment_id: int) -> MerryPayment:
     payment = (
-        MerryPayment.objects.select_for_update()
+        MerryPayment.objects.select_for_update(of=("self",))
         .select_related("merry", "beneficiary_member", "beneficiary_member__user")
         .get(id=payment_id)
     )
@@ -2831,7 +2831,7 @@ def allocate_payment(*, payment_id: int) -> MerryPayment:
         raise BadState("Payment amount must be > 0.")
 
     dues = list(
-        MerryContributionDue.objects.select_for_update()
+        MerryContributionDue.objects.select_for_update(of=("self",))
         .filter(
             merry=merry,
             seat__member=member,
@@ -2992,7 +2992,7 @@ def get_payout_readiness_status(
     period_key: Optional[str] = None,
     slot_no: Optional[int] = None,
 ) -> Dict[str, Any]:
-    merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
+    merry = MerryGoRound.objects.select_for_update(of=("self",)).filter(id=merry_id).first()
     if not merry:
         raise NotFound("Merry not found.")
 
@@ -3075,7 +3075,7 @@ def compute_payout_amount_for_slot(
 
 @transaction.atomic
 def get_next_payout_turn(*, merry_id: int) -> Dict[str, Any]:
-    merry = MerryGoRound.objects.select_for_update().filter(id=merry_id).first()
+    merry = MerryGoRound.objects.select_for_update(of=("self",)).filter(id=merry_id).first()
     if not merry:
         raise NotFound("Merry not found.")
 
@@ -3207,7 +3207,7 @@ def create_next_cycle_payout_record(
 @transaction.atomic
 def mark_payout_paid(*, payout_id: int, paid_at=None) -> MerryPayout:
     p = (
-        MerryPayout.objects.select_for_update()
+        MerryPayout.objects.select_for_update(of=("self",))
         .select_related("merry", "seat", "seat__member", "seat__member__user")
         .filter(id=payout_id)
         .first()
