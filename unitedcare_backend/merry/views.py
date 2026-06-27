@@ -417,17 +417,381 @@ class MerryDetailView(APIView):
         return Response(data, status=status.HTTP_200_OK)
 
 
+# ==========================================
+# Mobile detail + readiness rows
+# Safe frontend-friendly version
+# ==========================================
+def _mobile_view_money(value) -> str:
+    try:
+        return str(q2(value if value is not None else Decimal("0.00")))
+    except Exception:
+        return "0.00"
+
+
+def _mobile_view_date(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _mobile_view_username(user):
+    if not user:
+        return None
+    return (
+        getattr(user, "username", None)
+        or getattr(user, "phone", None)
+        or f"User #{getattr(user, 'id', '')}"
+    )
+
+
+def _mobile_view_due_outstanding(due: MerryContributionDue) -> Decimal:
+    try:
+        if hasattr(due, "outstanding"):
+            return q2(due.outstanding())
+    except Exception:
+        pass
+
+    try:
+        return q2(
+            (due.due_amount or Decimal("0.00"))
+            - (due.paid_amount or Decimal("0.00"))
+        )
+    except Exception:
+        return Decimal("0.00")
+
+
+def _mobile_view_due_row(due: MerryContributionDue) -> dict:
+    seat = getattr(due, "seat", None)
+    member = getattr(seat, "member", None) if seat else None
+    user = getattr(member, "user", None) if member else None
+    payout = getattr(due, "payout", None)
+
+    outstanding = _mobile_view_due_outstanding(due)
+
+    return {
+        "due_id": due.id,
+        "payout_id": getattr(due, "payout_id", None),
+        "turn_no": getattr(payout, "turn_no", None) if payout else None,
+        "cycle_no": getattr(payout, "cycle_no", None) if payout else None,
+        "period_key": getattr(due, "period_key", None),
+        "slot_no": int(getattr(due, "slot_no", 1) or 1),
+        "due_date": _mobile_view_date(getattr(due, "due_date", None)),
+        "seat_id": getattr(seat, "id", None),
+        "seat_no": getattr(seat, "seat_no", None),
+        "member_id": getattr(member, "id", None),
+        "user_id": getattr(user, "id", None),
+        "username": _mobile_view_username(user),
+        "phone": getattr(user, "phone", None) if user else None,
+        "due_amount": _mobile_view_money(getattr(due, "due_amount", Decimal("0.00"))),
+        "base_amount": _mobile_view_money(getattr(due, "base_amount", Decimal("0.00"))),
+        "penalty_amount": _mobile_view_money(getattr(due, "penalty_amount", Decimal("0.00"))),
+        "paid_amount": _mobile_view_money(getattr(due, "paid_amount", Decimal("0.00"))),
+        "outstanding": _mobile_view_money(outstanding),
+        "status": getattr(due, "status", None),
+        "days_overdue": int(getattr(due, "days_overdue", 0) or 0),
+    }
+
+
+def _mobile_view_sum_due_rows(dues) -> dict:
+    due_total = Decimal("0.00")
+    paid_total = Decimal("0.00")
+    outstanding_total = Decimal("0.00")
+
+    for due in dues:
+        due_total = q2(
+            due_total
+            + q2(getattr(due, "due_amount", Decimal("0.00")) or Decimal("0.00"))
+        )
+        paid_total = q2(
+            paid_total
+            + q2(getattr(due, "paid_amount", Decimal("0.00")) or Decimal("0.00"))
+        )
+        outstanding_total = q2(
+            outstanding_total + _mobile_view_due_outstanding(due)
+        )
+
+    return {
+        "due_total": due_total,
+        "paid_total": paid_total,
+        "outstanding_total": outstanding_total,
+    }
+
+
+def _mobile_view_get_current_payout_from_turn_meta(turn_meta: dict):
+    payout_id = turn_meta.get("payout_id")
+    if not payout_id:
+        return None
+
+    return (
+        MerryPayout.objects
+        .filter(id=payout_id)
+        .select_related("seat", "seat__member", "seat__member__user")
+        .first()
+    )
+
+
 class MerryMobileDetailView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, merry_id: int):
+        merry = get_merry_or_404(merry_id)
+
+        if not user_can_view_merry(request.user, merry):
+            raise PermissionDenied("Not allowed.")
+
+        active_member = (
+            MerryMember.objects
+            .select_related("merry", "user")
+            .filter(merry=merry, user=request.user, is_active=True)
+            .first()
+        )
+
+        latest_join_request = (
+            MerryJoinRequest.objects
+            .filter(merry=merry, user=request.user)
+            .order_by("-created_at", "-id")
+            .first()
+        )
+
+        # Source of truth for current turn and next turn.
+        # This already works in /api/merry/<id>/.
         try:
-            data = merry_services.get_merry_mobile_detail(
-                user=request.user,
-                merry_id=merry_id,
-            )
+            turn_meta = merry_services.get_next_payout_turn(merry_id=merry.id)
         except Exception as e:
             raise _service_error(e)
+
+        current_turn_no = turn_meta.get("current_turn") or turn_meta.get("turn_no")
+        next_turn_no = turn_meta.get("next_turn")
+
+        payout = _mobile_view_get_current_payout_from_turn_meta(turn_meta)
+
+        # Try to generate/refresh dues, but never allow this to crash mobile-detail.
+        try:
+            merry_services.ensure_dues_for_current_payout(merry_id=merry.id)
+        except Exception:
+            pass
+
+        current_due_rows = []
+        if payout:
+            try:
+                current_due_rows = list(
+                    MerryContributionDue.objects
+                    .filter(merry=merry, payout=payout)
+                    .select_related("seat", "seat__member", "seat__member__user", "payout")
+                    .order_by("seat__seat_no", "id")
+                )
+            except Exception:
+                current_due_rows = []
+
+        readiness_totals = _mobile_view_sum_due_rows(current_due_rows)
+
+        ready_for_payout = (
+            readiness_totals["due_total"] > Decimal("0.00")
+            and readiness_totals["paid_total"] >= readiness_totals["due_total"]
+        )
+
+        viewer_seats = []
+        viewer_seat_numbers = []
+        wallet_balance = Decimal("0.00")
+        viewer_due_now = Decimal("0.00")
+        viewer_pay_now = Decimal("0.00")
+
+        if active_member:
+            viewer_seats = list(
+                MerrySeat.objects
+                .filter(merry=merry, member=active_member, is_active=True)
+                .select_related("member", "member__user")
+                .order_by("seat_no", "id")
+            )
+            viewer_seat_numbers = [seat.seat_no for seat in viewer_seats]
+
+            # Try to generate this member's dues, but do not crash the screen.
+            try:
+                merry_services.ensure_member_dues_up_to_current_turn(
+                    member=active_member
+                )
+            except Exception:
+                pass
+
+            try:
+                viewer_due_rows = list(
+                    MerryContributionDue.objects
+                    .filter(
+                        merry=merry,
+                        seat__member=active_member,
+                        seat__is_active=True,
+                        status__in=["PENDING", "PARTIAL", "OVERDUE"],
+                        due_date__lte=timezone.localdate(),
+                    )
+                    .exclude(
+                        payout__isnull=True,
+                        due_date__isnull=True,
+                    )
+                    .select_related("seat", "payout", "merry")
+                    .order_by("due_date", "seat__seat_no", "id")
+                )
+
+                for due in viewer_due_rows:
+                    viewer_due_now = q2(
+                        viewer_due_now + _mobile_view_due_outstanding(due)
+                    )
+            except Exception:
+                viewer_due_now = Decimal("0.00")
+
+            try:
+                wallet_balance = merry_services.get_user_merry_wallet_balance(
+                    user=request.user
+                )
+            except Exception:
+                wallet_balance = Decimal("0.00")
+
+            if viewer_due_now > Decimal("0.00"):
+                viewer_pay_now = q2(viewer_due_now - wallet_balance)
+                if viewer_pay_now < Decimal("0.00"):
+                    viewer_pay_now = Decimal("0.00")
+            else:
+                seat_count = len(viewer_seats) if viewer_seats else 1
+                viewer_pay_now = q2(
+                    (merry.contribution_amount or Decimal("0.00"))
+                    * Decimal(seat_count)
+                )
+
+        try:
+            available_seats = (
+                merry.available_seats() if hasattr(merry, "available_seats") else None
+            )
+        except Exception:
+            available_seats = None
+
+        try:
+            available_seat_numbers = (
+                merry.available_seat_numbers()
+                if hasattr(merry, "available_seat_numbers")
+                else []
+            )
+        except Exception:
+            available_seat_numbers = []
+
+        data = {
+            "merry": {
+                "id": merry.id,
+                "name": merry.name,
+                "contribution_amount": _mobile_view_money(merry.contribution_amount),
+                "payout_frequency": merry.payout_frequency,
+                "cycle_duration_weeks": merry.cycle_duration_weeks,
+                "payout_order_type": merry.payout_order_type,
+                "next_payout_date": _mobile_view_date(merry.next_payout_date),
+                "is_open": getattr(merry, "is_open", True),
+                "max_seats": getattr(merry, "max_seats", 0),
+                "active_seats": MerrySeat.objects.filter(
+                    merry=merry,
+                    is_active=True,
+                ).count(),
+                "available_seats": available_seats,
+                "available_seat_numbers": available_seat_numbers,
+                "members_count": merry.members.filter(is_active=True).count(),
+                "seats_count": merry.seats.filter(is_active=True).count(),
+            },
+            "viewer": {
+                "user_id": request.user.id,
+                "username": _mobile_view_username(request.user),
+                "phone": getattr(request.user, "phone", None),
+                "is_admin": is_admin(request.user),
+                "is_member": bool(active_member),
+                "member_id": active_member.id if active_member else None,
+                "seat_numbers": viewer_seat_numbers,
+                "seat_count": len(viewer_seat_numbers),
+                "wallet_balance": _mobile_view_money(wallet_balance),
+                "due_now": _mobile_view_money(viewer_due_now),
+                "pay_now": _mobile_view_money(viewer_pay_now),
+                "my_join_request": (
+                    {
+                        "id": latest_join_request.id,
+                        "status": latest_join_request.status,
+                        "requested_seats": latest_join_request.requested_seats,
+                        "created_at": _mobile_view_date(latest_join_request.created_at),
+                        "reviewed_at": _mobile_view_date(latest_join_request.reviewed_at),
+                    }
+                    if latest_join_request
+                    else None
+                ),
+                "can_request_join": bool(
+                    not active_member
+                    and getattr(merry, "is_open", True)
+                    and (
+                        latest_join_request is None
+                        or latest_join_request.status in ["REJECTED", "CANCELLED"]
+                    )
+                    and (available_seats is None or available_seats > 0)
+                ),
+            },
+
+            # Clean naming: this is the current active payout turn.
+            "current_turn": {
+                "payout_id": turn_meta.get("payout_id"),
+                "turn_no": current_turn_no,
+                "cycle_no": turn_meta.get("cycle_no"),
+                "period_key": turn_meta.get("period_key"),
+                "period_label": turn_meta.get("period_label"),
+                "scheduled_date": _mobile_view_date(
+                    turn_meta.get("scheduled_date") or turn_meta.get("due_date")
+                ),
+                "slot_no": turn_meta.get("slot_no") or 1,
+                "expected_amount": _mobile_view_money(turn_meta.get("expected_amount")),
+                "receiver": {
+                    "seat_id": turn_meta.get("seat_id"),
+                    "seat_no": turn_meta.get("seat_no"),
+                    "payout_position": turn_meta.get("payout_position"),
+                    "member_id": turn_meta.get("member_id"),
+                    "user_id": turn_meta.get("user_id"),
+                    "username": turn_meta.get("username"),
+                    "phone": turn_meta.get("phone"),
+                },
+            },
+
+            # Clean naming: this is the upcoming turn after current.
+            "next_turn": {
+                "turn_no": next_turn_no,
+                "seat_id": turn_meta.get("next_seat_id"),
+                "seat_no": turn_meta.get("next_seat_no"),
+                "member_id": turn_meta.get("next_member_id"),
+                "user_id": turn_meta.get("next_user_id"),
+                "username": turn_meta.get("next_username"),
+                "phone": turn_meta.get("next_phone"),
+                "scheduled_date": _mobile_view_date(turn_meta.get("next_scheduled_date")),
+                "slot_no": turn_meta.get("next_slot_no") or 1,
+            },
+
+            # Explicit summary to avoid frontend confusion.
+            "turn_summary": {
+                "current_turn_no": current_turn_no,
+                "next_turn_no": next_turn_no,
+                "current_member": turn_meta.get("username"),
+                "next_member": turn_meta.get("next_username"),
+            },
+
+            "admin_readiness": {
+                "payout_id": turn_meta.get("payout_id"),
+                "turn_no": current_turn_no,
+                "cycle_no": turn_meta.get("cycle_no"),
+                "period_key": turn_meta.get("period_key"),
+                "scheduled_date": _mobile_view_date(
+                    turn_meta.get("scheduled_date") or turn_meta.get("due_date")
+                ),
+                "slot_no": turn_meta.get("slot_no") or 1,
+                "expected": _mobile_view_money(readiness_totals["due_total"]),
+                "paid": _mobile_view_money(readiness_totals["paid_total"]),
+                "outstanding": _mobile_view_money(readiness_totals["outstanding_total"]),
+                "ready_for_payout": ready_for_payout,
+                "payout_already_exists": bool(turn_meta.get("payout_id")),
+                "can_admin_create_payout": False,
+                "rows_count": len(current_due_rows),
+            },
+        }
+
+        data["merry"].update(_merry_policy_dict(merry))
 
         return Response(data, status=status.HTTP_200_OK)
 
@@ -436,15 +800,93 @@ class MerryMobileReadinessRowsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request, merry_id: int):
+        if not is_admin(request.user):
+            raise PermissionDenied("Admin only.")
+
+        merry = get_merry_or_404(merry_id)
+
         try:
-            data = merry_services.get_merry_mobile_readiness_rows(
-                user=request.user,
-                merry_id=merry_id,
-            )
+            turn_meta = merry_services.get_next_payout_turn(merry_id=merry.id)
         except Exception as e:
             raise _service_error(e)
 
-        return Response(data, status=status.HTTP_200_OK)
+        current_turn_no = turn_meta.get("current_turn") or turn_meta.get("turn_no")
+        next_turn_no = turn_meta.get("next_turn")
+
+        payout = _mobile_view_get_current_payout_from_turn_meta(turn_meta)
+
+        # Try to create/refresh current dues, but do not crash rows endpoint.
+        try:
+            merry_services.ensure_dues_for_current_payout(merry_id=merry.id)
+        except Exception:
+            pass
+
+        dues = []
+        if payout:
+            try:
+                dues = list(
+                    MerryContributionDue.objects
+                    .filter(merry=merry, payout=payout)
+                    .select_related("seat", "seat__member", "seat__member__user", "payout")
+                    .order_by("seat__seat_no", "id")
+                )
+            except Exception:
+                dues = []
+
+        rows = [_mobile_view_due_row(due) for due in dues]
+
+        paid_rows = []
+        partial_rows = []
+        unpaid_rows = []
+
+        for row in rows:
+            paid_amount = q2(row.get("paid_amount") or Decimal("0.00"))
+            outstanding = q2(row.get("outstanding") or Decimal("0.00"))
+
+            if paid_amount > Decimal("0.00") and outstanding <= Decimal("0.00"):
+                paid_rows.append(row)
+            elif paid_amount > Decimal("0.00") and outstanding > Decimal("0.00"):
+                partial_rows.append(row)
+            elif outstanding > Decimal("0.00"):
+                unpaid_rows.append(row)
+
+        totals = _mobile_view_sum_due_rows(dues)
+
+        return Response(
+            {
+                "merry_id": merry.id,
+                "merry_name": merry.name,
+                "payout_id": turn_meta.get("payout_id"),
+                "turn_no": current_turn_no,
+                "current_turn_no": current_turn_no,
+                "next_turn_no": next_turn_no,
+                "cycle_no": turn_meta.get("cycle_no"),
+                "period_key": turn_meta.get("period_key"),
+                "scheduled_date": _mobile_view_date(
+                    turn_meta.get("scheduled_date") or turn_meta.get("due_date")
+                ),
+                "slot_no": turn_meta.get("slot_no") or 1,
+                "summary": {
+                    "expected": _mobile_view_money(totals["due_total"]),
+                    "paid": _mobile_view_money(totals["paid_total"]),
+                    "outstanding": _mobile_view_money(totals["outstanding_total"]),
+                    "paid_count": len(paid_rows),
+                    "partial_count": len(partial_rows),
+                    "unpaid_count": len(unpaid_rows),
+                    "rows_count": len(rows),
+                },
+                "rows": rows,
+                "paid_rows": paid_rows,
+                "partial_rows": partial_rows,
+                "unpaid_rows": unpaid_rows,
+
+                # Compatibility aliases for frontend.
+                "paid": paid_rows,
+                "partial": partial_rows,
+                "unpaid": unpaid_rows,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ==========================================
@@ -1382,6 +1824,7 @@ class MerryMemberDashboardView(APIView):
 
         return Response(data, status=status.HTTP_200_OK)
 
+
 # # merry/views.py
 # # ROSCA compatibility version
 # # ---------------------------------------------------------
@@ -1732,6 +2175,13 @@ class MerryMemberDashboardView(APIView):
 #             user=request.user,
 #             is_active=True,
 #         ).first()
+
+#         if my_member:
+#             try:
+#                 with transaction.atomic():
+#                     merry_services.ensure_member_dues_up_to_current_turn(member=my_member)
+#             except Exception:
+#                 pass
 
 #         my_join_request = (
 #             MerryJoinRequest.objects.filter(merry=merry, user=request.user)
