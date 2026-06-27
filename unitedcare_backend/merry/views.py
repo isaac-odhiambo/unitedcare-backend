@@ -815,7 +815,7 @@ class MerryMobileReadinessRowsView(APIView):
 
         payout = _mobile_view_get_current_payout_from_turn_meta(turn_meta)
 
-        # Try to create/refresh current dues, but do not crash rows endpoint.
+        # Prepare current-turn dues if missing, but never crash this endpoint.
         try:
             merry_services.ensure_dues_for_current_payout(merry_id=merry.id)
         except Exception:
@@ -833,22 +833,53 @@ class MerryMobileReadinessRowsView(APIView):
             except Exception:
                 dues = []
 
-        rows = [_mobile_view_due_row(due) for due in dues]
+        def simple_member_row(due: MerryContributionDue) -> dict:
+            seat = getattr(due, "seat", None)
+            member = getattr(seat, "member", None) if seat else None
+            user = getattr(member, "user", None) if member else None
 
-        paid_rows = []
-        partial_rows = []
-        unpaid_rows = []
+            expected_amount = q2(
+                getattr(due, "due_amount", Decimal("0.00"))
+                or Decimal("0.00")
+            )
+            paid_amount = q2(
+                getattr(due, "paid_amount", Decimal("0.00"))
+                or Decimal("0.00")
+            )
+            outstanding_amount = _mobile_view_due_outstanding(due)
 
-        for row in rows:
+            if paid_amount > Decimal("0.00") and outstanding_amount <= Decimal("0.00"):
+                pay_status = "PAID"
+            elif paid_amount > Decimal("0.00") and outstanding_amount > Decimal("0.00"):
+                pay_status = "PARTIAL"
+            else:
+                pay_status = "NOT_PAID"
+
+            return {
+                "member_id": getattr(member, "id", None),
+                "user_id": getattr(user, "id", None),
+                "username": _mobile_view_username(user),
+                "phone": getattr(user, "phone", None) if user else None,
+                "seat_id": getattr(seat, "id", None),
+                "seat_no": getattr(seat, "seat_no", None),
+                "expected_amount": _mobile_view_money(expected_amount),
+                "paid_amount": _mobile_view_money(paid_amount),
+                "outstanding_amount": _mobile_view_money(outstanding_amount),
+                "status": pay_status,
+            }
+
+        members_paid = []
+        members_not_paid = []
+
+        for due in dues:
+            row = simple_member_row(due)
             paid_amount = q2(row.get("paid_amount") or Decimal("0.00"))
-            outstanding = q2(row.get("outstanding") or Decimal("0.00"))
+            outstanding_amount = q2(row.get("outstanding_amount") or Decimal("0.00"))
 
-            if paid_amount > Decimal("0.00") and outstanding <= Decimal("0.00"):
-                paid_rows.append(row)
-            elif paid_amount > Decimal("0.00") and outstanding > Decimal("0.00"):
-                partial_rows.append(row)
-            elif outstanding > Decimal("0.00"):
-                unpaid_rows.append(row)
+            if paid_amount > Decimal("0.00") and outstanding_amount <= Decimal("0.00"):
+                members_paid.append(row)
+            else:
+                members_not_paid.append(row)
 
         totals = _mobile_view_sum_due_rows(dues)
 
@@ -856,38 +887,22 @@ class MerryMobileReadinessRowsView(APIView):
             {
                 "merry_id": merry.id,
                 "merry_name": merry.name,
-                "payout_id": turn_meta.get("payout_id"),
                 "turn_no": current_turn_no,
                 "current_turn_no": current_turn_no,
                 "next_turn_no": next_turn_no,
-                "cycle_no": turn_meta.get("cycle_no"),
-                "period_key": turn_meta.get("period_key"),
                 "scheduled_date": _mobile_view_date(
                     turn_meta.get("scheduled_date") or turn_meta.get("due_date")
                 ),
-                "slot_no": turn_meta.get("slot_no") or 1,
-                "summary": {
-                    "expected": _mobile_view_money(totals["due_total"]),
-                    "paid": _mobile_view_money(totals["paid_total"]),
-                    "outstanding": _mobile_view_money(totals["outstanding_total"]),
-                    "paid_count": len(paid_rows),
-                    "partial_count": len(partial_rows),
-                    "unpaid_count": len(unpaid_rows),
-                    "rows_count": len(rows),
-                },
-                "rows": rows,
-                "paid_rows": paid_rows,
-                "partial_rows": partial_rows,
-                "unpaid_rows": unpaid_rows,
-
-                # Compatibility aliases for frontend.
-                "paid": paid_rows,
-                "partial": partial_rows,
-                "unpaid": unpaid_rows,
+                "pool_amount": _mobile_view_money(totals["due_total"]),
+                "total_paid": _mobile_view_money(totals["paid_total"]),
+                "total_unpaid": _mobile_view_money(totals["outstanding_total"]),
+                "paid_count": len(members_paid),
+                "not_paid_count": len(members_not_paid),
+                "members_paid": members_paid,
+                "members_not_paid": members_not_paid,
             },
             status=status.HTTP_200_OK,
         )
-
 
 # ==========================================
 # Members & Seats
