@@ -1823,8 +1823,6 @@ class MerryMemberDashboardView(APIView):
             raise _service_error(e)
 
         return Response(data, status=status.HTTP_200_OK)
-
-
 # # merry/views.py
 # # ROSCA compatibility version
 # # ---------------------------------------------------------
